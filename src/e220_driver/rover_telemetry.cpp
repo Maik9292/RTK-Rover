@@ -1,5 +1,7 @@
 #include "rover_telemetry.h"
+#include "../../user_config.h"
 #include <string.h>
+#include <stdio.h>
 #include <math.h>
 
 uint16_t rover_crc16_ccitt(const uint8_t *data, size_t len)
@@ -103,7 +105,17 @@ size_t rover_build_telemetry_packet(uint8_t *out_buf,
     pkt.rover_noise_dbm = (int8_t)state->e220_stats.ambient_noise_dbm;
     pkt.seq_num         = seq_num;
 
-    // Calculate CRC16 over the 37 bytes preceding the crc16 field
+    unsigned int fw_maj = 0, fw_min = 0, fw_pat = 0;
+    const char *ver_str = ROVER_FIRMWARE_VERSION;
+    if (ver_str[0] == 'v' || ver_str[0] == 'V') {
+        ver_str++;
+    }
+    sscanf(ver_str, "%u.%u.%u", &fw_maj, &fw_min, &fw_pat);
+    pkt.fw_major = (uint8_t)(fw_maj > 255U ? 255U : fw_maj);
+    pkt.fw_minor = (uint8_t)(fw_min > 255U ? 255U : fw_min);
+    pkt.fw_patch = (uint8_t)(fw_pat > 255U ? 255U : fw_pat);
+
+    // Calculate CRC16 over the 46 bytes preceding the crc16 field
     pkt.crc16 = rover_crc16_ccitt((const uint8_t *)&pkt, ROVER_TELEM_FRAME_LEN - 2);
 
     memcpy(out_buf, &pkt, sizeof(pkt));

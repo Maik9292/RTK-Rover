@@ -21,8 +21,8 @@ extern "C" {
 #define ROVER_MSG_ID_CMD_RATE_SWITCH    0x02U
 #define ROVER_MSG_ID_ACK_RATE_SWITCH    0x82U
 
-#define ROVER_TELEM_PAYLOAD_LEN         39U
-#define ROVER_TELEM_FRAME_LEN           45U  // 2 sync + 1 id + 1 len + 39 payload + 2 crc16
+#define ROVER_TELEM_PAYLOAD_LEN         42U
+#define ROVER_TELEM_FRAME_LEN           48U  // 2 sync + 1 id + 1 len + 42 payload + 2 crc16
 
 #define ROVER_CMD_SWITCH_PAYLOAD_LEN    4U
 #define ROVER_CMD_SWITCH_FRAME_LEN      10U  // 2 sync + 1 id + 1 len + 4 payload + 2 crc16
@@ -40,11 +40,11 @@ extern "C" {
 
 #pragma pack(push, 1)
 
-// 45-Byte Uplink Telemetry Frame
+// 48-Byte Uplink Telemetry Frame
 typedef struct {
     uint8_t  sync[2];        // 0xAA, 0x55
     uint8_t  msg_id;         // 0x01
-    uint8_t  payload_len;    // 39
+    uint8_t  payload_len;    // 42
     double   tip_lat;        // Ground-tip Latitude (WGS84 degrees)
     double   tip_lon;        // Ground-tip Longitude (WGS84 degrees)
     float    tip_height_m;   // Ground-tip Ellipsoidal Height (meters)
@@ -62,6 +62,9 @@ typedef struct {
     int8_t   rover_rssi_dbm; // Last LoRa packet RSSI measured at Rover (dBm)
     int8_t   rover_noise_dbm;// Live ambient noise measured at Rover (dBm)
     uint8_t  seq_num;        // Rolling Packet Sequence Counter (0..255)
+    uint8_t  fw_major;       // Rover Firmware Major Version (e.g. 0 for v0.8.6)
+    uint8_t  fw_minor;       // Rover Firmware Minor Version (e.g. 8 for v0.8.6)
+    uint8_t  fw_patch;       // Rover Firmware Patch Version (e.g. 6 for v0.8.6)
     uint16_t crc16;          // CRC16-CCITT (polynomial 0x1021, init 0xFFFF)
 } RoverUplinkTelemetry_t;
 

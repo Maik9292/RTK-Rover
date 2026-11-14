@@ -5,6 +5,15 @@ All notable changes to the **RTK Rover** project will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.8.6] - 2026-11-14
+
+### Added
+- **Rover Firmware Version in Uplink Telemetry (`src/e220_driver/rover_telemetry.h`, `src/e220_driver/rover_telemetry.cpp`, `src/e220_driver/e220_driver.cpp`, `scripts/e220_pacer.py v3.6.0`):**
+  - Expanded `RoverUplinkTelemetry_t` from `45` to `48` bytes (`ROVER_TELEM_PAYLOAD_LEN = 42U`) by appending `fw_major`, `fw_minor`, and `fw_patch` (`uint8_t` x 3) parsed automatically from `ROVER_FIRMWARE_VERSION` (`vX.Y.Z`).
+  - Updated `e220_pacer.py v3.6.0` (`FMT_TELEMETRY = "<2sBBddfHBBHhBBBHBHbbBBBBH"`) with backward compatibility for legacy 39B and 45B frames (`tot_len in (48, 45, 39)`), logging `FW:vX.Y.Z` in the `[ROVER TEL #seq]` console heartbeat, `"rover_fw_version"` in `/run/rtk_rover_status.json`, and `rover_fw` in rolling daily CSV logs (`scripts/test_rover_telemetry.py`).
+- **Mandatory Per-Version `CHANGELOG.md` & GitHub Sync Rule (`GEMINI.md`, `../AGENTS.md`, `docs/hyper-context-anchor.md`):**
+  - Codified the release policy requiring `[vX.Y.Z]` changelog updates, `check_secrets.py` verification, and atomic `git commit` + `git push` for every version bump so prior versions are directly restorable via Git without relying on AI context.
+
 ## [v0.8.5] - 2026-11-14
 
 ### Added

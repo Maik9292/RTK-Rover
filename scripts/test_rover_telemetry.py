@@ -17,6 +17,7 @@ from e220_pacer import (
     MSG_ID_REQ_SWITCH,
     MSG_ID_ACK_SWITCH,
     FMT_TELEMETRY,
+    FMT_TELEMETRY_V2,
     FMT_TELEMETRY_LEGACY,
     FMT_REQ_SWITCH,
     FMT_ACK_SWITCH,
@@ -25,7 +26,7 @@ from e220_pacer import (
 
 
 def test_telemetry_packing():
-    # 45-byte modern frame
+    # 48-byte V3 frame with firmware version
     tip_lat = 43.73191234
     tip_lon = -70.62373156
     tip_height = 88.42
@@ -43,12 +44,73 @@ def test_telemetry_packing():
     rssi = -84
     noise = -102
     seq = 42
+    fw_major = 0
+    fw_minor = 8
+    fw_patch = 6
 
     body = struct.pack(
         FMT_TELEMETRY,
         ROVER_SYNC,
         MSG_ID_TELEMETRY,
-        39,  # payload length
+        42,  # payload length
+        tip_lat,
+        tip_lon,
+        tip_height,
+        h_acc_mm,
+        fix_type,
+        ant2_fix_type,
+        baseline_mm,
+        baseline_pitch_cdeg,
+        heading_source,
+        sats_m,
+        sats_s,
+        hdg_cdeg,
+        bat_pct,
+        bat_mv,
+        rssi,
+        noise,
+        seq,
+        fw_major,
+        fw_minor,
+        fw_patch,
+        0,
+    )
+    assert len(body) == 48, f"Expected 48B, got {len(body)}"
+    crc = crc16_ccitt(body[:-2])
+    frame = body[:-2] + struct.pack("<H", crc)
+
+    # Verify unpack
+    unpacked = struct.unpack(FMT_TELEMETRY, frame)
+    assert unpacked[0] == ROVER_SYNC
+    assert unpacked[1] == MSG_ID_TELEMETRY
+    assert unpacked[2] == 42
+    assert abs(unpacked[3] - tip_lat) < 1e-7
+    assert abs(unpacked[4] - tip_lon) < 1e-7
+    assert unpacked[6] == 12
+    assert unpacked[7] == 4
+    assert unpacked[8] == 4
+    assert unpacked[9] == 554
+    assert unpacked[10] == 20
+    assert unpacked[11] == 1
+    assert unpacked[12] == 18
+    assert unpacked[13] == 14
+    assert unpacked[14] == 23450
+    assert unpacked[15] == 255
+    assert unpacked[16] == 5040
+    assert unpacked[17] == -84
+    assert unpacked[18] == -102
+    assert unpacked[19] == 42
+    assert unpacked[20] == fw_major
+    assert unpacked[21] == fw_minor
+    assert unpacked[22] == fw_patch
+    assert unpacked[23] == crc
+
+    # Verify 45-byte V2 backward-compatibility format
+    v2_body = struct.pack(
+        FMT_TELEMETRY_V2,
+        ROVER_SYNC,
+        MSG_ID_TELEMETRY,
+        39,
         tip_lat,
         tip_lon,
         tip_height,
@@ -68,33 +130,13 @@ def test_telemetry_packing():
         seq,
         0,
     )
-    assert len(body) == 45, f"Expected 45B, got {len(body)}"
-    crc = crc16_ccitt(body[:-2])
-    frame = body[:-2] + struct.pack("<H", crc)
+    assert len(v2_body) == 45, f"Expected 45B V2, got {len(v2_body)}"
+    v2_crc = crc16_ccitt(v2_body[:-2])
+    v2_frame = v2_body[:-2] + struct.pack("<H", v2_crc)
+    v2_unpacked = struct.unpack(FMT_TELEMETRY_V2, v2_frame)
+    assert v2_unpacked[19] == 42 and v2_unpacked[20] == v2_crc
 
-    # Verify unpack
-    unpacked = struct.unpack(FMT_TELEMETRY, frame)
-    assert unpacked[0] == ROVER_SYNC
-    assert unpacked[1] == MSG_ID_TELEMETRY
-    assert unpacked[2] == 39
-    assert abs(unpacked[3] - tip_lat) < 1e-7
-    assert abs(unpacked[4] - tip_lon) < 1e-7
-    assert unpacked[6] == 12
-    assert unpacked[7] == 4
-    assert unpacked[8] == 4
-    assert unpacked[9] == 554
-    assert unpacked[10] == 20
-    assert unpacked[11] == 1
-    assert unpacked[12] == 18
-    assert unpacked[13] == 14
-    assert unpacked[14] == 23450
-    assert unpacked[15] == 255
-    assert unpacked[16] == 5040
-    assert unpacked[17] == -84
-    assert unpacked[18] == -102
-    assert unpacked[19] == 42
-    assert unpacked[20] == crc
-    print("[PASS] Telemetry packing, size (45B), USB sentinel (255) and CRC16 verified!")
+    print("[PASS] Telemetry packing, size (48B + 45B compat), firmware version (v0.8.6), USB sentinel (255) and CRC16 verified!")
 
 
 def test_rate_switch_frames():
@@ -144,6 +186,7 @@ def test_pacer_logging():
             "rover_noise_dbm": -102,
             "base_air_rate_kbps": 19.2,
             "channel": 75,
+            "rover_fw_version": "v0.8.6",
         }
 
         # Test CSV write
@@ -156,6 +199,7 @@ def test_pacer_logging():
             assert len(lines) == 2, f"Expected header + 1 row, got {len(lines)}"
             assert "RTK_FIX" in lines[1]
             assert "43.73191234" in lines[1]
+            assert "v0.8.6" in lines[1]
 
         # Test compression
         pacer.current_log_file.close()

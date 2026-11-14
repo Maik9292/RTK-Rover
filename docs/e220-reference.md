@@ -1,9 +1,9 @@
 # Ebyte E220-900T30S Practical Engineering Reference
 
-**Document Version:** 2.3  
+**Document Version:** 2.4  
 **Last Updated:** November 14, 2026  
-**Firmware Target:** `v0.8.5`  
-**Companion Software:** `e220_pacer.py v3.5.2`  
+**Firmware Target:** `v0.8.6`  
+**Companion Software:** `e220_pacer.py v3.6.0`  
 **Target Hardware:** Ebyte `E220-900T30S` (`850.125 - 930.125 MHz`, `1 W` / `+30 dBm` SMD UART LoRa Module)  
 **Applicability:** Directly applies to `E220-900T30S` / `E220-900T30D` (`1 W`) and `E220-900T22S` / `E220-900T22D` (`160 mW`, noting TX power bit differences in Section 4.4).  
 
@@ -282,7 +282,7 @@ Never issue `C0 C1 C2 C3 00 02` blindly during active reception or during a pend
 
 ## 9. Bi-Directional Half-Duplex LoRa Protocol & Telemetry Uplink
 
-### 9.1 GPS-Disciplined 5-Second Superframe TDMA Architecture (`v0.8.5`)
+### 9.1 GPS-Disciplined 5-Second Superframe TDMA Architecture (`v0.8.6`)
 Because both Base and Rover operate on the same frequency (`925.125 MHz`), downlink and uplink transmissions are deterministically scheduled against GPS UTC seconds (`sf_sec = utc_sec % 5`):
 
 ```text
@@ -292,17 +292,17 @@ Because both Base and Rover operate on the same frequency (`925.125 MHz`), downl
                                                           720..845ms (rate-adaptive)
 ```
 
-* **Base Station (`e220_pacer.py v3.5.2`):** Runs 100% downlink in Seconds 1..4 (dropping empty MSM frames `<= 28 B` and evaluating the `<= 9.6k` constellation interleaver before cutoff). In Second 0, enforces a downlink TX cutoff (`700 ms` @ `<= 9.6k`, `740 ms` @ `>= 19.2k`) before listening strictly for Rover uplink frames.
-* **Rover (`e220_driver.cpp`):** Transmits its 45-byte binary telemetry frame (or 10-byte rate switch request) exclusively inside the GPS-disciplined Second 0 uplink window (`775..845 ms` @ `>= 19.2k`, `745..825 ms` @ `9.6k`, `720..800 ms` @ `4.8k`), waiting for E220 TX completion via `e220_wait_tx_complete(25, 300)`.
+* **Base Station (`e220_pacer.py v3.6.0`):** Runs 100% downlink in Seconds 1..4 (dropping empty MSM frames `<= 28 B` and evaluating the `<= 9.6k` constellation interleaver before cutoff). In Second 0, enforces a downlink TX cutoff (`700 ms` @ `<= 9.6k`, `740 ms` @ `>= 19.2k`) before listening strictly for Rover uplink frames (`48 B` V3 telemetry with firmware version, or legacy `45 B` / `39 B`).
+* **Rover (`e220_driver.cpp`):** Transmits its 48-byte binary telemetry frame (or 10-byte rate switch request) exclusively inside the GPS-disciplined Second 0 uplink window (`775..845 ms` @ `>= 19.2k`, `745..825 ms` @ `9.6k`, `720..800 ms` @ `4.8k`), waiting for E220 TX completion via `e220_wait_tx_complete(25, 300)`.
 
-### 9.2 45-Byte Uplink Frame Specification (`RoverUplinkTelemetry_t`)
+### 9.2 48-Byte Uplink Frame Specification (`RoverUplinkTelemetry_t`)
 
 ```text
 Offset  Field                Type      Units / Encoding
 -----------------------------------------------------------------------------
 0..1    sync                 uint8[2]  0xAA, 0x55 (Preamble sync)
 2       msg_id               uint8     0x01 (ROVER_MSG_ID_TELEMETRY)
-3       payload_len          uint8     39 (Bytes following length field)
+3       payload_len          uint8     42 (Bytes following length field)
 4..11   tip_lat              double    Ground-tip Latitude (WGS84 degrees)
 12..19  tip_lon              double    Ground-tip Longitude (WGS84 degrees)
 20..23  tip_height_m         float     Ground-tip Ellipsoidal Height (meters)
@@ -311,16 +311,19 @@ Offset  Field                Type      Units / Encoding
 27      ant2_fix_type        uint8     ANT2 Slave Moving-Baseline Fix (0=None, 4=Fix, 5=Float)
 28..29  baseline_mm          uint16    Measured 3D Baseline (millimeters, 555mm nominal)
 30..31  baseline_pitch_cdeg  int16     Crossbar Pitch (centidegrees, e.g. +20 = +0.20 deg)
-32      heading_source       uint8     0=NONE, 1=DUAL_FIX, 2=DUAL_FLT, 3=WALK, 4=GYRO, 5=COG, 6=HOLD
+32      heading_source       uint8     0=NONE, 1=DUAL_FIX, 2=DUAL_FLT, 3=WALK, 4=GYRO, 5=COG, 6=HOLD, 7=COMP
 33      sats_master          uint8     Master Antenna satellites tracked
 34      sats_slave           uint8     Slave satellites (bits [5:0]), b6=valid, b7=fixed
 35..36  heading_cdeg         uint16    True Heading (centidegrees, 0..36000 -> 0.00..360.00 deg)
-37      battery_pct          uint8     Battery State of Charge (0..100 %)
-38..39  battery_mv           uint16    Battery Terminal Voltage (millivolts)
+37      battery_pct          uint8     Battery State of Charge (0..100%, 255=USB Power)
+38..39  battery_mv           uint16    Battery / VBUS Terminal Voltage (millivolts)
 40      rover_rssi_dbm       int8      Last Base packet RSSI received at Rover (dBm)
 41      rover_noise_dbm      int8      Ambient RF noise floor at Rover (dBm)
 42      seq                  uint8     Rolling sequence counter (0..255)
-43..44  crc16                uint16    CRC16-CCITT across bytes 0..42
+43      fw_major             uint8     Rover Firmware Major Version (e.g. 0 for v0.8.6)
+44      fw_minor             uint8     Rover Firmware Minor Version (e.g. 8 for v0.8.6)
+45      fw_patch             uint8     Rover Firmware Patch Version (e.g. 6 for v0.8.6)
+46..47  crc16                uint16    CRC16-CCITT across bytes 0..45
 ```
 
 ### 9.3 ANT2 Moving-Baseline Semantics
@@ -378,7 +381,7 @@ Both Base and Rover arm a **60-second rollback watchdog** upon switching registe
 3. **Telemetry Processor & Storage:**
    * **Terminal Heartbeat:** Outputs clean 7-bit ASCII lines (using `deg` units):
      ```text
-     [ROVER TEL #042] ANT1:RTK_FIX (28M) | ANT2:SLV_FIX (26S, BL:55.4cm, P:+0.2deg) | Hdg:142.6deg [DUAL_FIX] | Bat:85% (4.02V) | RSSI:-84dBm | Pos:43.7319105, -70.6237371, 12.45m
+     [ROVER TEL #042] FW:v0.8.6 | ANT1:RTK_FIX (28M) | ANT2:SLV_FIX (26S, BL:55.4cm, P:+0.2deg) | Hdg:142.6deg [DUAL_FIX] | Bat:85% (4.02V) | RSSI:-84dBm | Pos:43.7319105, -70.6237371, 12.45m
      ```
    * **RAM State (`/run/rtk_rover_status.json`):** Atomic tmpfs writes in RAM (zero MicroSD card wear) for local web dashboard integration.
    * **Rolling Daily CSV (`~/rover_logs/rover_YYYY-MM-DD.csv`):** Auto-detects interactive user home directories in `/home/` when running under systemd `User=root`, creates directories with `0777` permissions, compresses yesterday's logs to `.csv.gz`, and enforces 30-day retention with a 50 MB hard FIFO cap.

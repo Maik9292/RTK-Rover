@@ -1152,8 +1152,10 @@ extern "C" void e220_poll_and_forward_rtcm(void)
                                  telem_state.battery_percent,
                                  telem_state.battery_voltage);
                     }
-                    Serial.printf("[E220 LORA TX #%u] Uplink 45B (Fix:%d SLV:%d Tip:%.7f,%.7f,%.2fm BL:%.1fcm P:%+.1fdeg %s)\n",
+                    Serial.printf("[E220 LORA TX #%u] Uplink %uB (FW:%s Fix:%d SLV:%d Tip:%.7f,%.7f,%.2fm BL:%.1fcm P:%+.1fdeg %s)\n",
                                   s_uplink_seq,
+                                  (unsigned)n,
+                                  ROVER_FIRMWARE_VERSION,
                                   telem_state.fix_type,
                                   telem_state.slave_fix_type,
                                   telem_state.tip_lat,

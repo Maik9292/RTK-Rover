@@ -1,9 +1,9 @@
 # RTK Rover - Project Overview
 
-**Document Version:** `v2.7.0`  
+**Document Version:** `v2.7.1`  
 **Last Updated:** November 14, 2026  
-**Firmware Target:** `v0.8.5`  
-**Python Ecosystem Target:** `v3.5.2`  
+**Firmware Target:** `v0.8.6`  
+**Python Ecosystem Target:** `v3.6.0`  
 **License:** GNU General Public License v3.0 (`GPLv3`)  
 
 This document serves as the master technical specification for the **RTK Rover** project. It details the mechanical setup, dual-antenna lever-arm kinematics, electrical pinouts, FreeRTOS + LVGL 9 firmware architecture, operational modes, and companion Python scripts.
@@ -12,7 +12,8 @@ This document serves as the master technical specification for the **RTK Rover**
 
 ## 1. Project Identity, Versioning & Documentation Rules
 * **CRITICAL RULE:** All projects shall have a main Software version identifier as `v[Major].[Minor].[Patch]` and follow industry-standard SemVer rules and practices for bumping the version at EVERY file iteration.
-* **Why:** We do not reuse version numbers for each iteration. This allows us to distinctly identify in the AI context the files we are working on. The version string is defined as `ROVER_FIRMWARE_VERSION` in `user_config.h`.
+* **Mandatory Per-Version Changelog & Git Sync:** Every version bump (`ROVER_FIRMWARE_VERSION` in `user_config.h` or `__version__` in Python scripts) must be recorded immediately under a `[vX.Y.Z]` entry in `CHANGELOG.md`, verified with `python scripts/check_secrets.py`, and committed + pushed to Git/GitHub (`origin/master`) so every version can be restored reproducibly from Git without relying on AI context.
+* **Why:** We do not reuse version numbers for each iteration. This allows us to distinctly identify in the AI context and Git history the exact files we are working on. The firmware version string is defined as `ROVER_FIRMWARE_VERSION` in `user_config.h` and transmitted in the 48-byte LoRa uplink telemetry frame.
 * **Pure ASCII Requirement:** All user-facing strings, labels, and terminal outputs strictly use standard ASCII characters. Extended Unicode symbols (such as $\pm$, $\circ$, arrows) are avoided in UI strings to guarantee compatibility with LVGL fonts and prevent missing glyph boxes.
 * **Sibling Repository Architecture & Code/Data Decoupling:** The project strictly enforces the separation of computational logic from domain data. Public `RTK_Rover` contains open-source firmware, drivers, kinematics, and schema-driven mathematical tools. All private land records, deed PDFs, personal surveyed coordinates, raw sensor captures, and personal radio configurations reside in an independent sibling repository (`RTK_Rover_Private`) under local Git version control.
 
@@ -39,11 +40,11 @@ This document serves as the master technical specification for the **RTK Rover**
      * **Target EEPROM Profile:** `ADDH=0x00 ADDL=0x00 REG0=0xE5 REG1=0x23 CHAN=0x4B REG3=0x00`.
    * **Base Station Software & Phase 9 GPS-Disciplined 5s Superframe TDMA Architecture:**
      * **RTKBase Stream Filtering:** RTKBase port `5016` is filtered via `str2str` to `"1006(5),1074,1084,1094,1230(10)"`, producing a lean, high-fidelity stream of ~625-650 Bytes/s (GPS MSM4, GLONASS MSM4, Galileo MSM4, Base ARP, and GLONASS biases). Empty MSM frames (`<= 28 B`) are dropped prior to RF TX.
-     * **Two-Regime AUX + Hardware-Calibrated Time-on-Air Pacing (`scripts/e220_pacer.py v3.5.2`):**
+     * **Two-Regime AUX + Hardware-Calibrated Time-on-Air Pacing (`scripts/e220_pacer.py v3.6.0`):**
        * Per E220-900T30S Manual Section 5.6.2, `AUX=1` indicates the 400-byte UART buffer emptied into the LLCC68 transceiver, **not** that over-the-air RF transmission has completed.
        * **Single-Subpacket Frames (`<= 200B`, e.g., `1006`, `1230`, `1084`):** Transfer straight into an idle LLCC68 FIFO without holding `AUX` LOW; paced deterministically by silicon-calibrated LoRa Time-on-Air plus a `35 ms` receiver UART drain guard delay.
        * **Two-Subpacket Frames (`201..400B`, e.g., `1074`, `1094`):** Hold `AUX` LOW while Subpacket 1 (`200B`) transmits on air, then raise `AUX` HIGH the instant Subpacket 2 (`len - 200`) enters the LLCC68 FIFO and **begins** RF TX; paced by waiting for `AUX` rising edge plus `estimate_subpacket_air_s(len - 200) + 35 ms` guard delay.
-       * **GPS-Disciplined 5-Second Superframe TDMA:** Anchored to `UTC_Second % 5`: Seconds 1..4 run at 100% Base downlink capacity; Second 0 enforces a hard TX cutoff (`700 ms` @ `<= 9.6k`, `740 ms` @ `>= 19.2k`) before listening strictly for Rover uplink (`45 B` telemetry / `10 B` air-rate switch request). Synchronous 3-rate air-rate switches (`19.2k / 9.6k / 4.8k`) transmit paced primary + backup `ACK_SWITCH` frames in Second 1 (holding RTCM TX until top of Second 2) and reconfigure both E220 modules simultaneously at `0 ms` of Second 2 with a 60-second rollback failsafe.
+       * **GPS-Disciplined 5-Second Superframe TDMA:** Anchored to `UTC_Second % 5`: Seconds 1..4 run at 100% Base downlink capacity; Second 0 enforces a hard TX cutoff (`700 ms` @ `<= 9.6k`, `740 ms` @ `>= 19.2k`) before listening strictly for Rover uplink (`48 B` telemetry including `fw_major.fw_minor.fw_patch` / `10 B` air-rate switch request). Synchronous 3-rate air-rate switches (`19.2k / 9.6k / 4.8k`) transmit paced primary + backup `ACK_SWITCH` frames in Second 1 (holding RTCM TX until top of Second 2) and reconfigure both E220 modules simultaneously at `0 ms` of Second 2 with a 60-second rollback failsafe.
        * Includes `GPIO 22` hardware reset watchdog if `AUX` locks LOW `> 1.5 s`, `TIOCEXCL` exclusive serial port locking, source `CRC24Q` verification, and startup Channel 75 ambient RF noise floor probing.
      * **Adaptive Constellation Interleaver (at $\le 9.6\text{ kbps}$):**
        * Tracks epoch boundaries via `self.last_msm_type` and interleaves secondary constellations across alternating epochs to prevent LoRa channel saturation: at `9.6 kbps`, GPS `1074` runs at `1.0 Hz` while GLONASS `1084` and Galileo `1094` alternate 1:1 (`0.5 Hz` each; `0.33 Hz` for 3 secondaries). At `<= 4.8 kbps`, GPS runs on even epochs and rotates secondaries (`~0.25 Hz` each).
@@ -176,7 +177,7 @@ Because prebuilt Arduino-ESP32 (`v3.3.x`, `qio_opi`) compiles with `CONFIG_SPIRA
   * Compact **Tare** button (`62x28 px`) nested in the bottom-right of the circle's bounding rectangle (`TARE` Blue / `RST` Orange).
   * Centered Pole Tilt angle readout (`dX` / `dY`) below circle.
 * **Tile 4 (Screen 5) -- Hardware Diagnostics & Live Observers:**
-  * **Pinned Top Header Deck:** Fixed firmware header (`RTK ROVER v0.8.5` in Montserrat 16 White).
+  * **Pinned Top Header Deck:** Fixed firmware header (`RTK ROVER v0.8.6` in Montserrat 16 White).
   * **Dual-Power & UPS Card:** Displays external VBUS status (`AXP2101` `0x00` `VBUS_GOOD` register bit + masked ADC voltage), VBAT 5V boost peripheral power rail, internal battery voltage/percentage, charging/float status, and auto-shutdown timer countdown.
   * **Pinned LoRa RF Survey Card ($y = 26$):** Elevated to the top of the tile for permanent visibility of noise floor, packet RSSI (`~1.8–2.0 s` near-realtime updates, `6.0 s` freshness window across 5s superframes), AUX edges, RTCM message counters, and truncation drops.
   * **Expanded Scrollable Container (+57 px Viewport):** Multi-line auto-wrapping telemetry cards:
@@ -191,7 +192,7 @@ Because prebuilt Arduino-ESP32 (`v3.3.x`, `qio_opi`) compiles with `CONFIG_SPIRA
 
 ## 7. Python Survey & Ingestion Scripts (`scripts/`)
 
-* **`e220_pacer.py` (v3.5.2):** Datasheet Section 5.6.2 hardware-paced LoRa driver for RTKBase with Phase 9 GPS-Disciplined 5-Second Superframe TDMA. Handles atomic RTCM3 frame pacing, empty MSM filtering (`<= 28 B`), `GPIO 22` hardware watchdog, `TIOCEXCL` locking, Mode 0 ambient noise floor probing, bi-directional uplink telemetry logging (dual-format 39B/45B auto-detecting unpacker recording ANT1 RTK fix, ANT2 slave fix `SLV_FIX`/`SLV_FLT`, 3D baseline length, crossbar pitch, explicit heading source, `PWR:USB` / `Bat:xx%` power status, RAM JSON + rolling daily CSV), clean ASCII `deg` units in console heartbeat, synchronous 3-rate air-rate switching (`19.2k / 9.6k / 4.8k`) with paced primary + backup Second 1 `ACK_SWITCH` and Second 2 hardware switch, and epoch-tracked Adaptive Constellation Interleaving at $\le 9.6\text{ kbps}$.
+* **`e220_pacer.py` (v3.6.0):** Datasheet Section 5.6.2 hardware-paced LoRa driver for RTKBase with Phase 9 GPS-Disciplined 5-Second Superframe TDMA. Handles atomic RTCM3 frame pacing, empty MSM filtering (`<= 28 B`), `GPIO 22` hardware watchdog, `TIOCEXCL` locking, Mode 0 ambient noise floor probing, bi-directional uplink telemetry logging (tri-format 39B/45B/48B auto-detecting unpacker recording `FW:vX.Y.Z` firmware version, ANT1 RTK fix, ANT2 slave fix `SLV_FIX`/`SLV_FLT`, 3D baseline length, crossbar pitch, explicit heading source, `PWR:USB` / `Bat:xx%` power status, RAM JSON + rolling daily CSV with `rover_fw` column), clean ASCII `deg` units in console heartbeat, synchronous 3-rate air-rate switching (`19.2k / 9.6k / 4.8k`) with paced primary + backup Second 1 `ACK_SWITCH` and Second 2 hardware switch, and epoch-tracked Adaptive Constellation Interleaving at $\le 9.6\text{ kbps}$.
 * **`cogo_solver.py` (v1.1.0):** Schema-driven Coordinate Geometry (COGO) traverse solver. Ingests standard parcel JSON schemas ([`docs/schemas/cadastral_schema.json`](schemas/cadastral_schema.json)) and control anchor CSV files, performs forward geodesic projections, verifies loop closure precision, applies Bowditch / Compass Rule adjustments, solves circular road curve geometry, reconciles common boundaries, and exports to Google Earth KML, Rover `/waypoints.csv`, GeoJSON, AutoCAD DXF (with layer organization), and text closure audits. Detailed documentation in [`docs/cogo_solver_guide.md`](cogo_solver_guide.md).
 * **`check_secrets.py` (v1.1.1):** Pre-push security verification scanner. Scans Git tracked files and unpushed commits for generic credentials, private keys, and local absolute filesystem paths, plus personal signatures defined in an unversioned `.secrets.local` configuration.
 * **`install_git_hooks.py` (v1.1.0):** Automatically installs the pre-push security verification hook into `.git/hooks/pre-push`.

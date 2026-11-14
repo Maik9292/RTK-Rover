@@ -69,7 +69,7 @@ except ImportError:
 
 __filename__ = "e220_pacer.py"
 __app_name__ = "e220_pacer"
-__version__ = "3.5.2"
+__version__ = "3.6.0"
 __date__ = "2026-11-14"
 
 # Force unbuffered output so systemd journalctl displays entries in real time
@@ -147,11 +147,18 @@ MSG_ID_ACK_SWITCH = 0x82
 # sats_m(B), sats_s(B), hdg_cdeg(H), bat_pct(B), bat_mv(H), rssi(b), noise(b), seq(B), crc(H)
 FMT_TELEMETRY_LEGACY = "<2sBBddfHBBBHBHbbBH"
 
-# 45-Byte Expanded Uplink Telemetry Frame Format (plen=39):
+# 45-Byte V2 Uplink Telemetry Frame Format (plen=39, without firmware version):
 # sync(2s), mid(B), plen(B), lat(d), lon(d), height(f), h_acc_mm(H), fix(B),
 # ant2_fix(B), baseline_mm(H), baseline_pitch_cdeg(h), hdg_source(B),
 # sats_m(B), sats_s(B), hdg_cdeg(H), bat_pct(B), bat_mv(H), rssi(b), noise(b), seq(B), crc(H)
-FMT_TELEMETRY = "<2sBBddfHBBHhBBBHBHbbBH"
+FMT_TELEMETRY_V2 = "<2sBBddfHBBHhBBBHBHbbBH"
+
+# 48-Byte V3 Uplink Telemetry Frame Format (plen=42, with fw_major, fw_minor, fw_patch):
+# sync(2s), mid(B), plen(B), lat(d), lon(d), height(f), h_acc_mm(H), fix(B),
+# ant2_fix(B), baseline_mm(H), baseline_pitch_cdeg(h), hdg_source(B),
+# sats_m(B), sats_s(B), hdg_cdeg(H), bat_pct(B), bat_mv(H), rssi(b), noise(b), seq(B),
+# fw_major(B), fw_minor(B), fw_patch(B), crc(H)
+FMT_TELEMETRY = "<2sBBddfHBBHhBBBHBHbbBBBBH"
 
 # 10-Byte Remote Air-Rate Switch Request Format:
 # sync(2s), mid(B), plen(B), target_code(B), target_chan(B), req_id(H), crc(H)
@@ -1010,7 +1017,7 @@ class E220Pacer:
                     "sats_master", "sats_slave", "heading_deg",
                     "battery_pct", "battery_mv",
                     "rover_rssi_dbm", "rover_noise_dbm",
-                    "air_rate_kbps", "channel"
+                    "air_rate_kbps", "channel", "rover_fw"
                 ]
                 self.current_log_file.write(",".join(headers) + "\n")
 
@@ -1035,7 +1042,8 @@ class E220Pacer:
             str(data["rover_rssi_dbm"]),
             str(data["rover_noise_dbm"]),
             f"{data['base_air_rate_kbps']:.1f}",
-            str(data["channel"])
+            str(data["channel"]),
+            data.get("rover_fw_version", "unknown"),
         ]
         if self.current_log_file:
             self.current_log_file.write(",".join(row) + "\n")
@@ -1139,14 +1147,25 @@ class E220Pacer:
             7: "COMP",
         }
 
-        if len(cand) == 45:
+        if len(cand) == 48:
             (sync, mid, plen, lat, lon, height, h_acc_mm, fix_type,
              ant2_fix_type, baseline_mm, baseline_pitch_cdeg, heading_source,
-             sats_m, sats_s, hdg_cdeg, bat_pct, bat_mv, r_rssi, r_noise, seq, crc) = struct.unpack(FMT_TELEMETRY, cand)
+             sats_m, sats_s, hdg_cdeg, bat_pct, bat_mv, r_rssi, r_noise, seq,
+             fw_major, fw_minor, fw_patch, crc) = struct.unpack(FMT_TELEMETRY, cand)
             bl_cm = baseline_mm / 10.0
             pitch_deg = baseline_pitch_cdeg / 100.0
             slv_fix_str = slv_fix_names.get(ant2_fix_type, f"TYPE_{ant2_fix_type}")
             hdg_tag = hdg_source_names.get(heading_source, f"SRC_{heading_source}")
+            rover_fw_str = f"v{fw_major}.{fw_minor}.{fw_patch}"
+        elif len(cand) == 45:
+            (sync, mid, plen, lat, lon, height, h_acc_mm, fix_type,
+             ant2_fix_type, baseline_mm, baseline_pitch_cdeg, heading_source,
+             sats_m, sats_s, hdg_cdeg, bat_pct, bat_mv, r_rssi, r_noise, seq, crc) = struct.unpack(FMT_TELEMETRY_V2, cand)
+            bl_cm = baseline_mm / 10.0
+            pitch_deg = baseline_pitch_cdeg / 100.0
+            slv_fix_str = slv_fix_names.get(ant2_fix_type, f"TYPE_{ant2_fix_type}")
+            hdg_tag = hdg_source_names.get(heading_source, f"SRC_{heading_source}")
+            rover_fw_str = "unknown"
         else:
             (sync, mid, plen, lat, lon, height, h_acc_mm, fix_type, sats_m, sats_s,
              hdg_cdeg, bat_pct, bat_mv, r_rssi, r_noise, seq, crc) = struct.unpack(FMT_TELEMETRY_LEGACY, cand)
@@ -1156,6 +1175,7 @@ class E220Pacer:
             slv_fix_str = slv_fix_names.get(ant2_fix_type, "NONE")
             heading_source = 1 if (sats_s & 0x80) else (2 if (sats_s & 0x40) else 0)
             hdg_tag = hdg_source_names.get(heading_source, "NONE")
+            rover_fw_str = "unknown"
 
         fix_str = fix_names.get(fix_type, f"TYPE_{fix_type}")
         hdg_deg = hdg_cdeg / 100.0
@@ -1168,7 +1188,7 @@ class E220Pacer:
         bat_str = f"PWR:USB ({bat_mv/1000.0:.2f}V)" if bat_pct == 255 else f"Bat:{bat_pct}% ({bat_mv/1000.0:.2f}V)"
 
         print(
-            f"[ROVER TEL #{seq:03d}] ANT1:{fix_str} ({sats_m}M) | "
+            f"[ROVER TEL #{seq:03d}] FW:{rover_fw_str} | ANT1:{fix_str} ({sats_m}M) | "
             f"ANT2:{slv_fix_str} ({sats_s_clean}S, BL:{bl_cm:.1f}cm, P:{pitch_deg:+.1f}deg) | "
             f"Hdg:{hdg_deg:5.1f}deg [{hdg_tag}] | {bat_str} | "
             f"RSSI:{r_rssi}dBm | Pos:{lat:.7f}, {lon:.7f}, {height:.2f}m",
@@ -1178,6 +1198,7 @@ class E220Pacer:
         status_data = {
             "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "seq": seq,
+            "rover_fw_version": rover_fw_str,
             "fix_type": fix_type,
             "fix_name": fix_str,
             "ant2_fix_type": ant2_fix_type,
@@ -1284,7 +1305,7 @@ class E220Pacer:
             del self.uplink_buf[:tot_len]
             self.last_rover_rx_time = time.monotonic()
 
-            if msg_id == MSG_ID_TELEMETRY and (tot_len == 45 or tot_len == 39):
+            if msg_id == MSG_ID_TELEMETRY and tot_len in (48, 45, 39):
                 self._handle_telemetry_packet(cand)
             elif msg_id == MSG_ID_REQ_SWITCH and tot_len == 10:
                 self._handle_rate_switch_request(cand)
