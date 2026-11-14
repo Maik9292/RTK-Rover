@@ -6,6 +6,8 @@
 #include <SPI.h>
 #include <driver/gpio.h>
 #include <esp_heap_caps.h>
+#include <esp_system.h>
+#include <esp_task_wdt.h>
 
 #include "user_config.h"
 #include "src/rover_api.h"
@@ -43,6 +45,8 @@ static QueueHandle_t roverStateQueue = NULL;
 static QueueHandle_t beepQueue       = NULL;
 static esp_codec_dev_handle_t playback_handle = NULL;
 static volatile bool     pending_tare_level   = false;
+static portMUX_TYPE      s_pwr_snapshot_mux   = portMUX_INITIALIZER_UNLOCKED;
+static Axp2101Status_t   s_pwr_snapshot       = {};
 
 // =========================================================================
 // Backlight PWM Control (GPIO 6 on ESP32-S3-Touch-LCD-3.5B)
@@ -164,6 +168,7 @@ void task_audio_beep(void *pvParameters)
 void task_rover_core0(void *pvParameters)
 {
     (void)pvParameters;
+    esp_task_wdt_add(NULL);
     RoverUIData_t state = {};
     uint32_t last_ui_push_ms   = 0;
     uint32_t last_telem_log_ms = 0;
@@ -194,6 +199,7 @@ void task_rover_core0(void *pvParameters)
                                           state.raw_lon,
                                           state.raw_alt_m,
                                           state.heading_valid,
+                                          state.heading_source,
                                           state.true_heading_deg,
                                           state.baseline_pitch_deg,
                                           &state.tip_lat,
@@ -255,7 +261,23 @@ void task_rover_core0(void *pvParameters)
                 } else {
                     snprintf(rssi_str, sizeof(rssi_str), "Noise:--dBm Pkt:--dBm");
                 }
-                Serial.printf("[TELEM] Fix:%d SVs:%u/%u Hdg:%s(%.1f) BL:%.1fcm Spd:%.1fm/s Base:%u Diff:%.1fs | COM1 RX:%luB NMEA:%lu RTCM_TX:%luB | E220 AUX:%d (Edges:%lu) %s RX:%luB Fwd:%luB OK:%lu (1006:%u 1074:%u 1084:%u 1094:%u 1230:%u) Err:%lu (Trunc:%lu) Orph:%luB\n",
+                char pwr_str[32];
+                Axp2101Status_t pwr_snap;
+                portENTER_CRITICAL(&s_pwr_snapshot_mux);
+                pwr_snap = s_pwr_snapshot;
+                portEXIT_CRITICAL(&s_pwr_snapshot_mux);
+                if (!pwr_snap.online) {
+                    snprintf(pwr_str, sizeof(pwr_str), "Pwr:--");
+                } else if (pwr_snap.vbus_good) {
+                    snprintf(pwr_str, sizeof(pwr_str), "USB:%.2fV%s",
+                             pwr_snap.vbus_voltage_v,
+                             pwr_snap.is_charging ? "+" : "");
+                } else {
+                    snprintf(pwr_str, sizeof(pwr_str), "BAT:%u%%(%.2fV)",
+                             pwr_snap.battery_percent,
+                             pwr_snap.battery_voltage_v);
+                }
+                Serial.printf("[TELEM] Fix:%d SVs:%u/%u Hdg:%s(%.1f) BL:%.1fcm Spd:%.1fm/s Base:%u Diff:%.1fs | %s | COM1 RX:%luB NMEA:%lu RTCM_TX:%luB | E220 AUX:%d (Edges:%lu) %s RX:%luB Fwd:%luB OK:%lu (1006:%u 1074:%u 1084:%u 1094:%u 1230:%u) Err:%lu (Trunc:%lu) Orph:%luB\n",
                               (int)state.fix_type,
                               state.num_sats,
                               state.sats_in_view,
@@ -265,9 +287,10 @@ void task_rover_core0(void *pvParameters)
                               state.speed_m_s,
                               state.base_station_id,
                               state.diff_age_s,
+                              pwr_str,
                               (unsigned long)state.um982_stats.com1_rx_bytes,
                               (unsigned long)state.um982_stats.nmea_sentences_ok,
-                              (unsigned long)state.um982_stats.com2_tx_bytes,
+                              (unsigned long)state.um982_stats.rtcm_tx_bytes,
                               state.e220_stats.aux_pin_high ? 1 : 0,
                               (unsigned long)state.e220_stats.aux_fall_count,
                               rssi_str,
@@ -285,6 +308,7 @@ void task_rover_core0(void *pvParameters)
             }
         }
 
+        esp_task_wdt_reset();
         vTaskDelay(pdMS_TO_TICKS(2));
     }
 }
@@ -356,6 +380,24 @@ void task_display_and_audio(void *pvParameters)
         if (now - last_pwr_poll_ms >= 2000 || last_pwr_poll_ms == 0) {
             last_pwr_poll_ms = (now == 0) ? 1 : now;
             axp2101_bsp_read(&pwr);
+
+            portENTER_CRITICAL(&s_pwr_snapshot_mux);
+            s_pwr_snapshot = pwr;
+            portEXIT_CRITICAL(&s_pwr_snapshot_mux);
+
+            static bool s_pwr_init = false;
+            static bool s_last_vbus_good = false;
+            if (s_pwr_init && (pwr.vbus_good != s_last_vbus_good)) {
+                Serial.printf("[POWER] Transition: %s -> %s | VBUS:%.2fV VBAT:%.2fV (%u%%) Chg:%s\n",
+                              s_last_vbus_good ? "USB" : "BATTERY",
+                              pwr.vbus_good ? "USB" : "BATTERY",
+                              pwr.vbus_voltage_v,
+                              pwr.battery_voltage_v,
+                              pwr.battery_percent,
+                              pwr.is_charging ? "YES" : "NO");
+            }
+            s_last_vbus_good = pwr.vbus_good;
+            s_pwr_init       = true;
         }
 
         // Auto-shutdown on battery inactivity timeout
@@ -367,8 +409,8 @@ void task_display_and_audio(void *pvParameters)
             s_battery_since_ms = now; // User interacted: reset timeout window
         }
 
-        if (pwr.vbus_good) {
-            s_battery_since_ms = now; // On USB power: hold timer reset
+        if (pwr.vbus_good || ui_state.survey_in_progress || ui_state.speed_m_s >= 0.30f) {
+            s_battery_since_ms = now; // On USB power, active survey, or walking motion: hold timer reset
         } else {
             if (s_battery_since_ms == 0) s_battery_since_ms = now;
             if (current_settings.auto_shutdown_battery_min > 0) {
@@ -579,6 +621,7 @@ void setup()
 
     Serial.printf("\n====================================================\n");
     Serial.printf("   RTK Rover %s -- Power-Up Diagnostics\n", ROVER_FIRMWARE_VERSION);
+    Serial.printf("   Reset Reason: %d\n", (int)esp_reset_reason());
     Serial.printf("====================================================\n");
 
     // 1. Initialize Shared I2C0 Bus (IO7=SCL, IO8=SDA) & TCA9554 IO Expander

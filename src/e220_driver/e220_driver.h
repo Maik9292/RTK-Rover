@@ -35,6 +35,9 @@ float e220_get_active_air_rate(void);
 // Returns target air-rate requested during pending negotiation (kbps)
 float e220_get_requested_air_rate(void);
 
+// Returns true when the GPS-disciplined 5-second superframe Second 0 uplink TX slot is active
+bool e220_is_uplink_slot_active(uint32_t now_ms);
+
 #ifdef __cplusplus
 }
 #endif

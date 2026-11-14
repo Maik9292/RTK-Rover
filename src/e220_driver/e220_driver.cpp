@@ -20,6 +20,7 @@ static RoverUIData_t     s_latest_telemetry_state = {};
 static bool              s_has_telemetry_state    = false;
 static portMUX_TYPE      s_telem_mux              = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t          s_last_uplink_tx_ms      = 0;
+static uint32_t          s_last_uplink_utc_sec    = 0xFFFFFFFFU;
 static uint8_t           s_uplink_seq             = 0;
 
 static volatile bool     s_rate_switch_requested  = false;
@@ -31,6 +32,7 @@ static bool              s_rate_switch_ack_received = false;
 static uint32_t          s_rate_switch_exec_ms    = 0;
 static float             s_active_air_rate        = 19.2f;
 static float             s_fallback_air_rate      = 19.2f;
+static uint32_t          s_rate_switch_done_ms    = 0;
 static uint32_t          s_last_valid_rtcm_ms     = 0;
 static bool              s_switched_requires_watchdog = false;
 
@@ -71,10 +73,10 @@ static void IRAM_ATTR e220_aux_isr(void)
 #define RTCM_STAGE_CAPACITY      1536U
 
 static uint8_t  rx_stage[RTCM_STAGE_CAPACITY];
-static size_t   rx_stage_len         = 0;
-static uint32_t last_stage_rx_ms     = 0;
-static uint32_t last_1094_rx_ms      = 0;
-static bool     rtcm_in_resync       = false;
+static size_t   rx_stage_len            = 0;
+static uint32_t last_stage_rx_ms        = 0;
+static uint32_t last_terminal_msm_rx_ms = 0;
+static bool     rtcm_in_resync          = false;
 
 static inline uint32_t e220_get_trunc_timeout_ms(void) {
     if (s_active_air_rate <= 4.8f)  return 1200U;
@@ -82,21 +84,62 @@ static inline uint32_t e220_get_trunc_timeout_ms(void) {
     return 280U; // 19.2k, 38.4k, 62.5k
 }
 
+static bool e220_get_superframe_clock(uint32_t now_ms,
+                                      uint32_t *utc_sec_out,
+                                      uint32_t *superframe_sec_out,
+                                      uint32_t *ms_in_sec_out)
+{
+    if (!gps_time_sync.time_synced) {
+        return false;
+    }
+    uint32_t elapsed        = now_ms - gps_time_sync.last_sync_millis;
+    uint32_t current_sec    = (gps_time_sync.last_utc_sec + (elapsed / 1000U)) % 86400U;
+    uint32_t superframe_sec = current_sec % 5U;
+    uint32_t ms_in_sec      = elapsed % 1000U;
+    if (utc_sec_out)        *utc_sec_out        = current_sec;
+    if (superframe_sec_out) *superframe_sec_out = superframe_sec;
+    if (ms_in_sec_out)      *ms_in_sec_out      = ms_in_sec;
+    return true;
+}
+
+extern "C" bool e220_is_uplink_slot_active(uint32_t now_ms)
+{
+    uint32_t superframe_sec = 0;
+    uint32_t ms_in_sec      = 0;
+    if (!e220_get_superframe_clock(now_ms, NULL, &superframe_sec, &ms_in_sec)) {
+        return false;
+    }
+    if (superframe_sec != 0U) {
+        return false;
+    }
+    if (s_active_air_rate <= 4.8f) {
+        return (ms_in_sec >= 720U && ms_in_sec <= 800U);
+    }
+    if (s_active_air_rate <= 9.6f) {
+        return (ms_in_sec >= 745U && ms_in_sec <= 825U);
+    }
+    return (ms_in_sec >= 775U && ms_in_sec <= 845U);
+}
+
 // =========================================================================
 // Non-Blocking Mode 0 Live RSSI / Ambient Noise Register Poll State
-// Queries C0 C1 C2 C3 00 02 in the post-1094 quiet gap (or every 10s when
-// idle). Parses both 4-byte (C1 00 <noise> <pkt>) and 5-byte
+// Queries C0 C1 C2 C3 00 02 once per Second 0 post-uplink quiet window (or
+// every 2s when idle). Parses both 4-byte (C1 00 <noise> <pkt>) and 5-byte
 // (C1 00 02 <noise> <pkt>) E220-900T30S replies (requires REG1 Bit 5 = 0x20).
 // =========================================================================
 #define E220_RSSI_POLL_INTERVAL_MS  900U
 #define E220_RSSI_IDLE_POLL_MS      2000U
-#define E220_RSSI_REPLY_TIMEOUT_MS  80U
+#define E220_RSSI_REPLY_TIMEOUT_MS  140U
 
-static bool     rssi_query_active    = false;
-static uint32_t last_rssi_poll_ms    = 0;
-static uint32_t rssi_query_start_ms  = 0;
+static bool     rssi_query_active       = false;
+static uint32_t last_rssi_poll_ms       = 0;
+static uint32_t s_last_rssi_poll_utc_sec = 0xFFFFFFFFU;
+static uint32_t rssi_query_start_ms     = 0;
 static uint8_t  rssi_reply_buf[5]    = {0};
 static uint8_t  rssi_reply_len       = 0;
+static uint8_t  s_rssi_timeout_streak = 0;
+static uint32_t s_aux_low_since_ms    = 0;
+static bool     s_was_radio_online    = false;
 
 // Burst telemetry state
 static uint32_t burst_bytes          = 0;
@@ -135,6 +178,19 @@ static bool e220_wait_aux_high(uint32_t timeout_ms)
         vTaskDelay(pdMS_TO_TICKS(2));
     }
     return true;
+}
+
+static void e220_wait_tx_complete(uint32_t fall_wait_ms, uint32_t rise_timeout_ms)
+{
+    uint32_t t0 = millis();
+    while (digitalRead(ROVER_PIN_E220_AUX) == HIGH) {
+        if (millis() - t0 >= fall_wait_ms) {
+            break;
+        }
+        delayMicroseconds(500);
+    }
+    e220_wait_aux_high(rise_timeout_ms);
+    isr_aux_fall_us = 0;
 }
 
 extern "C" void e220_set_mode(uint8_t m0, uint8_t m1)
@@ -340,8 +396,12 @@ extern "C" bool e220_write_default_config_registers(void)
         e220_stats.cfg_reg0      = resp[5];
         e220_stats.cfg_reg1      = resp[6];
         e220_stats.cfg_channel   = resp[7];
-        e220_stats.cfg_reg3      = resp[8];
-        e220_stats.config_valid  = true;
+        e220_stats.cfg_reg3          = resp[8];
+        e220_stats.config_valid      = true;
+        e220_stats.radio_online      = true;
+        e220_stats.last_radio_rsp_ms = millis();
+        s_rssi_timeout_streak        = 0;
+        s_was_radio_online           = true;
         ok = true;
         e220_log_decoded_registers("E220 WRITE OK");
     } else {
@@ -390,8 +450,12 @@ extern "C" bool e220_read_config_registers(void)
             e220_stats.cfg_reg0      = resp[5];
             e220_stats.cfg_reg1      = resp[6];
             e220_stats.cfg_channel   = resp[7];
-            e220_stats.cfg_reg3      = resp[8];
-            e220_stats.config_valid  = true;
+            e220_stats.cfg_reg3          = resp[8];
+            e220_stats.config_valid      = true;
+            e220_stats.radio_online      = true;
+            e220_stats.last_radio_rsp_ms = millis();
+            s_rssi_timeout_streak        = 0;
+            s_was_radio_online           = true;
             ok = true;
             e220_log_decoded_registers("E220 READ OK");
         } else if (attempt == 0) {
@@ -474,6 +538,8 @@ extern "C" void e220_run_powerup_selftest(void)
     }
 }
 
+static void e220_record_rssi_reply(uint8_t noise_raw, uint8_t pkt_raw, uint32_t now);
+
 static void e220_shift_stage_one_byte(void)
 {
     if (rx_stage_len > 1) {
@@ -502,12 +568,22 @@ static void e220_process_rx_stage(void)
             if (msg_id == ROVER_MSG_ID_ACK_RATE_SWITCH && tot_len == ROVER_ACK_SWITCH_FRAME_LEN) {
                 RoverRateSwitchAck_t ack;
                 if (rover_parse_rate_switch_ack(rx_stage, tot_len, &ack)) {
-                    Serial.printf("[E220 LORA RX ACK] Rate switch confirmed! (Req #%u Status:%u Delay:%ums)\n",
-                                  ack.req_id, ack.status, ack.switch_delay_ms);
                     if (ack.status == 0 && ack.req_id == s_rate_switch_req_id) {
-                        s_rate_switch_ack_received = true;
-                        s_rate_switch_exec_ms = millis() + ack.switch_delay_ms;
-                    } else {
+                        if (!s_rate_switch_ack_received) {
+                            s_rate_switch_ack_received = true;
+                            uint32_t rx_now_ms = millis();
+                            if (gps_time_sync.time_synced) {
+                                // Align hardware register reconfiguration precisely to top of Second 2 (T0 + 2 @ 0 ms)
+                                uint32_t elapsed = rx_now_ms - gps_time_sync.last_sync_millis;
+                                uint32_t rem_ms  = 1000U - (elapsed % 1000U);
+                                s_rate_switch_exec_ms = (rem_ms >= 200U) ? (rx_now_ms + rem_ms) : (rx_now_ms + ack.switch_delay_ms);
+                            } else {
+                                s_rate_switch_exec_ms = rx_now_ms + ack.switch_delay_ms;
+                            }
+                            Serial.printf("[E220 LORA RX ACK] Rate switch confirmed! (Req #%u Status:%u Delay:%ums)\n",
+                                          ack.req_id, ack.status, ack.switch_delay_ms);
+                        }
+                    } else if (!s_rate_switch_ack_received) {
                         s_rate_switch_requested = false;
                         e220_stats.rate_switch_pending = false;
                     }
@@ -524,6 +600,41 @@ static void e220_process_rx_stage(void)
             continue;
         }
 
+        // 0b. Intercept Late Mode 0 RSSI Replies:
+        //     4-byte E220-900T30S reply: 0xC1 0x00 <noise>=0x80..0xFA> <pkt>=0x80..0xFA>
+        //     5-byte datasheet reply:    0xC1 0x00 0x02 <noise>=0x80..0xFA> <pkt>=0x80..0xFA>
+        if (rx_stage_len >= 2 && rx_stage[0] == 0xC1 && rx_stage[1] == 0x00) {
+            if (rx_stage_len < 3) {
+                break; // Wait for byte 2 (0x02 or >= 0x80)
+            }
+            bool is_5b_hdr = (rx_stage[2] == 0x02U);
+            bool is_4b_hdr = (rx_stage[2] >= 0x80U && rx_stage[2] <= 0xFAU);
+            if (!is_5b_hdr && !is_4b_hdr) {
+                e220_stats.rtcm_orphan_bytes++;
+                e220_shift_stage_one_byte();
+                continue;
+            }
+            size_t need_len = is_5b_hdr ? 5U : 4U;
+            if (rx_stage_len < need_len) {
+                break; // Wait for remaining RSSI payload byte(s)
+            }
+            uint8_t noise_raw = is_5b_hdr ? rx_stage[3] : rx_stage[2];
+            uint8_t pkt_raw   = is_5b_hdr ? rx_stage[4] : rx_stage[3];
+            if (noise_raw < 0x80U || noise_raw > 0xFAU || pkt_raw < 0x80U || pkt_raw > 0xFAU) {
+                e220_stats.rtcm_orphan_bytes++;
+                e220_shift_stage_one_byte();
+                continue;
+            }
+            e220_record_rssi_reply(noise_raw, pkt_raw, millis());
+            if (rx_stage_len > need_len) {
+                memmove(rx_stage, rx_stage + need_len, rx_stage_len - need_len);
+                rx_stage_len -= need_len;
+            } else {
+                rx_stage_len = 0;
+            }
+            continue;
+        }
+
         // 1. Strip any leading non-0xD3 orphan bytes before UM982 COM2 ever sees them
         if (rx_stage[0] != 0xD3) {
             size_t sync_pos = 1;
@@ -534,6 +645,13 @@ static void e220_process_rx_stage(void)
                 if (sync_pos + 1 < rx_stage_len &&
                     rx_stage[sync_pos] == ROVER_TELEM_SYNC0 &&
                     rx_stage[sync_pos + 1] == ROVER_TELEM_SYNC1) {
+                    break;
+                }
+                if (sync_pos + 2 < rx_stage_len &&
+                    rx_stage[sync_pos] == 0xC1 &&
+                    rx_stage[sync_pos + 1] == 0x00 &&
+                    (rx_stage[sync_pos + 2] == 0x02U ||
+                     (rx_stage[sync_pos + 2] >= 0x80U && rx_stage[sync_pos + 2] <= 0xFAU))) {
                     break;
                 }
                 sync_pos++;
@@ -590,8 +708,9 @@ static void e220_process_rx_stage(void)
             // Verified intact RTCM3 frame -> forward atomically to UM982 COM1!
             um982_forward_rtcm(rx_stage, total_len);
 
+            uint32_t ok_now = millis();
             rtcm_in_resync = false;
-            s_last_valid_rtcm_ms = millis();
+            s_last_valid_rtcm_ms = ok_now;
             e220_stats.rtcm_frames_ok++;
             e220_stats.rtcm_bytes_forwarded += (uint32_t)total_len;
             e220_stats.last_msg_type = msg_type;
@@ -602,9 +721,12 @@ static void e220_process_rx_stage(void)
                 e220_stats.msg_msm_count++;
                 if (msg_type == 1074)      e220_stats.msg_1074_count++;
                 else if (msg_type == 1084) e220_stats.msg_1084_count++;
-                else if (msg_type == 1094) {
-                    e220_stats.msg_1094_count++;
-                    last_1094_rx_ms = millis();
+                else if (msg_type == 1094) e220_stats.msg_1094_count++;
+
+                if (msg_type == 1094 ||
+                    (msg_type == 1084 && s_active_air_rate <= 10.0f) ||
+                    (msg_type == 1074 && s_active_air_rate <= 5.0f)) {
+                    last_terminal_msm_rx_ms = ok_now;
                 }
             } else if (msg_type == 1230) {
                 e220_stats.msg_1230_count++;
@@ -680,8 +802,15 @@ static void e220_ingest_rx_bytes(const uint8_t *data, size_t len, uint32_t now)
     burst_bytes += (uint32_t)len;
     burst_last_byte_ms = now;
 
-    e220_stats.rx_bytes_total += (uint32_t)len;
-    e220_stats.last_rx_ms = now;
+    e220_stats.rx_bytes_total   += (uint32_t)len;
+    e220_stats.last_rx_ms        = now;
+    e220_stats.radio_online      = true;
+    e220_stats.last_radio_rsp_ms = now;
+    s_rssi_timeout_streak        = 0;
+    if (!s_was_radio_online) {
+        s_was_radio_online = true;
+        Serial.println("[E220 LORA] Radio link ONLINE (UART RX activity detected).");
+    }
     last_stage_rx_ms = now;
 
     // Preserve raw wire-tap to SD/FFat rtcm-base_*.txt for forensic analysis
@@ -708,11 +837,42 @@ static void e220_ingest_rx_bytes(const uint8_t *data, size_t len, uint32_t now)
     e220_process_rx_stage();
 }
 
+static void e220_record_rssi_reply(uint8_t noise_raw, uint8_t pkt_raw, uint32_t now)
+{
+    if (noise_raw > 0x80U && noise_raw <= 0xFAU) {
+        e220_stats.ambient_noise_dbm = (int16_t)noise_raw - 256;
+    }
+    if (e220_stats.rx_bytes_total > 0 && pkt_raw >= 0x81U && pkt_raw <= 0xFAU) {
+        e220_stats.last_pkt_rssi_dbm = (int16_t)pkt_raw - 256;
+        e220_stats.rssi_valid        = true;
+    }
+    e220_stats.radio_online      = true;
+    e220_stats.last_radio_rsp_ms = now;
+    s_rssi_timeout_streak        = 0;
+    if (!s_was_radio_online) {
+        s_was_radio_online = true;
+        Serial.println("[E220 LORA] Radio link ONLINE (Mode 0 RSSI response verified).");
+        if (!e220_stats.config_valid) {
+            pending_cfg_read = true;
+        }
+    }
+    rssi_query_active     = false;
+    rssi_reply_len        = 0;
+    e220_suppress_aux_isr = false;
+}
+
 extern "C" void e220_poll_and_forward_rtcm(void)
 {
     e220_stats.aux_pin_high    = (digitalRead(ROVER_PIN_E220_AUX) == HIGH);
     e220_stats.aux_fall_count  = isr_aux_fall_count;
     e220_stats.aux_last_low_us = isr_aux_last_low_us;
+
+    uint32_t poll_now_ms = millis();
+    if (e220_stats.aux_pin_high) {
+        s_aux_low_since_ms = 0;
+    } else if (s_aux_low_since_ms == 0) {
+        s_aux_low_since_ms = (poll_now_ms == 0) ? 1U : poll_now_ms;
+    }
 
     if (pending_cfg_write) {
         pending_cfg_write = false;
@@ -732,7 +892,11 @@ extern "C" void e220_poll_and_forward_rtcm(void)
 
             bool prefix_mismatch =
                 (rssi_reply_len == 1 && rssi_reply_buf[0] != 0xC1) ||
-                (rssi_reply_len == 2 && rssi_reply_buf[1] != 0x00);
+                (rssi_reply_len == 2 && rssi_reply_buf[1] != 0x00) ||
+                (rssi_reply_len == 3 && rssi_reply_buf[2] != 0x02U &&
+                 (rssi_reply_buf[2] < 0x80U || rssi_reply_buf[2] > 0xFAU)) ||
+                (rssi_reply_len >= 4 && (rssi_reply_buf[3] < 0x80U || rssi_reply_buf[3] > 0xFAU)) ||
+                (rssi_reply_len == 5 && (rssi_reply_buf[4] < 0x80U || rssi_reply_buf[4] > 0xFAU));
 
             if (prefix_mismatch) {
                 // An incoming LoRa packet arrived simultaneously -> cancel RSSI intercept and feed zero-loss to RTCM stage!
@@ -744,29 +908,15 @@ extern "C" void e220_poll_and_forward_rtcm(void)
                 break;
             }
 
-            if (rssi_reply_len == 4 && rssi_reply_buf[2] != 0x02) {
-                // 4-byte E220-900T30S MCU firmware reply: 0xC1 0x00 <noise_raw> <pkt_raw>
-                e220_stats.ambient_noise_dbm = (int16_t)rssi_reply_buf[2] - 256;
-                if (e220_stats.rx_bytes_total > 0 && rssi_reply_buf[3] != 0x00) {
-                    e220_stats.last_pkt_rssi_dbm = (int16_t)rssi_reply_buf[3] - 256;
-                }
-                e220_stats.rssi_valid        = true;
-                rssi_query_active            = false;
-                rssi_reply_len               = 0;
-                e220_suppress_aux_isr        = false;
+            if (rssi_reply_len == 4 && rssi_reply_buf[2] != 0x02U) {
+                // 4-byte E220-900T30S silicon firmware reply: 0xC1 0x00 <noise_raw> <pkt_raw>
+                e220_record_rssi_reply(rssi_reply_buf[2], rssi_reply_buf[3], now);
                 break;
             }
 
             if (rssi_reply_len == 5) {
                 // 5-byte datasheet reply: 0xC1 0x00 0x02 <noise_raw> <pkt_raw>
-                e220_stats.ambient_noise_dbm = (int16_t)rssi_reply_buf[3] - 256;
-                if (e220_stats.rx_bytes_total > 0 && rssi_reply_buf[4] != 0x00) {
-                    e220_stats.last_pkt_rssi_dbm = (int16_t)rssi_reply_buf[4] - 256;
-                }
-                e220_stats.rssi_valid        = true;
-                rssi_query_active            = false;
-                rssi_reply_len               = 0;
-                e220_suppress_aux_isr        = false;
+                e220_record_rssi_reply(rssi_reply_buf[3], rssi_reply_buf[4], now);
                 break;
             }
         }
@@ -780,6 +930,18 @@ extern "C" void e220_poll_and_forward_rtcm(void)
                 e220_ingest_rx_bytes(rssi_reply_buf, saved_len, millis());
             } else {
                 rssi_reply_len = 0;
+                if (s_rssi_timeout_streak < 255U) {
+                    s_rssi_timeout_streak++;
+                }
+                uint32_t rx_silence_ms = (e220_stats.last_rx_ms > 0) ? (millis() - e220_stats.last_rx_ms) : 0xFFFFFFFFU;
+                if (s_rssi_timeout_streak >= 3U && rx_silence_ms > 10000U) {
+                    if (e220_stats.radio_online) {
+                        Serial.println("[E220 LORA] WARNING: Radio link OFFLINE (3 consecutive Mode 0 poll timeouts & >10s RX silence).");
+                    }
+                    e220_stats.radio_online = false;
+                    e220_stats.rssi_valid   = false;
+                    s_was_radio_online      = false;
+                }
             }
         }
     }
@@ -795,6 +957,17 @@ extern "C" void e220_poll_and_forward_rtcm(void)
     }
 
     uint32_t now = millis();
+
+    if (s_aux_low_since_ms > 0 &&
+        (now - s_aux_low_since_ms > 3000U) &&
+        (e220_stats.last_rx_ms == 0 || (now - e220_stats.last_rx_ms > 3000U))) {
+        if (e220_stats.radio_online) {
+            Serial.println("[E220 LORA] WARNING: Radio link OFFLINE (AUX held LOW > 3.0s with no UART RX).");
+        }
+        e220_stats.radio_online = false;
+        e220_stats.rssi_valid   = false;
+        s_was_radio_online      = false;
+    }
 
     // 3. Flush burst diagnostic log when UART line goes idle for >= 15 ms
     if (burst_bytes > 0 && (now - burst_last_byte_ms >= 15)) {
@@ -837,73 +1010,88 @@ extern "C" void e220_poll_and_forward_rtcm(void)
         rtcm_in_resync = false;
     }
 
-    // 5. Synchronized Mode 0 Ambient Noise & Last Packet RSSI query:
-    //    - Active stream: fire 30..350ms after 1094 (inside the ~545ms inter-epoch RF quiet gap @ 38.4k)
-    //      or 35..300ms after any RX burst if 1094 has not arrived within 8s.
-    //    - Idle link: probe once 2.5s after boot, then every 10s when no RF traffic is arriving.
-    if (!rssi_query_active &&
-        e220_stats.config_valid &&
-        ((e220_stats.cfg_reg1 & 0x20) != 0) &&
+    // 5. Synchronized Mode 0 Ambient Noise & Last Packet RSSI query (~1.8-2.0s real-time updates):
+    //    - Suppressed while an air-rate switch request/ACK handshake is in flight.
+    //    - In Second 0: poll immediately after uplink TX finishes (780..890ms).
+    //    - In Seconds 1..4: poll ONLY inside guaranteed end-of-epoch idle gap after a terminal MSM
+    //      frame completes (15..45ms post-frame and sf_ms in 420..780ms, leaving >=220ms before next epoch).
+    uint32_t sf_utc_sec = 0;
+    uint32_t sf_sec     = 0;
+    uint32_t sf_ms      = 0;
+    bool     has_sf     = e220_get_superframe_clock(now, &sf_utc_sec, &sf_sec, &sf_ms);
+    bool     in_sec0_tx_block = has_sf && (sf_sec == 0U) && (sf_ms >= 680U) && (sf_ms <= 880U) &&
+                                (s_last_uplink_utc_sec != sf_utc_sec);
+
+    if (!s_rate_switch_requested &&
+        !rssi_query_active &&
+        !in_sec0_tx_block &&
+        (!e220_stats.config_valid || ((e220_stats.cfg_reg1 & 0x20) != 0)) &&
         rx_stage_len == 0 &&
         burst_bytes == 0 &&
+        (burst_last_byte_ms == 0 || (now - burst_last_byte_ms >= 15U)) &&
         (now - last_rssi_poll_ms >= E220_RSSI_POLL_INTERVAL_MS) &&
         digitalRead(ROVER_PIN_E220_AUX) == HIGH &&
         Serial0.available() == 0) {
 
-        bool post_1094_gap = (last_1094_rx_ms > 0) &&
-                             (now - last_1094_rx_ms >= 30U) &&
-                             (now - last_1094_rx_ms <= 350U);
+        bool post_uplink_gap = has_sf && (sf_sec == 0U) &&
+                               (s_last_uplink_utc_sec == sf_utc_sec) &&
+                               (s_last_rssi_poll_utc_sec != sf_utc_sec) &&
+                               (sf_ms >= 780U) && (sf_ms <= 890U);
 
-        bool post_any_gap  = (e220_stats.last_rx_ms > 0) &&
-                             (last_1094_rx_ms == 0 || (now - last_1094_rx_ms > 8000U)) &&
-                             (now - e220_stats.last_rx_ms >= 35U) &&
-                             (now - e220_stats.last_rx_ms <= 300U);
+        bool inter_epoch_gap = has_sf && (sf_sec != 0U) &&
+                               (last_terminal_msm_rx_ms > 0) &&
+                               (now - last_terminal_msm_rx_ms >= 15U) &&
+                               (now - last_terminal_msm_rx_ms <= 45U) &&
+                               (sf_ms >= 420U) && (sf_ms <= 780U) &&
+                               (now - last_rssi_poll_ms >= 1800U);
 
-        bool boot_probe    = (!e220_stats.rssi_valid) &&
-                             (e220_stats.last_rx_ms == 0) &&
-                             (now >= 2500U);
+        bool unsynced_gap    = !has_sf &&
+                               (last_terminal_msm_rx_ms > 0) &&
+                               (now - last_terminal_msm_rx_ms >= 15U) &&
+                               (now - last_terminal_msm_rx_ms <= 45U) &&
+                               (now - last_rssi_poll_ms >= 1800U);
 
-        bool idle_probe    = (e220_stats.last_rx_ms == 0 || (now - e220_stats.last_rx_ms >= E220_RSSI_IDLE_POLL_MS)) &&
-                             (now - last_rssi_poll_ms >= E220_RSSI_IDLE_POLL_MS);
+        bool idle_link_probe = (e220_stats.last_rx_ms == 0 || (now - e220_stats.last_rx_ms > 3000U)) &&
+                               (!has_sf || sf_sec != 0U || sf_ms < 650U) &&
+                               (now - last_rssi_poll_ms >= 2000U);
 
-        if (post_1094_gap || post_any_gap || boot_probe || idle_probe) {
+        if (post_uplink_gap || inter_epoch_gap || unsynced_gap || idle_link_probe) {
             static const uint8_t kRssiCmd[6] = {0xC0, 0xC1, 0xC2, 0xC3, 0x00, 0x02};
-            last_rssi_poll_ms     = now;
-            rssi_query_start_ms   = now;
-            rssi_reply_len        = 0;
-            e220_suppress_aux_isr = true;
-            rssi_query_active     = true;
+            last_rssi_poll_ms       = now;
+            if (has_sf) {
+                s_last_rssi_poll_utc_sec = sf_utc_sec;
+            }
+            rssi_query_start_ms     = now;
+            rssi_reply_len          = 0;
+            e220_suppress_aux_isr   = true;
+            rssi_query_active       = true;
             Serial0.write(kRssiCmd, sizeof(kRssiCmd));
         }
     }
 
-    // 6. Bi-Directional LoRa Uplink & Air-Rate Negotiation Scheduler
-    // Transmits in the half-duplex quiet window (>= 100ms after RTCM burst end / 1094,
-    // or when link is idle, provided AUX is HIGH and no RSSI query is in flight).
+    // 6. Bi-Directional LoRa Uplink & Air-Rate Negotiation Scheduler (GPS-Disciplined 5s Superframe TDMA)
+    // Transmits ONLY during the GPS-disciplined Second 0 quiet/uplink slot (max 1 packet per Second 0),
+    // provided AUX is HIGH, UART RX is idle, and no RSSI query is in flight.
     if (!rssi_query_active &&
         rx_stage_len == 0 &&
         burst_bytes == 0 &&
         digitalRead(ROVER_PIN_E220_AUX) == HIGH &&
         Serial0.available() == 0) {
 
-        bool in_quiet_window = false;
-        if (last_1094_rx_ms > 0 && (now - last_1094_rx_ms >= 100U) && (now - last_1094_rx_ms <= 450U)) {
-            in_quiet_window = true;
-        } else if (last_burst_end_ms > 0 && (now - last_burst_end_ms >= 100U) && (now - last_burst_end_ms <= 450U)) {
-            in_quiet_window = true;
-        } else if (e220_stats.last_rx_ms == 0 || (now - e220_stats.last_rx_ms >= 3000U)) {
-            in_quiet_window = true; // Idle link
-        }
+        bool uplink_slot_ready = has_sf &&
+                                 e220_is_uplink_slot_active(now) &&
+                                 (sf_utc_sec != s_last_uplink_utc_sec) &&
+                                 (s_last_uplink_tx_ms == 0 || (now - s_last_uplink_tx_ms >= 2000U));
 
-        // A. Priority 1: Transmit Pending Air-Rate Switch Request
+        // A. Priority 1: Transmit Pending Air-Rate Switch Request (12s timeout covers 2 full 5s superframes)
         if (s_rate_switch_requested && !s_rate_switch_ack_received) {
-            if (s_rate_switch_req_start_ms > 0 && (now - s_rate_switch_req_start_ms > 6000U)) {
-                // Request timeout after 6 seconds of no ACK -> abort and clear pending flag
+            if (s_rate_switch_req_start_ms > 0 && (now - s_rate_switch_req_start_ms > 12000U)) {
+                // Request timeout after 12 seconds of no ACK -> abort and clear pending flag
                 Serial.printf("[E220 LORA] Air-rate switch request to %.1fk timed out (no ACK) -> Aborting.\n", s_requested_rate_kbps);
                 s_rate_switch_requested        = false;
                 e220_stats.rate_switch_pending = false;
                 s_rate_switch_req_start_ms     = 0;
-            } else if (in_quiet_window && (now - s_rate_switch_req_tx_ms >= 1000U)) {
+            } else if (uplink_slot_ready) {
                 uint8_t air_code = ROVER_AIR_CODE_19_2K;
                 if (s_requested_rate_kbps < 3.0f)       air_code = ROVER_AIR_CODE_2_4K;
                 else if (s_requested_rate_kbps < 7.0f)  air_code = ROVER_AIR_CODE_4_8K;
@@ -919,20 +1107,21 @@ extern "C" void e220_poll_and_forward_rtcm(void)
                     e220_suppress_aux_isr = true;
                     Serial0.write(tx_buf, n);
                     Serial0.flush();
-                    e220_wait_aux_high(250);
+                    e220_wait_tx_complete(25, 300);
+                    now = millis();
                     e220_suppress_aux_isr = false;
                     s_rate_switch_req_tx_ms = now;
                     s_last_uplink_tx_ms     = now;
+                    s_last_uplink_utc_sec   = sf_utc_sec;
                     Serial.printf("[E220 LORA TX] Sent Rate Switch Req #%u -> air_code 0x%02X (%.1fk)\n",
                                   s_rate_switch_req_id, air_code, s_requested_rate_kbps);
                 }
             }
         }
-        // B. Priority 2: Periodic Uplink Telemetry (Every 5 seconds)
+        // B. Priority 2: Periodic Uplink Telemetry (Every 5 seconds in GPS-disciplined Second 0 slot)
         else if (s_has_telemetry_state &&
                  !s_rate_switch_requested &&
-                 in_quiet_window &&
-                 (now - s_last_uplink_tx_ms >= 5000U)) {
+                 uplink_slot_ready) {
 
             RoverUIData_t telem_state;
             portENTER_CRITICAL(&s_telem_mux);
@@ -945,13 +1134,25 @@ extern "C" void e220_poll_and_forward_rtcm(void)
                 e220_suppress_aux_isr = true;
                 Serial0.write(tx_buf, n);
                 Serial0.flush();
-                e220_wait_aux_high(250);
+                e220_wait_tx_complete(25, 300);
+                now = millis();
                 e220_suppress_aux_isr = false;
-                s_last_uplink_tx_ms = now;
+                s_last_uplink_tx_ms   = now;
+                s_last_uplink_utc_sec = sf_utc_sec;
                 s_uplink_seq++;
                 e220_stats.uplink_packets_sent++;
                 if (current_settings.enable_serial_logging) {
-                    Serial.printf("[E220 LORA TX #%u] Uplink 45B (Fix:%d SLV:%d Tip:%.7f,%.7f,%.2fm BL:%.1fcm P:%+.1fdeg Bat:%u%%)\n",
+                    char pwr_str[32];
+                    if (telem_state.vbus_present) {
+                        snprintf(pwr_str, sizeof(pwr_str), "USB:%.2fV%s",
+                                 telem_state.vbus_voltage,
+                                 telem_state.is_charging ? "+" : "");
+                    } else {
+                        snprintf(pwr_str, sizeof(pwr_str), "Bat:%u%%(%.2fV)",
+                                 telem_state.battery_percent,
+                                 telem_state.battery_voltage);
+                    }
+                    Serial.printf("[E220 LORA TX #%u] Uplink 45B (Fix:%d SLV:%d Tip:%.7f,%.7f,%.2fm BL:%.1fcm P:%+.1fdeg %s)\n",
                                   s_uplink_seq,
                                   telem_state.fix_type,
                                   telem_state.slave_fix_type,
@@ -960,14 +1161,14 @@ extern "C" void e220_poll_and_forward_rtcm(void)
                                   telem_state.tip_height_m,
                                   telem_state.baseline_length_m * 100.0f,
                                   telem_state.baseline_pitch_deg,
-                                  telem_state.battery_percent);
+                                  pwr_str);
                 }
             }
         }
     }
 
-    // 7. Execute Scheduled Air-Rate Reconfiguration after ACK delay
-    if (s_rate_switch_ack_received && (now >= s_rate_switch_exec_ms)) {
+    // 7. Execute Scheduled Air-Rate Reconfiguration synchronously at Second 2 boundary
+    if (s_rate_switch_ack_received && ((int32_t)(now - s_rate_switch_exec_ms) >= 0)) {
         s_rate_switch_ack_received = false;
         s_rate_switch_requested    = false;
         e220_stats.rate_switch_pending = false;
@@ -978,20 +1179,21 @@ extern "C" void e220_poll_and_forward_rtcm(void)
         s_active_air_rate = s_requested_rate_kbps;
         e220_stats.active_air_rate_kbps = s_active_air_rate;
         e220_stats.uplink_rate_switches++;
+        now = millis();
+        s_rate_switch_done_ms = now;
         s_switched_requires_watchdog = true;
-        s_last_valid_rtcm_ms = now;
         mark_settings_dirty();
     }
 
     // 8. 60-Second Watchdog Rollback Guard
     if (s_switched_requires_watchdog) {
-        if (e220_stats.rtcm_frames_ok > 0 && (now - e220_stats.last_rx_ms < 5000U)) {
-            // Received valid RTCM at the new air-rate -> switch confirmed!
+        if (e220_stats.rtcm_frames_ok > 0 && ((int32_t)(s_last_valid_rtcm_ms - s_rate_switch_done_ms) > 0)) {
+            // Received valid RTCM strictly AFTER the switch completed -> switch confirmed!
             s_switched_requires_watchdog = false;
-            Serial.println("[E220 LORA] Link verified at new air-rate! Watchdog disarmed.");
-        } else if (now - s_last_valid_rtcm_ms > 60000U) {
+            Serial.printf("[E220 TDMA] Post-switch RTCM verified on %.1fk; rollback watchdog disarmed.\n", s_active_air_rate);
+        } else if (now >= s_rate_switch_done_ms && (now - s_rate_switch_done_ms > 60000U)) {
             s_switched_requires_watchdog = false;
-            Serial.println("[E220 LORA WATCHDOG] 60s silence -> Rolling back to 19.2k fallback!");
+            Serial.printf("[E220 LORA WATCHDOG] 60s silence -> Rolling back to %.1fk fallback!\n", s_fallback_air_rate);
             current_settings.e220_air_rate_kbps = s_fallback_air_rate;
             e220_write_default_config_registers();
             s_active_air_rate = s_fallback_air_rate;
@@ -1018,7 +1220,23 @@ extern "C" void e220_feed_telemetry_state(const RoverUIData_t *state)
 
 extern "C" bool e220_request_air_rate_switch(float target_rate_kbps)
 {
-    if (s_rate_switch_requested || e220_stats.rate_switch_pending) {
+    if (target_rate_kbps < 2.0f || target_rate_kbps > 65.0f) {
+        return false;
+    }
+    // Reject only once the over-the-air switch request has been transmitted in Second 0
+    if (s_rate_switch_requested && (s_rate_switch_req_tx_ms > 0 || s_rate_switch_ack_received)) {
+        return false;
+    }
+    // If rapid cycling brings target back to the currently active rate before Second 0 TX, cancel queued switch
+    if (fabsf(target_rate_kbps - s_active_air_rate) < 0.2f) {
+        if (s_rate_switch_requested) {
+            s_rate_switch_requested        = false;
+            s_requested_rate_kbps          = s_active_air_rate;
+            e220_stats.rate_switch_pending = false;
+            s_rate_switch_req_start_ms     = 0;
+            Serial.printf("[E220 TDMA] Queued air-rate switch cancelled (cycled back to %.1fk).\n", s_active_air_rate);
+            return true;
+        }
         return false;
     }
     s_requested_rate_kbps      = target_rate_kbps;

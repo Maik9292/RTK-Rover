@@ -5,6 +5,55 @@ All notable changes to the **RTK Rover** project will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.8.5] - 2026-11-14
+
+### Added
+- **3-Rate LoRa Air-Rate Button Cycling & Rapid Pre-TX Queuing (`src/lvgl_port/lvgl_port.c`, `src/e220_driver/e220_driver.cpp`):**
+  - Updated `lora_rate_btn_cb()` to cycle across all three Phase 9 air-rates (`19.2k -> 9.6k -> 4.8k -> 19.2k`) based on the queued target rate when pending (`e220_is_rate_switch_pending() ? e220_get_requested_air_rate() : e220_get_active_air_rate()`).
+  - Updated `e220_request_air_rate_switch()` to allow rapid rate cycling until the Second 0 over-the-air request is transmitted (`s_rate_switch_req_tx_ms == 0 && !s_rate_switch_ack_received`), cleanly cancelling the pending switch if cycled back to `s_active_air_rate`.
+- **Near-Realtime Collision-Free Mode 0 RSSI Polling (`src/e220_driver/e220_driver.cpp`):**
+  - Added `last_terminal_msm_rx_ms` (`1094`, `1084` at `<= 10.0k`, `1074` at `<= 5.0k`) and `inter_epoch_gap` (`15..45 ms` after terminal MSM completion while `sf_ms` is `420..780 ms`, leaving `>= 220 ms` idle silence before the next 1 Hz epoch), alongside Second 0 `post_uplink_gap` (`780..890 ms`), delivering `~1.8–2.0 s` LoRa dBm updates without colliding with incoming 2-subpacket RTCM frames.
+
+### Fixed
+- **Air-Rate Switch Synchronization Hardening (`scripts/e220_pacer.py v3.5.2`, `src/e220_driver/e220_driver.cpp`):**
+  - Updated `_transmit_pending_switch_ack_if_due()` in `scripts/e220_pacer.py` to pace the 11-byte `ACK_SWITCH` frame through `self.send_packet(ack_frame)` (respecting full Time-on-Air + 35 ms guard) and transmit a backup `ACK_SWITCH #2` at `>= 220 ms` in Second 1.
+  - Updated `_service_superframe_events()` and `process_stream()` to hold RTCM downlink TX during Second 1 while a Second 2 switch (`pending_switch_exec_sec > 0`) is pending so RTCM frames never concatenate onto `ACK_SWITCH` or bleed across the Second 2 `reconfigure_air_rate()` transition.
+  - Suppressed Mode 0 RSSI polling while `s_rate_switch_requested` is `true`, ignored duplicate `ROVER_MSG_ID_ACK_RATE_SWITCH` frames once `s_rate_switch_ack_received` is set, and separated `s_rate_switch_done_ms` from `s_last_valid_rtcm_ms` (refreshing `now = millis()` after `e220_write_default_config_registers()`) so the 60-second rollback watchdog only disarms when a valid CRC24Q RTCM frame arrives strictly *after* the switch.
+- **LoRa dBm Display & Tile 4 Meter Blank/Red Flickering (`src/e220_driver/e220_driver.cpp`, `src/lvgl_port/lvgl_port.c`):**
+  - Restored dual **4-byte** (`0xC1 0x00 <noise> <pkt>`, per `docs/e220-reference.md` Section 7.2) and **5-byte** (`0xC1 0x00 0x02 <noise> <pkt>`) Mode 0 RSSI reply parsing across `rssi_query_active` and Stage `0b`, validating payload bytes in `0x80..0xFA` (`-128..-6 dBm`) so random `0xC1 0x00` RTCM byte collisions cannot corrupt RSSI stats.
+  - Prevented `s_rssi_timeout_streak >= 3U` from clearing `radio_online` / `rssi_valid` while UART RX bytes have arrived within the last 10 seconds (`rx_silence_ms <= 10000U`).
+  - Raised UI RSSI staleness thresholds in `lvgl_port.c` (`is_stale > 6000 ms` in header, `is_fresh <= 6.0f s` on Tile 4) so neither flashes red or drops to `0%` across a 5-second superframe boundary.
+
+## [v0.8.4] - 2026-11-14
+
+### Fixed
+- **9.6 kbps Constellation Interleaver Epoch Tracking & Uplink TX Pacing (`test/_037`, `scripts/e220_pacer.py v3.5.1`, `src/e220_driver/e220_driver.cpp`):**
+  - Resolved `9.6k` interleaver bug where `1084` (GLONASS) and `1094` (Galileo) were both transmitted in the same epoch (`89%` duty cycle): tracked `self.last_msm_type` in `should_send_rtcm_frame()` and evaluated the interleaver before the Second 0 downlink cutoff (`self.head_frame_approved`) so skipped frames are dropped immediately.
+  - Added `e220_wait_tx_complete(25, 300)` after Rover uplink TX in Second 0 so `post_uplink_gap` Mode 0 RSSI polling waits for TX completion.
+
+## [v0.8.3] - 2026-11-14
+
+### Fixed
+- **Zero Compiler Warnings Cleanup (`src/waypoint_manager/waypoint_manager.cpp`):**
+  - Eliminated all 6 pre-existing `-Wvolatile` compound-assignment deprecation warnings on `volatile uint32_t g_waypoint_change_seq` and established zero warnings under `--warnings default`.
+
+## [v0.8.2] - 2026-11-14
+
+### Fixed
+- **VBAT 5V Boost Rail Sensor Detection (`src/um982_driver/`, `src/e220_driver/`, `src/lvgl_port/lvgl_port.c`, `RTK_Rover.ino`):**
+  - Decoupled UM982 (`com1_online`) and E220 (`radio_online`) operational status checks from `vbus_present` so removing USB power while the VBAT 5V boost converter powers both peripherals keeps RTK fix, heading, and LoRa telemetry active.
+
+## [v0.8.1] - 2026-11-14
+
+### Added
+- **Phase 9: GPS-Disciplined 5-Second Superframe TDMA (`GpsTimeSync_t`, `scripts/e220_pacer.py v3.5.0`, `src/e220_driver/e220_driver.cpp`):**
+  - Anchored Base and Rover half-duplex scheduling to GPS UTC time (`UTC_Second % 5 == 0` Second 0 downlink cutoff + Rover uplink slot; Seconds 1..4 100% Base downlink; synchronous Second 1 `ACK` / Second 2 hardware switch).
+  - Added empty MSM frame dropper (`<= 28 B`) on the Base pacer and resolved 5 code-review items from `docs/project_review_sonnet.md`.
+
+### Fixed
+- **AXP2101 USB/Battery Unplug Voltage & Icon Glitch (`test/_036`, `src/axp2101_bsp/axp2101_bsp.c`):**
+  - Fixed `16.37 V` false VBUS voltage and stuck USB/charging icon on USB unplug by reading AXP2101 status register `0x00` bit 5 (`VBUS_GOOD`), masking raw 14-bit ADC registers `0x34..0x39`, and enforcing a `1500..5500 mV` VBUS validity gate.
+
 ## [v0.8.0] - 2026-11-07
 
 ### Added
@@ -20,7 +69,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added `i2c_bsp_probe_optional_addr()` and `src/mag_bsp/mmc5983ma_driver.cpp` supporting non-intrusive boot-time auto-detection of the external `MMC5983MA` (`0x30`, `Product ID 1` register `0x2F == 0x30`) on shared `I2C_NUM_0` (`GPIO 7` SCL / `GPIO 8` SDA @ `400 kHz`). When unplugged, the firmware runs transparently in 6-DOF fallback mode (`MAG: N/A (6-DOF Mode)`).
   - Implemented hardware `SET` (`0x08`) and `RESET` (`0x10`) degaussing coil pulse calibration (`mmc5983ma_calibrate_bridge_offset()`) on `Internal Control 0` (`0x09`) at boot and every 60 seconds to mathematically eliminate thermal bridge zero-field offset drift ($\mathbf{Offset} = 0.5(\mathbf{M}_{\text{SET}} + \mathbf{M}_{\text{RESET}})$) and read die temperature (`Tout`).
   - Implemented `nav_heading_9dof_update()` in `src/nav_engine/nav_engine.cpp`: continuously learns and updates the True-North tare offset (`mag_true_north_offset_deg`) and clean reference magnetic field norm (`mag_field_ref_uT`) via a circular EMA filter whenever `UM982` has `HDG FIX` (`SLV_FIX` + valid baseline), rejects localized steel/iron anomalies when $|\|\mathbf{B}\| - B_{\text{ref}}| > 3.5\,\mu\text{T}$, and provides 9-DOF complementary-filtered heading (`HDG_SRC_COMP = 7`, displayed as `HDG CMP` / `[CMP]` in Teal `#14B8A6`) under heavy forest canopy.
-  - Updated Tile 3 (`[2D POLE PLUMB BUBBLE & COMPASS]`) and Tile 4 (`[IMU & 9-DOF COMPASS]`) with live magnetic field vector $(B_x, B_y, B_z)$, total field $\|\mathbf{B}\|$, True-North tare offset, die temperature, `SET/RESET` count, and `[TARE MAG]` button.
+  - Updated Tile 3 (`[2D POLE PLUMB BUBBLE & COMPASS]`) and Tile 4 (`[IMU & 9-DOF COMPASS]`) with live magnetic field vector $(B_x, B_y, B_z)$, total field $\|\mathbf{B}\|$, True-North tare offset, die temperature, and `SET/RESET` count (read-only display; there is no manual mag-tare button -- the tare is learned automatically from `UM982 HDG FIX`).
   - Updated `scripts/e220_pacer.py` (`v3.4.1`) to decode `HDG_SRC_COMP = 7` (`[COMP]`).
   - Bumped `ROVER_FIRMWARE_VERSION` in `user_config.h` to `v0.8.0`.
 

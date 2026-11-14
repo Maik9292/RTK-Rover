@@ -89,6 +89,8 @@ typedef struct {
     uint32_t uplink_rate_switches; // Successful air-rate switches completed
     bool     rate_switch_pending;  // True while waiting for Base ACK / switch delay
     float    active_air_rate_kbps; // Current operating air rate (e.g. 19.2, 9.6)
+    bool     radio_online;         // True when E220 actively responds to Mode 3 config or Mode 0 RSSI/RX
+    uint32_t last_radio_rsp_ms;    // millis() of most recent UART RX byte, RSSI reply, or register read
 } E220LinkStats_t;
 
 // =========================================================================
@@ -97,21 +99,37 @@ typedef struct {
 typedef struct {
     uint32_t com1_rx_bytes;
     uint32_t com1_tx_bytes;
-    uint32_t com2_rx_bytes;     // Legacy counter (0 in Single-UART COM1 mode)
-    uint32_t com2_tx_bytes;     // Verified RTCM3 bytes forwarded to UM982 (via COM1 in v0.8.0+)
+    uint32_t com2_rx_bytes;            // Legacy counter (0 in Single-UART COM1 mode)
+    uint32_t rtcm_tx_bytes;            // Verified RTCM3 bytes forwarded to UM982 (via COM1 in v0.8.0+)
+    uint32_t com1_tx_mutex_timeouts;   // Bounded 50ms mutex contention drops on COM1 TX
     uint32_t nmea_sentences_ok;
     uint32_t heading_sentences_ok;
-    uint32_t cmd_responses_ok;  // Count of $command / #VERSIONA / #MODE / $CONFIG / #LOGLIST responses
+    uint32_t cmd_responses_ok;         // Count of $command / #VERSIONA / #MODE / $CONFIG / #LOGLIST responses
     bool     com1_test_passed;
-    bool     com2_test_passed;  // True when Single-UART COM1 bidirectional self-test & state audit pass
-    bool     known_state_ok;    // True when MODE == ROVER SURVEY, COM1 has 7 logs, and COM2 has 0 logs
+    bool     com1_online;              // True when valid COM1 NMEA/Unicore/ACK traffic received within last 3.0s
+    uint32_t last_com1_rx_ms;          // millis() of most recent valid line on COM1
+    bool     single_uart_audit_passed; // True when Single-UART COM1 bidirectional self-test & state audit pass
+    bool     known_state_ok;           // True when MODE == ROVER SURVEY, COM1 has 7 logs, and COM2 has 0 logs
     char     last_com1_line[96];       // Most recent NMEA / Navigation sentence on COM1
-    char     last_com2_line[64];       // Most recent Command Response / ACK on COM1
+    char     last_cmd_ack_line[64];    // Most recent Command Response / ACK on COM1
     char     um982_version[48];        // Parsed from #VERSIONA
     char     um982_mode[32];           // Parsed from #MODE (e.g. "ROVER SURVEY")
     char     um982_config_summary[96]; // Parsed from $CONFIG (e.g. "MULTI | FIXLEN 55.5/12.0 LOWDYN")
     char     um982_loglist[112];       // Parsed from #LOGLIST (e.g. "COM1(7): GGA RMC GST GSV HDG GGAH BASE | COM2:0")
 } Um982PortStats_t;
+
+// =========================================================================
+// GPS UTC & Solution Staleness Time-Sync State (Disciplines 5s TDMA Superframe)
+// =========================================================================
+typedef struct {
+    uint32_t last_utc_sec;          // Seconds since midnight (0..86399) from GGA/RMC
+    uint32_t last_sync_millis;      // ESP32 millis() anchored to the integer UTC second boundary
+    uint32_t last_gga_ms;           // ESP32 millis() when last valid $GNGGA arrived
+    uint32_t last_rmc_ms;           // ESP32 millis() when last valid $GNRMC arrived
+    uint32_t last_uniheadinga_ms;   // ESP32 millis() when last valid #UNIHEADINGA arrived
+    uint32_t last_rtcm_forward_ms;  // ESP32 millis() when last verified RTCM3 frame was forwarded
+    bool     time_synced;           // True when locked to valid GNSS UTC within last 15s
+} GpsTimeSync_t;
 
 // =========================================================================
 // Heading Source Resolution

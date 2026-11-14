@@ -12,6 +12,7 @@
 
 static RoverUIData_t     gnss_state = {};
 static Um982PortStats_t  port_stats = {};
+volatile GpsTimeSync_t   gps_time_sync = {};
 static char              com1_line_buf[512];
 static uint16_t          com1_line_pos      = 0;
 static bool              com1_line_overflow = false;
@@ -52,6 +53,8 @@ static uint32_t gsv_last_gl_ms = 0;
 static uint32_t gsv_last_ga_ms = 0;
 static uint32_t gsv_last_gb_ms = 0;
 static uint32_t gsv_last_gq_ms = 0;
+static uint32_t s_last_offline_probe_ms = 0;
+static bool     s_was_com1_online       = false;
 
 static double parse_nmea_deg_min(const char *str, const char *hemisphere)
 {
@@ -84,13 +87,47 @@ static int split_csv_fields(char *line, char **fields, int max_fields)
     return count;
 }
 
+static void update_gps_utc_sync_from_nmea_field(const char *time_field, uint32_t now_ms)
+{
+    if (!time_field || strlen(time_field) < 6) return;
+    for (int i = 0; i < 6; i++) {
+        if (time_field[i] < '0' || time_field[i] > '9') return;
+    }
+
+    uint32_t hh = (uint32_t)((time_field[0] - '0') * 10 + (time_field[1] - '0'));
+    uint32_t mm = (uint32_t)((time_field[2] - '0') * 10 + (time_field[3] - '0'));
+    uint32_t ss = (uint32_t)((time_field[4] - '0') * 10 + (time_field[5] - '0'));
+    if (hh >= 24U || mm >= 60U || ss >= 60U) return;
+
+    uint32_t frac_ms = 0;
+    if (time_field[6] == '.' && time_field[7] != '\0') {
+        double frac = atof(time_field + 6);
+        if (frac >= 0.0 && frac < 1.0) {
+            frac_ms = (uint32_t)(frac * 1000.0 + 0.5);
+            if (frac_ms >= 1000U) frac_ms = 999U;
+        }
+    }
+
+    // Anchor last_sync_millis to the exact integer UTC second boundary (.000),
+    // compensating for fractional epoch timestamp and ~15 ms NMEA serial transit latency.
+    gps_time_sync.last_utc_sec     = (hh * 3600U) + (mm * 60U) + ss;
+    gps_time_sync.last_sync_millis = now_ms - frac_ms - 15U;
+    gps_time_sync.time_synced      = true;
+}
+
 static void handle_gga_sentence(char *line)
 {
     char *f[16] = {0};
     int n = split_csv_fields(line, f, 16);
     if (n < 14) return;
 
+    uint32_t now_ms = millis();
+    gps_time_sync.last_gga_ms = now_ms;
+
     int qual = f[6] ? atoi(f[6]) : 0;
+    if (qual > 0 && f[1] && f[1][0]) {
+        update_gps_utc_sync_from_nmea_field(f[1], now_ms);
+    }
     gnss_state.fix_type = (GnssFixType_t)qual;
     gnss_state.num_sats = f[7] ? (uint8_t)atoi(f[7]) : 0;
     if (f[8] && f[8][0]) gnss_state.hdop = (float)atof(f[8]);
@@ -147,8 +184,14 @@ static void handle_rmc_sentence(char *line)
     int n = split_csv_fields(line, f, 14);
     if (n < 10) return;
 
+    uint32_t now_ms = millis();
+    gps_time_sync.last_rmc_ms = now_ms;
+
     // Field 2: Status ('A'=Active, 'V'=Void, or 'D'=Differential)
     bool pos_active = (f[2] && (f[2][0] == 'A' || f[2][0] == 'D'));
+    if (pos_active && f[1] && f[1][0]) {
+        update_gps_utc_sync_from_nmea_field(f[1], now_ms);
+    }
 
     // Field 7: Speed over ground in knots (1 knot = 0.514444 m/s)
     if (f[7] && f[7][0]) {
@@ -289,6 +332,7 @@ static void handle_uniheadinga_sentence(char *line)
                 gnss_state.heading_is_fixed   = true;
                 gnss_state.heading_source     = HDG_SRC_DUAL_FIX;
                 gnss_state.slave_fix_type     = GNSS_FIX_RTK_FIXED;
+                gps_time_sync.last_uniheadinga_ms = millis();
                 port_stats.heading_sentences_ok++;
             } else if (bl_physically_sane) {
                 // Float with sane physical baseline
@@ -298,6 +342,7 @@ static void handle_uniheadinga_sentence(char *line)
                 gnss_state.heading_is_fixed   = false;
                 gnss_state.heading_source     = HDG_SRC_DUAL_FLT;
                 gnss_state.slave_fix_type     = GNSS_FIX_RTK_FLOAT;
+                gps_time_sync.last_uniheadinga_ms = millis();
                 port_stats.heading_sentences_ok++;
             } else {
                 // Wild baseline vector (e.g. 4.88m in Float) - reject dual-antenna heading!
@@ -497,17 +542,24 @@ static void parse_loglist_response_line(const char *line)
     rebuild_known_state_summary();
 }
 
+static void mark_com1_rx_alive(void)
+{
+    port_stats.last_com1_rx_ms  = millis();
+    port_stats.com1_online      = true;
+    port_stats.com1_test_passed = true;
+}
+
 static void record_cmd_response_line(const char *line)
 {
+    mark_com1_rx_alive();
     port_stats.cmd_responses_ok++;
-    strncpy(port_stats.last_com2_line, line, sizeof(port_stats.last_com2_line) - 1);
-    port_stats.last_com2_line[sizeof(port_stats.last_com2_line) - 1] = '\0';
+    strncpy(port_stats.last_cmd_ack_line, line, sizeof(port_stats.last_cmd_ack_line) - 1);
+    port_stats.last_cmd_ack_line[sizeof(port_stats.last_cmd_ack_line) - 1] = '\0';
 }
 
 static void process_com1_line(char *line, uint16_t line_len)
 {
     if (!line || line[0] == '\0') return;
-    port_stats.com1_test_passed = true;
 
     // =====================================================================
     // Stream 3: Unicore Command / Query Responses ($command, #VERSIONA, #MODE, $CONFIG, #LOGLIST)
@@ -574,6 +626,9 @@ static void process_com1_line(char *line, uint16_t line_len)
     if (line[0] == '$' && !verify_nmea_xor_checksum(line)) {
         return;
     }
+    if (line[0] == '$' || line[0] == '#') {
+        mark_com1_rx_alive();
+    }
 
     nmea_logger_feed((const uint8_t *)line, line_len);
     nmea_logger_feed((const uint8_t *)"\r\n", 2);
@@ -613,7 +668,12 @@ extern "C" void send_um982_com1_command(const char *cmd)
 {
     if (!cmd) return;
     size_t len = strlen(cmd);
-    if (s_com1_tx_mutex) xSemaphoreTake(s_com1_tx_mutex, portMAX_DELAY);
+    if (s_com1_tx_mutex) {
+        if (xSemaphoreTake(s_com1_tx_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+            port_stats.com1_tx_mutex_timeouts++;
+            return;
+        }
+    }
     if (Serial) Serial.printf("[UM982 COM1 TX] %s\n", cmd);
     Serial1.write((const uint8_t *)cmd, len);
     Serial1.write((const uint8_t *)"\r\n", 2);
@@ -673,7 +733,7 @@ extern "C" void um982_query_receiver_state(void)
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 
-    port_stats.com2_test_passed = port_stats.com1_test_passed;
+    port_stats.single_uart_audit_passed = port_stats.com1_test_passed;
     Serial.printf("[UM982 AUDIT SUMMARY] State:%s | Ver:%s | Mode:%s | Cfg:[%s] | Logs:[%s]\n",
                   port_stats.known_state_ok ? "KNOWN STATE OK" : "CHECK LOGS/MODE",
                   port_stats.um982_version,
@@ -684,6 +744,20 @@ extern "C" void um982_query_receiver_state(void)
 
 extern "C" void um982_configure_rover_defaults(void)
 {
+    float spacing_m = (current_settings.antenna_spacing_m > 0.05f) ? current_settings.antenna_spacing_m : 0.555f;
+    float spacing_cm = spacing_m * 100.0f;
+    char exp_len_prefix[16];
+    snprintf(exp_len_prefix, sizeof(exp_len_prefix), "%.1f", spacing_cm);
+
+    // Query existing NVM receiver state first to prevent redundant SAVECONFIG flash wear on warm boots
+    um982_query_receiver_state();
+    if (port_stats.known_state_ok &&
+        strstr(port_stats.um982_mode, "SURVEY") != NULL &&
+        strstr(s_cfg_hdg_len, exp_len_prefix) != NULL) {
+        Serial.println("[UM982] Warm boot: Receiver already in KNOWN STATE OK -> Skipping reconfig & SAVECONFIG.");
+        return;
+    }
+
     // Phase 1: Quiet-First Setup (Silence periodic logs on COM1 & COM2 so commands do not collide with NMEA)
     send_um982_com1_command("CONFIG COM1 115200");
     vTaskDelay(pdMS_TO_TICKS(40));
@@ -709,8 +783,6 @@ extern "C" void um982_configure_rover_defaults(void)
     vTaskDelay(pdMS_TO_TICKS(40));
 
     char hdg_cmd[64];
-    float spacing_m = (current_settings.antenna_spacing_m > 0.05f) ? current_settings.antenna_spacing_m : 0.555f;
-    float spacing_cm = spacing_m * 100.0f;
     // Parameter 1: baseline length in centimeters (Table 4-14 in manual: 55.5 cm)
     // Parameter 2: tolerance in centimeters (12 cm tolerance)
     snprintf(hdg_cmd, sizeof(hdg_cmd), "CONFIG HEADING LENGTH %.1f 12", spacing_cm);
@@ -754,11 +826,8 @@ extern "C" void um982_run_powerup_selftest(void)
 {
     Serial.println("\n--- [UM982 Single-UART (COM1) Power-Up Self-Test] ---");
 
-    // Silence any warm-boot periodic logs on COM1/COM2 first so VERSIONA response is clean
-    send_um982_com1_command("UNLOGALL COM1");
-    vTaskDelay(pdMS_TO_TICKS(30));
-    send_um982_com1_command("UNLOGALL COM2");
-    vTaskDelay(pdMS_TO_TICKS(30));
+    // Preserve any warm-boot NMEA/log configuration during self-test so um982_configure_rover_defaults()
+    // can audit the live receiver state without unnecessary UNLOGALL/SAVECONFIG flash wear.
     while (Serial1.available()) Serial1.read();
 
     Serial.println("[UM982 COM1] Testing Full-Duplex UART1 (RX=IO17, TX=IO18 @ 115200) with VERSIONA...");
@@ -770,11 +839,11 @@ extern "C" void um982_run_powerup_selftest(void)
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     if (port_stats.com1_test_passed) {
-        port_stats.com2_test_passed = true;
+        port_stats.single_uart_audit_passed = true;
         Serial.printf("[UM982 COM1 TEST] PASS — RX=%lu B | Version: %s | Last ACK: %s\n",
                       (unsigned long)port_stats.com1_rx_bytes,
                       port_stats.um982_version,
-                      port_stats.last_com2_line);
+                      port_stats.last_cmd_ack_line);
     } else {
         Serial.println("[UM982 COM1 TEST] FAIL — No response on IO17/18 @ 115200");
     }
@@ -797,8 +866,8 @@ extern "C" void um982_driver_init(void)
     port_stats.um982_loglist[sizeof(port_stats.um982_loglist) - 1] = '\0';
     strncpy(port_stats.last_com1_line, "No COM1 NMEA yet", sizeof(port_stats.last_com1_line) - 1);
     port_stats.last_com1_line[sizeof(port_stats.last_com1_line) - 1] = '\0';
-    strncpy(port_stats.last_com2_line, "No CMD ACK yet", sizeof(port_stats.last_com2_line) - 1);
-    port_stats.last_com2_line[sizeof(port_stats.last_com2_line) - 1] = '\0';
+    strncpy(port_stats.last_cmd_ack_line, "No CMD ACK yet", sizeof(port_stats.last_cmd_ack_line) - 1);
+    port_stats.last_cmd_ack_line[sizeof(port_stats.last_cmd_ack_line) - 1] = '\0';
 
     pinMode(ROVER_PIN_UM982_TXD0, INPUT_PULLDOWN);
     pinMode(ROVER_PIN_UM982_RXD0, INPUT_PULLDOWN);
@@ -822,9 +891,15 @@ extern "C" void um982_driver_init(void)
 extern "C" void um982_forward_rtcm(const uint8_t *data, size_t len)
 {
     if (!s_com1_tx_boot_complete || !data || len == 0) return;
-    if (s_com1_tx_mutex) xSemaphoreTake(s_com1_tx_mutex, portMAX_DELAY);
+    if (s_com1_tx_mutex) {
+        if (xSemaphoreTake(s_com1_tx_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+            port_stats.com1_tx_mutex_timeouts++;
+            return;
+        }
+    }
     size_t written = Serial1.write(data, len);
-    port_stats.com2_tx_bytes += (uint32_t)written; // Tracks RTCM3 bytes forwarded to UM982
+    gps_time_sync.last_rtcm_forward_ms = millis();
+    port_stats.rtcm_tx_bytes += (uint32_t)written; // Tracks RTCM3 bytes forwarded to UM982
     port_stats.com1_tx_bytes += (uint32_t)written;
     if (s_com1_tx_mutex) xSemaphoreGive(s_com1_tx_mutex);
 }
@@ -859,6 +934,33 @@ extern "C" void um982_poll_com1(void)
             }
         }
     }
+
+    uint32_t now_ms = millis();
+    bool is_online = (port_stats.last_com1_rx_ms > 0) &&
+                     ((now_ms - port_stats.last_com1_rx_ms) <= 3000U);
+    if (is_online && !s_was_com1_online) {
+        s_was_com1_online = true;
+        if (s_com1_tx_boot_complete && !port_stats.known_state_ok) {
+            Serial.println("[UM982] COM1 link came ONLINE after boot -> Running receiver state check/config.");
+            um982_configure_rover_defaults();
+        }
+    } else if (!is_online) {
+        if (s_was_com1_online) {
+            Serial.println("[UM982] WARNING: COM1 link went OFFLINE (>3.0s silence).");
+            s_was_com1_online = false;
+        }
+        port_stats.com1_online      = false;
+        port_stats.com1_test_passed = false;
+        if (s_com1_tx_boot_complete && (now_ms - s_last_offline_probe_ms >= 3000U)) {
+            s_last_offline_probe_ms = now_ms;
+            // Lightweight non-blocking probe so an unconfigured/reset UM982 responds when powered on
+            if (!s_com1_tx_mutex || xSemaphoreTake(s_com1_tx_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                Serial1.write((const uint8_t *)"VERSIONA\r\n", 10);
+                port_stats.com1_tx_bytes += 10U;
+                if (s_com1_tx_mutex) xSemaphoreGive(s_com1_tx_mutex);
+            }
+        }
+    }
 }
 
 extern "C" void um982_poll_com2(void)
@@ -869,6 +971,41 @@ extern "C" void um982_poll_com2(void)
 extern "C" void um982_get_latest_state(RoverUIData_t *state_out)
 {
     if (!state_out) return;
+
+    // Age-of-data expiration: expire stale GGA, GPS UTC sync, and dual-antenna heading on UART/antenna dropout
+    uint32_t now_ms = millis();
+    bool com1_alive = (port_stats.last_com1_rx_ms > 0) &&
+                      ((now_ms - port_stats.last_com1_rx_ms) <= 3000U);
+    port_stats.com1_online      = com1_alive;
+    port_stats.com1_test_passed = com1_alive;
+    if (!com1_alive) {
+        gnss_state.fix_type          = GNSS_FIX_NONE;
+        gnss_state.num_sats          = 0;
+        gnss_state.sats_in_view      = 0;
+        gnss_state.h_acc_m           = 99.9f;
+        gnss_state.v_acc_m           = 99.9f;
+        gnss_state.slave_fix_type    = GNSS_FIX_NONE;
+        gnss_state.slave_num_sats    = 0;
+        gnss_state.baseline_length_m = 0.0f;
+    }
+    if (gps_time_sync.last_gga_ms == 0 || (now_ms - gps_time_sync.last_gga_ms > 2000U)) {
+        gnss_state.fix_type = GNSS_FIX_NONE;
+        gnss_state.h_acc_m  = 99.9f;
+        gnss_state.v_acc_m  = 99.9f;
+    }
+    if (gps_time_sync.time_synced &&
+        (now_ms - gps_time_sync.last_gga_ms > 15000U) &&
+        (now_ms - gps_time_sync.last_rmc_ms > 15000U)) {
+        gps_time_sync.time_synced = false;
+    }
+    if ((gnss_state.heading_source == HDG_SRC_DUAL_FIX || gnss_state.heading_source == HDG_SRC_DUAL_FLT) &&
+        (gps_time_sync.last_uniheadinga_ms == 0 || (now_ms - gps_time_sync.last_uniheadinga_ms > 3000U))) {
+        gnss_state.heading_valid    = false;
+        gnss_state.heading_is_fixed = false;
+        gnss_state.heading_source   = HDG_SRC_NONE;
+        gnss_state.slave_fix_type   = GNSS_FIX_NONE;
+    }
+
     state_out->raw_lat            = gnss_state.raw_lat;
     state_out->raw_lon            = gnss_state.raw_lon;
     state_out->raw_alt_m          = gnss_state.raw_alt_m;

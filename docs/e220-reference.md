@@ -1,9 +1,9 @@
 # Ebyte E220-900T30S Practical Engineering Reference
 
-**Document Version:** 2.2  
-**Last Updated:** November 7, 2026  
-**Firmware Target:** `v0.7.7`  
-**Companion Software:** `e220_pacer.py v3.4.0`  
+**Document Version:** 2.3  
+**Last Updated:** November 14, 2026  
+**Firmware Target:** `v0.8.5`  
+**Companion Software:** `e220_pacer.py v3.5.2`  
 **Target Hardware:** Ebyte `E220-900T30S` (`850.125 - 930.125 MHz`, `1 W` / `+30 dBm` SMD UART LoRa Module)  
 **Applicability:** Directly applies to `E220-900T30S` / `E220-900T30D` (`1 W`) and `E220-900T22S` / `E220-900T22D` (`160 mW`, noting TX power bit differences in Section 4.4).  
 
@@ -261,10 +261,11 @@ Raw bytes lie in `0x80 .. 0xF5` (`>= 128`, representing `-128 dBm .. -11 dBm`).
 * If `len == 4` and `buf[0..1] == C1 00` and `buf[2] >= 0x80`: 4-byte reply (`noise = buf[2] - 256`, `pkt = buf[3] - 256`).
 * If `len == 5` and `buf[0..2] == C1 00 02`: 5-byte reply (`noise = buf[3] - 256`, `pkt = buf[4] - 256`).
 
-### 7.3 Quiet-Window Synchronization
-Never issue `C0 C1 C2 C3 00 02` blindly during active reception:
-1. Send the query strictly inside the inter-burst quiet window (`30..350 ms` after the last frame completes, `AUX == HIGH`).
-2. Prefix-Mismatch Abort: If `byte[0] != 0xC1` (e.g. `0xD3` from an unexpected incoming packet), abort RSSI interception immediately and pipe bytes directly into the RTCM parser.
+### 7.3 Quiet-Window Synchronization (`v0.8.5` Superframe TDMA)
+Never issue `C0 C1 C2 C3 00 02` blindly during active reception or during a pending rate-switch handshake:
+1. **Second 0 Post-Uplink Gap (`sf_sec == 0`):** Poll strictly after the Rover's uplink TX finishes (`sf_ms` in `780..890 ms`, `e220_wait_tx_complete(25, 300)`).
+2. **Seconds 1..4 Inter-Epoch Gap (`sf_sec != 0`):** For near-realtime (`~1.8–2.0 s`) updates, poll strictly after a terminal MSM frame completes (`1094`, or `1084` at `<= 10.0k`, or `1074` at `<= 5.0k`; `15..45 ms` post-frame) **and** while GPS millisecond phase `sf_ms` is in `420..780 ms` (guaranteeing `>= 220 ms` idle silence before the next 1 Hz epoch begins).
+3. **Resilient Prefix & Streak Handling:** Accept `buf[2] == 0x02` (5-byte) or `buf[2]` in `0x80..0xFA` (4-byte) alongside payload bytes `0x80..0xFA`. On mismatch (incoming packet collision), abort immediately and pipe bytes into `e220_ingest_rx_bytes()`. Never mark `radio_online = false` or `rssi_valid = false` on poll timeout streak if RTCM bytes arrived within the last `10 s`.
 
 ---
 
@@ -281,21 +282,18 @@ Never issue `C0 C1 C2 C3 00 02` blindly during active reception:
 
 ## 9. Bi-Directional Half-Duplex LoRa Protocol & Telemetry Uplink
 
-### 9.1 Half-Duplex Quiet-Window Architecture
-Because both Base and Rover operate on the same frequency (`925.125 MHz`), transmissions must be strictly non-overlapping:
+### 9.1 GPS-Disciplined 5-Second Superframe TDMA Architecture (`v0.8.5`)
+Because both Base and Rover operate on the same frequency (`925.125 MHz`), downlink and uplink transmissions are deterministically scheduled against GPS UTC seconds (`sf_sec = utc_sec % 5`):
 
 ```text
-Time (1-second epoch):
-0.00s                      0.55s                                 1.00s
-|=== Base RTCM3 Burst ====>|--- Half-Duplex Quiet Window -------->|
-                           |                                      |
-                           |   t = 0.60s: Rover Uplink 45B (31ms) |
-                           |   [===========>]                     |
+5-Second Superframe (UTC_Second % 5):
+  Seconds 1..4: [============ 100% Base RTCM3 Downlink (Zero Rover TX) ============]
+  Second 0:     [=== Base Downlink (cutoff 700/740ms) ===|=== Rover Uplink Slot ===]
+                                                          720..845ms (rate-adaptive)
 ```
 
-* **Base Station:** Transmits RTCM3 corrections in a burst at epoch start ($t = 0.00\text{ s} \dots 0.55\text{ s}$).
-* **Rover:** Transmits a 45-byte binary telemetry frame every 5 seconds within the quiet window ($t = 0.60\text{ s} \dots 0.90\text{ s}$).
-* At `19.2 kbps`, the 45-byte frame requires only $\approx 31\text{ ms}$ airtime ($<1\%$ duty cycle), leaving $> 100\text{ ms}$ guard margins on both sides.
+* **Base Station (`e220_pacer.py v3.5.2`):** Runs 100% downlink in Seconds 1..4 (dropping empty MSM frames `<= 28 B` and evaluating the `<= 9.6k` constellation interleaver before cutoff). In Second 0, enforces a downlink TX cutoff (`700 ms` @ `<= 9.6k`, `740 ms` @ `>= 19.2k`) before listening strictly for Rover uplink frames.
+* **Rover (`e220_driver.cpp`):** Transmits its 45-byte binary telemetry frame (or 10-byte rate switch request) exclusively inside the GPS-disciplined Second 0 uplink window (`775..845 ms` @ `>= 19.2k`, `745..825 ms` @ `9.6k`, `720..800 ms` @ `4.8k`), waiting for E220 TX completion via `e220_wait_tx_complete(25, 300)`.
 
 ### 9.2 45-Byte Uplink Frame Specification (`RoverUplinkTelemetry_t`)
 
@@ -341,7 +339,7 @@ To prevent operator confusion between ANT1's base fix and ANT2's moving-baseline
 
 ## 10. Touchscreen Remote Air-Rate Switching Protocol
 
-The system supports zero-credential, over-the-air air-rate negotiation between Rover and Base:
+The system supports zero-credential, GPS-synchronized 3-rate switching (`19.2k -> 9.6k -> 4.8k -> 19.2k`) between Rover and Base:
 
 ```mermaid
 sequenceDiagram
@@ -349,17 +347,15 @@ sequenceDiagram
     participant Rover as Rover UI (ESP32-S3)
     participant Base as Base Pacer (Raspberry Pi)
 
-    Note over Rover: User taps [LORA: 19.2k]<br/>Button changes to REQ: 9.6k
-    Rover->>Base: CMD_REQ_RADIO_SWITCH (10B, 0x02, target=9.6k, req_id)
-    Note over Base: Pauses RTCM TX<br/>Prepares ACK
-    Base->>Rover: ACK_RADIO_SWITCH (11B, 0x82, req_id, delay=400ms)
-    Note over Rover: Schedules Mode 3 switch<br/>at t + 400ms
-    Note over Base: Waits 400ms for ACK airtime<br/>Switches M0=1, M1=1 (Mode 3)
-    Note over Rover: Switches M0=1, M1=1 (Mode 3)<br/>Reconfigures REG0=0xE4 @ 9600 baud
-    Note over Base: Reconfigures REG0=0xE4 @ 9600 baud<br/>Returns to Mode 0
-    Note over Rover: Returns to Mode 0<br/>Enables 9.6k Adaptive Interleaver
-    Rover->>Base: Telemetry Uplink @ 9.6k (45B)
-    Note over Base: Uplink verified!<br/>Disarms 60s rollback watchdog
+    Note over Rover: User taps [LORA] to cycle 19.2k / 9.6k / 4.8k<br/>Pre-TX queue allows rapid cycling or cancel
+    Rover->>Base: CMD_REQ_RADIO_SWITCH (10B, Second 0 Uplink, req_id)
+    Note over Base: Schedules ACK@T0+1, Switch@T0+2<br/>Holds RTCM downlink during Second 1
+    Base->>Rover: ACK_RADIO_SWITCH #1 @ T0+1 0ms (11B via send_packet)
+    Base->>Rover: ACK_RADIO_SWITCH #2 @ T0+1 >=220ms (backup)
+    Note over Rover: Aligns hardware switch to top of Second 2 (T0+2)
+    Note over Base: At T0+2 0ms: Reconfigures E220 Mode 3 registers
+    Note over Rover: At T0+2 0ms: Reconfigures E220 Mode 3 registers
+    Note over Rover,Base: Both arm 60s rollback watchdog until first valid post-switch traffic
 ```
 
 ### 10.1 Binary Frame Formats
@@ -367,10 +363,10 @@ sequenceDiagram
   `0xAA 0x55 | 0x02 | len=0x04 | target_rate_code(1) | target_channel(1) | req_id(2) | crc16(2)`
   * Rate codes: `0x02`=2.4k, `0x03`=4.8k, `0x04`=9.6k, `0x05`=19.2k, `0x06`=38.4k, `0x07`=62.5k.
 * **Acknowledge (`ACK_RADIO_SWITCH`, 11 Bytes):**
-  `0xAA 0x55 | 0x82 | len=0x05 | req_id(2) | status=0x00 | exec_delay_ms(2, 400ms) | crc16(2)`
+  `0xAA 0x55 | 0x82 | len=0x05 | req_id(2) | status=0x00 | exec_delay_ms(2, 1000ms) | crc16(2)`
 
 ### 10.2 Automatic Rollback Watchdog
-If the Base Station reconfigures to a new air rate but does not receive a valid telemetry packet within **60 seconds**, it assumes the Rover failed to switch or RF link was lost, and automatically reverts its EEPROM/registers back to the $19.2\text{ kbps}$ fallback profile.
+Both Base and Rover arm a **60-second rollback watchdog** upon switching registers at Second 2 (`s_rate_switch_done_ms` on Rover). The Rover watchdog disarms only upon receiving a valid `CRC24Q` RTCM frame strictly *after* the switch timestamp; the Base disarms upon receiving valid rover telemetry after `watchdog_rate_switch_time`. Otherwise, both revert cleanly to `19.2 kbps`.
 
 ---
 

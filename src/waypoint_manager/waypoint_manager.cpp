@@ -308,7 +308,7 @@ extern "C" bool waypoint_load_csv(const char *filepath)
         g_active_waypoint_idx = 0;
     }
     waypoint_invalidate_survey_cache();
-    g_waypoint_change_seq++;
+    g_waypoint_change_seq = g_waypoint_change_seq + 1;
     Serial.printf("Loaded %d waypoints from %s\n", g_waypoint_count, filepath);
     return g_waypoint_count > 0;
 }
@@ -478,7 +478,7 @@ extern "C" void waypoint_select_next(void)
     if (g_waypoint_count <= 0) return;
     g_active_waypoint_idx = (g_active_waypoint_idx + 1) % g_waypoint_count;
     current_settings.active_waypoint_index = g_active_waypoint_idx;
-    g_waypoint_change_seq++;
+    g_waypoint_change_seq = g_waypoint_change_seq + 1;
     mark_settings_dirty();
     waypoint_invalidate_survey_cache();
 }
@@ -488,7 +488,7 @@ extern "C" void waypoint_select_prev(void)
     if (g_waypoint_count <= 0) return;
     g_active_waypoint_idx = (g_active_waypoint_idx - 1 + g_waypoint_count) % g_waypoint_count;
     current_settings.active_waypoint_index = g_active_waypoint_idx;
-    g_waypoint_change_seq++;
+    g_waypoint_change_seq = g_waypoint_change_seq + 1;
     mark_settings_dirty();
     waypoint_invalidate_survey_cache();
 }
@@ -498,7 +498,7 @@ extern "C" void waypoint_select_index(int16_t idx)
     if (idx >= 0 && idx < g_waypoint_count) {
         g_active_waypoint_idx = idx;
         current_settings.active_waypoint_index = g_active_waypoint_idx;
-        g_waypoint_change_seq++;
+        g_waypoint_change_seq = g_waypoint_change_seq + 1;
         mark_settings_dirty();
         waypoint_invalidate_survey_cache();
     }
@@ -619,7 +619,7 @@ extern "C" void waypoint_line_stakeout_swap(void)
     // Align active target to new destination (Point B)
     g_active_waypoint_idx = cur_a;
     current_settings.active_waypoint_index = g_active_waypoint_idx;
-    g_waypoint_change_seq++;
+    g_waypoint_change_seq = g_waypoint_change_seq + 1;
     mark_settings_dirty();
 }
 
@@ -631,7 +631,7 @@ extern "C" void waypoint_line_stakeout_set_points(int16_t idx_a, int16_t idx_b)
         g_stakeout_custom_pair = true;
         g_active_waypoint_idx = idx_b;
         current_settings.active_waypoint_index = g_active_waypoint_idx;
-        g_waypoint_change_seq++;
+        g_waypoint_change_seq = g_waypoint_change_seq + 1;
         mark_settings_dirty();
     }
 }

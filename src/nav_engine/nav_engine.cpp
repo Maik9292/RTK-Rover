@@ -25,6 +25,7 @@ extern "C" void nav_compute_pole_tip_position(double master_lat,
                                               double master_lon,
                                               double master_alt_m,
                                               bool heading_valid,
+                                              HeadingSource_t heading_source,
                                               float true_heading_deg,
                                               float baseline_pitch_deg,
                                               double *tip_lat_out,
@@ -35,8 +36,13 @@ extern "C" void nav_compute_pole_tip_position(double master_lat,
     double tip_lon = master_lon;
     double tip_alt = master_alt_m - (double)current_settings.antenna_height_m;
 
-    // Apply Master->Pole-Center lever-arm correction when dual-antenna heading is valid
-    if (current_settings.apply_lever_arm && heading_valid && fabs(master_lat) > 0.0001) {
+    // Apply Master->Pole-Center lever-arm correction strictly when dual-antenna carrier phase heading is active.
+    // Fallback headings (COG/HOLD/DISP/GYRO/COMP) do NOT know the 555mm beam orientation relative to the body
+    // and would inject up to 27.75 cm horizontal error if projected along motion/magnetic azimuth.
+    bool dual_antenna_locked = heading_valid &&
+                               (heading_source == HDG_SRC_DUAL_FIX ||
+                                heading_source == HDG_SRC_DUAL_FLT);
+    if (current_settings.apply_lever_arm && dual_antenna_locked && fabs(master_lat) > 0.0001) {
         double half_baseline_m = (double)current_settings.antenna_spacing_m * 0.5;
         double az_rad    = (double)(true_heading_deg + current_settings.baseline_mount_offset_deg) * DEG_TO_RAD;
         double pitch_rad = (double)baseline_pitch_deg * DEG_TO_RAD;

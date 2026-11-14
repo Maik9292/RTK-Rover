@@ -1221,18 +1221,26 @@ static void audio_mode_toggle_btn_cb(lv_event_t *e)
 static void lora_rate_btn_cb(lv_event_t *e)
 {
     (void)e;
-    if (e220_is_rate_switch_pending()) {
-        play_rover_beep(600, 40); // Busy tone
-        return;
+    float cur_rate = e220_is_rate_switch_pending()
+                         ? e220_get_requested_air_rate()
+                         : e220_get_active_air_rate();
+    float next_rate;
+    if (cur_rate > 14.0f) {
+        next_rate = 9.6f;
+    } else if (cur_rate > 7.0f) {
+        next_rate = 4.8f;
+    } else {
+        next_rate = 19.2f;
     }
-    float cur_rate = e220_get_active_air_rate();
-    float next_rate = (cur_rate >= 19.0f && cur_rate <= 20.0f) ? 9.6f : 19.2f;
 
-    play_rover_beep(1600, 35);
-    if (current_settings.enable_touch_logging) {
-        rover_printf("[TOUCH BTN] LoRa Rate clicked -> Requesting %.1fk\n", next_rate);
+    if (e220_request_air_rate_switch(next_rate)) {
+        play_rover_beep(1800, 60);
+        if (current_settings.enable_touch_logging) {
+            rover_printf("[TOUCH BTN] LoRa Rate clicked -> Requesting %.1fk\n", next_rate);
+        }
+    } else {
+        play_rover_beep(600, 40); // Busy tone: OTA switch handshake already in flight
     }
-    e220_request_air_rate_switch(next_rate);
     update_all_control_buttons();
 }
 
@@ -2503,6 +2511,18 @@ static inline lv_color_t get_lora_rssi_color(int16_t rssi_dbm, bool is_stale)
     }
 }
 
+static const char *get_heading_source_tag(const RoverUIData_t *d)
+{
+    if (d->heading_source == HDG_SRC_DUAL_FIX) return "FIX";
+    if (d->heading_source == HDG_SRC_DUAL_FLT) return "FLT";
+    if (d->heading_source == HDG_SRC_DISP)     return "WLK";
+    if (d->heading_source == HDG_SRC_COMP)     return "CMP";
+    if (d->heading_source == HDG_SRC_GYRO)     return "GYR";
+    if (d->heading_source == HDG_SRC_COG)      return "COG";
+    if (d->heading_source == HDG_SRC_HOLD)     return "HLD";
+    return d->heading_is_fixed ? "FIX" : "FLT";
+}
+
 void update_rover_ui(const RoverUIData_t *d)
 {
     if (!d) return;
@@ -2587,15 +2607,13 @@ void update_rover_ui(const RoverUIData_t *d)
         update_all_control_buttons();
     }
 
-    // Row 2: Master Antenna (ANT1) Fix Badge & Metrics
-    if (!d->vbus_present) {
+    // Row 2: Master Antenna (ANT1) Fix Badge & Metrics + Live LoRa Status (decoupled from VBUS)
+    if (!d->um982_stats.com1_online) {
         lv_label_set_text(hdr_m_fix_lbl, "OFF");
         lv_obj_set_style_bg_color(hdr_m_fix_badge, lv_palette_main(LV_PALETTE_RED), 0);
         lv_label_set_text(hdr_m_sats_lbl, "SV:--");
         lv_label_set_text(hdr_m_acc_lbl, "+/- ---");
         lv_obj_set_style_text_color(hdr_m_acc_lbl, lv_color_hex(0x64748B), 0);
-        lv_label_set_text(hdr_m_rtcm_lbl, "LoRa: OFF");
-        lv_obj_set_style_text_color(hdr_m_rtcm_lbl, lv_color_hex(0x64748B), 0);
     } else {
         const char *fix_str = "NO FIX";
         lv_color_t fix_col  = lv_palette_main(LV_PALETTE_RED);
@@ -2624,29 +2642,37 @@ void update_rover_ui(const RoverUIData_t *d)
         snprintf(buf, sizeof(buf), "+/-%s", acc_str);
         lv_label_set_text(hdr_m_acc_lbl, buf);
         lv_obj_set_style_text_color(hdr_m_acc_lbl, fix_col, 0);
-
-        now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
-        uint32_t last_radio_rx_age = (d->e220_stats.last_rx_ms > 0) ? (now_ms - d->e220_stats.last_rx_ms) : 99999;
-
-        // Header Row 2: LoRa Signal Strength (Numeric "LoRa: -104dB" or "LoRa: -- dB")
-        if (d->e220_stats.rssi_valid && d->e220_stats.rx_bytes_total > 0) {
-            bool is_stale = (last_radio_rx_age > 4000);
-            snprintf(buf, sizeof(buf), "LoRa: %ddB", (int)d->e220_stats.last_pkt_rssi_dbm);
-            lv_label_set_text(hdr_m_rtcm_lbl, buf);
-            lv_obj_set_style_text_color(hdr_m_rtcm_lbl, get_lora_rssi_color(d->e220_stats.last_pkt_rssi_dbm, is_stale), 0);
-        } else {
-            lv_label_set_text(hdr_m_rtcm_lbl, "LoRa: -- dB");
-            lv_obj_set_style_text_color(hdr_m_rtcm_lbl, lv_color_hex(0x64748B), 0);
-        }
     }
 
-    // Row 3: Dual-Antenna Heading Status & Metrics
-    if (!d->vbus_present) {
+    now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+    uint32_t last_radio_rx_age = (d->e220_stats.last_rx_ms > 0) ? (now_ms - d->e220_stats.last_rx_ms) : 99999;
+
+    // Header Row 2: LoRa Signal Strength (Numeric "LoRa: -104dB", "LoRa: -- dB", or "LoRa: OFF")
+    if (!d->e220_stats.radio_online) {
+        lv_label_set_text(hdr_m_rtcm_lbl, "LoRa: OFF");
+        lv_obj_set_style_text_color(hdr_m_rtcm_lbl, lv_color_hex(0x64748B), 0);
+    } else if (d->e220_stats.rssi_valid && d->e220_stats.rx_bytes_total > 0) {
+        bool is_stale = (last_radio_rx_age > 6000);
+        snprintf(buf, sizeof(buf), "LoRa: %ddB", (int)d->e220_stats.last_pkt_rssi_dbm);
+        lv_label_set_text(hdr_m_rtcm_lbl, buf);
+        lv_obj_set_style_text_color(hdr_m_rtcm_lbl, get_lora_rssi_color(d->e220_stats.last_pkt_rssi_dbm, is_stale), 0);
+    } else {
+        lv_label_set_text(hdr_m_rtcm_lbl, "LoRa: -- dB");
+        lv_obj_set_style_text_color(hdr_m_rtcm_lbl, lv_color_hex(0x64748B), 0);
+    }
+
+    // Row 3: Dual-Antenna Heading Status & Metrics (decoupled from VBUS)
+    if (!d->um982_stats.com1_online) {
         if (hdr_s_fix_lbl) lv_label_set_text(hdr_s_fix_lbl, "OFF");
         if (hdr_s_fix_badge) lv_obj_set_style_bg_color(hdr_s_fix_badge, lv_palette_main(LV_PALETTE_RED), 0);
         lv_label_set_text(hdr_s_sats_lbl, "SV:--");
         lv_label_set_text(hdr_s_bl_lbl, "BL:--.-cm");
-        lv_label_set_text(hdr_s_hdg_lbl, "Hdg:---.-");
+        if (d->heading_valid) {
+            snprintf(buf, sizeof(buf), "Hdg:%.1f %s", d->true_heading_deg, get_heading_source_tag(d));
+            lv_label_set_text(hdr_s_hdg_lbl, buf);
+        } else {
+            lv_label_set_text(hdr_s_hdg_lbl, "Hdg:---.-");
+        }
     } else {
         const char *hdg_badge_str = "HDG ---";
         lv_color_t hdg_badge_col  = lv_color_hex(0x3A3F47);
@@ -3669,7 +3695,7 @@ void update_rover_ui(const RoverUIData_t *d)
     // 5. Update Tile 4: Pinned LoRa RF Survey Card & Hardware Diagnostics Status
     if (t4_rf_card && t4_rf_bar && t4_rf_rssi_lbl) {
         float rx_age_s = (d->e220_stats.last_rx_ms > 0) ? (float)(now_ms - d->e220_stats.last_rx_ms) / 1000.0f : 999.0f;
-        bool is_fresh = (d->e220_stats.rssi_valid && rx_age_s <= 4.0f && d->e220_stats.rx_bytes_total > 0);
+        bool is_fresh = (d->e220_stats.rssi_valid && rx_age_s <= 6.0f && d->e220_stats.rx_bytes_total > 0);
         int16_t pkt_rssi = d->e220_stats.last_pkt_rssi_dbm;
         int16_t noise_floor = d->e220_stats.ambient_noise_dbm;
 
@@ -3694,6 +3720,9 @@ void update_rover_ui(const RoverUIData_t *d)
             snprintf(buf, sizeof(buf), "LoRa: %d dBm*", (int)pkt_rssi);
             lv_label_set_text(t4_rf_rssi_lbl, buf);
             lv_obj_set_style_text_color(t4_rf_rssi_lbl, lv_palette_main(LV_PALETTE_RED), 0);
+        } else if (!d->e220_stats.radio_online) {
+            lv_label_set_text(t4_rf_rssi_lbl, "LoRa: Offline");
+            lv_obj_set_style_text_color(t4_rf_rssi_lbl, lv_color_hex(0x64748B), 0);
         } else {
             lv_label_set_text(t4_rf_rssi_lbl, "LoRa: No Signal");
             lv_obj_set_style_text_color(t4_rf_rssi_lbl, lv_color_hex(0x64748B), 0);
@@ -3752,11 +3781,13 @@ void update_rover_ui(const RoverUIData_t *d)
         nav_format_height(d->tip_height_m, hgt_str, sizeof(hgt_str));
         uint8_t sv_view = (d->sats_in_view >= d->num_sats) ? d->sats_in_view : d->num_sats;
 
-        const char *m_fix_str = "NO FIX";
-        if (d->fix_type == GNSS_FIX_RTK_FIXED)      m_fix_str = "RTK FIX";
-        else if (d->fix_type == GNSS_FIX_RTK_FLOAT) m_fix_str = "RTK FLT";
-        else if (d->fix_type == GNSS_FIX_DGPS)      m_fix_str = "DGPS";
-        else if (d->fix_type == GNSS_FIX_SINGLE)    m_fix_str = "SINGLE";
+        const char *m_fix_str = !d->um982_stats.com1_online ? "OFFLINE" : "NO FIX";
+        if (d->um982_stats.com1_online) {
+            if (d->fix_type == GNSS_FIX_RTK_FIXED)      m_fix_str = "RTK FIX";
+            else if (d->fix_type == GNSS_FIX_RTK_FLOAT) m_fix_str = "RTK FLT";
+            else if (d->fix_type == GNSS_FIX_DGPS)      m_fix_str = "DGPS";
+            else if (d->fix_type == GNSS_FIX_SINGLE)    m_fix_str = "SINGLE";
+        }
 
         snprintf(buf, sizeof(buf),
                  "[ANT1 MASTER] %s | SV:%u/%u | HDOP:%.1f\n"
@@ -3885,10 +3916,10 @@ void update_rover_ui(const RoverUIData_t *d)
                  "RX:%lu B | TX:%lu B (RTCM:%lu B)\n"
                  "NMEA:%lu | HDG:%lu | Diff:%.1fs\n"
                  "Last NMEA: %s",
-                 d->um982_stats.com1_test_passed ? "PASS" : "WAIT",
+                 d->um982_stats.com1_online ? "ONLINE" : "OFFLINE",
                  (unsigned long)d->um982_stats.com1_rx_bytes,
                  (unsigned long)d->um982_stats.com1_tx_bytes,
-                 (unsigned long)d->um982_stats.com2_tx_bytes,
+                 (unsigned long)d->um982_stats.rtcm_tx_bytes,
                  (unsigned long)d->um982_stats.nmea_sentences_ok,
                  (unsigned long)d->um982_stats.heading_sentences_ok,
                  d->diff_age_s,
@@ -3903,13 +3934,13 @@ void update_rover_ui(const RoverUIData_t *d)
                  "Mode: %s | %s\n"
                  "Logs: %s\n"
                  "Last ACK (%lu): %s",
-                 d->um982_stats.known_state_ok ? "STATE OK" : (d->um982_stats.com1_test_passed ? "CHECK" : "WAIT"),
+                 !d->um982_stats.com1_online ? "OFFLINE" : (d->um982_stats.known_state_ok ? "STATE OK" : "CHECK"),
                  d->um982_stats.um982_version,
                  d->um982_stats.um982_mode,
                  d->um982_stats.um982_config_summary,
                  d->um982_stats.um982_loglist,
                  (unsigned long)d->um982_stats.cmd_responses_ok,
-                 d->um982_stats.last_com2_line);
+                 d->um982_stats.last_cmd_ack_line);
         lv_label_set_text(t4_com2_lbl, buf);
         if (d->um982_stats.known_state_ok) {
             lv_obj_set_style_text_color(t4_com2_lbl, lv_color_hex(0x00FFAA), 0);
@@ -3930,7 +3961,7 @@ void update_rover_ui(const RoverUIData_t *d)
                  "1006 (Base ARP): %u | 1074 (GPS): %u\n"
                  "1084 (GLO): %u | 1094 (GAL): %u\n"
                  "1230 (Biases): %u",
-                 d->e220_stats.config_valid ? (d->e220_stats.config_matched ? "CFG OK" : "CFG DIFF") : "NO RSP",
+                 !d->e220_stats.radio_online ? "OFFLINE" : (d->e220_stats.config_valid ? (d->e220_stats.config_matched ? "CFG OK" : "CFG DIFF") : "ONLINE"),
                  d->e220_stats.aux_pin_high ? 1 : 0,
                  (unsigned long)d->e220_stats.aux_fall_count,
                  m0_str,
@@ -3976,24 +4007,31 @@ void update_rover_ui(const RoverUIData_t *d)
 
     // 8. Update Tile 4: Power / PMIC AXP2101 Diagnostics
     if (t4_power_lbl) {
+        bool periph_5v_active = d->um982_stats.com1_online || d->e220_stats.radio_online;
         if (d->vbus_present) {
             snprintf(buf, sizeof(buf),
                      "[POWER / PMIC AXP2101]\n"
-                     "Input: USB Power Pack (%.2fV) | 5V Rail: ON\n"
-                     "Backup Bat: %.2fV (%u%%) | Chg: %s\n"
-                     "Status: UPS Charged & Standby",
+                     "Input: USB External (%.2fV) | 5V Rail: %s\n"
+                     "Battery: %.2fV (%u%%) | Chg: %s\n"
+                     "Peripherals: UM982:%s | E220:%s",
                      d->vbus_voltage,
+                     periph_5v_active ? "ON" : "OFF",
                      d->battery_voltage,
                      (unsigned int)d->battery_percent,
-                     d->is_charging ? "YES (500mA)" : "FLOAT (100%)");
+                     d->is_charging ? "YES (Charging)" : "STANDBY",
+                     d->um982_stats.com1_online ? "ON" : "OFF",
+                     d->e220_stats.radio_online ? "ON" : "OFF");
         } else {
             snprintf(buf, sizeof(buf),
                      "[POWER / PMIC AXP2101]\n"
-                     "Input: BACKUP BATTERY ONLY | 5V Rail: OFF\n"
-                     "Battery: %.2fV (%u%%) | ESP32+LCD Drain: ~130mA\n"
-                     "Auto-Shutdown: %u min timeout (Touch resets)",
+                     "Input: LiPo Battery | 5V Boost: %s\n"
+                     "Battery: %.2fV (%u%%) | Periph: UM982:%s E220:%s\n"
+                     "Auto-Shutdown: %u min idle (Touch/Motion resets)",
+                     periph_5v_active ? "ON" : "OFF",
                      d->battery_voltage,
                      (unsigned int)d->battery_percent,
+                     d->um982_stats.com1_online ? "ON" : "OFF",
+                     d->e220_stats.radio_online ? "ON" : "OFF",
                      current_settings.auto_shutdown_battery_min);
         }
         lv_label_set_text(t4_power_lbl, buf);

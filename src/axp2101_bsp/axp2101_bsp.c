@@ -5,7 +5,7 @@
 
 // AXP2101 Core Telemetry & LDO Registers (per X-Powers AXP2101 Datasheet V1.0 & Waveshare 3.5B BSP)
 #define AXP2101_REG_STATUS1       0x00 // Bit 5: VBUS good, Bit 3: BAT present
-#define AXP2101_REG_STATUS2       0x01 // Bits [7:5] Charge status (001=charging)
+#define AXP2101_REG_STATUS2       0x01 // Bits [6:5]: Bat dir (00=standby,01=charging,10=discharging); Bits [2:0]: Chg phase (1..3=active,4=done,5=off)
 #define AXP2101_REG_IC_TYPE       0x03 // Expected Chip ID = 0x4A
 #define AXP2101_REG_COMM_CFG      0x10 // Bit 0: Soft PWROFF
 #define AXP2101_REG_ADC_EN        0x30 // Bit 0: VBAT, Bit 1: TS (Disable=0), Bit 2: VBUS, Bit 3: VSYS
@@ -99,46 +99,54 @@ void axp2101_bsp_read(Axp2101Status_t *status)
 
     uint8_t st[2] = {0};
     bool raw_vbus_good = false;
+    bool bat_present   = false;
     if (i2c_read_buff(axp2101_dev_handle, AXP2101_REG_STATUS1, st, 2) == ESP_OK) {
-        raw_vbus_good       = (st[0] & (1 << 5)) != 0;
-        uint8_t chg_state   = (st[1] >> 5) & 0x07;
-        status->is_charging = (chg_state == 0x01 || chg_state == 0x02);
+        raw_vbus_good = (st[0] & (1 << 5)) != 0;
+        bat_present   = (st[0] & (1 << 3)) != 0;
+
+        // Decode STATUS2 (0x01): Bits [6:5] = Battery Current Direction (01b = Charging, 10b = Discharging),
+        // Bits [2:0] = Charger Phase (1=Tri-charge, 2=CC, 3=CV, 4=Done, 5=Not charging).
+        uint8_t chg_dir  = (st[1] >> 5) & 0x03;
+        uint8_t chg_stat = st[1] & 0x07;
+        status->vbus_good   = raw_vbus_good;
+        status->is_charging = raw_vbus_good && (chg_dir == 0x01) && (chg_stat >= 1 && chg_stat <= 3);
+    } else {
+        // Retain prior valid vbus_good on transient I2C bus contention
+        raw_vbus_good = status->vbus_good;
+        bat_present   = (status->battery_voltage_v > 2.5f);
     }
 
-    uint8_t vbus_raw[2] = {0};
-    float raw_vbus_v = 0.0f;
-    if (i2c_read_buff(axp2101_dev_handle, AXP2101_REG_VBUS_H, vbus_raw, 2) == ESP_OK) {
-        uint16_t vbus_mv = ((uint16_t)(vbus_raw[0] & 0x3F) << 8) | vbus_raw[1];
-        raw_vbus_v = (float)vbus_mv / 1000.0f;
-        status->vbus_voltage_v = raw_vbus_v;
-    } else {
-        raw_vbus_v = status->vbus_voltage_v; // Retain previous valid reading on transient I2C bus contention
-    }
-
-    // Debounce VBUS presence:
-    // USB power is considered present if hardware bit is set OR ADC measures >= 4.0V
-    static uint8_t s_vbus_loss_debounce = 0;
-    static bool s_filtered_vbus_good = true;
-
-    bool vbus_detected = raw_vbus_good || (raw_vbus_v >= 4.0f);
-    if (vbus_detected) {
-        s_vbus_loss_debounce = 0;
-        s_filtered_vbus_good = true;
-    } else {
-        // Require 2 consecutive missing cycles (>= 4s) of BOTH bit=0 and VBUS < 4.0V
-        // before declaring VBUS disconnected
-        if (s_vbus_loss_debounce < 2) {
-            s_vbus_loss_debounce++;
-        } else {
-            s_filtered_vbus_good = false;
+    // Read VBUS ADC strictly gated on STATUS1 bit 5 comparator (VBUS good).
+    // Note: On AXP2101, when VBUS is unplugged, the 14-bit VBUS ADC channel (0x38/0x39)
+    // floats near full-scale (0x3FF2 = 16,370 mV = 16.37V), which previously latched vbus_good=true.
+    if (raw_vbus_good) {
+        uint8_t vbus_raw[2] = {0};
+        if (i2c_read_buff(axp2101_dev_handle, AXP2101_REG_VBUS_H, vbus_raw, 2) == ESP_OK) {
+            uint16_t vbus_mv = ((uint16_t)(vbus_raw[0] & 0x3F) << 8) | vbus_raw[1];
+            if (vbus_mv >= 3800 && vbus_mv <= 6500) {
+                status->vbus_voltage_v = (float)vbus_mv / 1000.0f;
+            } else if (status->vbus_voltage_v < 3.8f || status->vbus_voltage_v > 6.5f) {
+                status->vbus_voltage_v = 5.00f;
+            }
+        } else if (status->vbus_voltage_v < 3.8f || status->vbus_voltage_v > 6.5f) {
+            status->vbus_voltage_v = 5.00f;
         }
+    } else {
+        status->vbus_good      = false;
+        status->vbus_voltage_v = 0.0f;
+        status->is_charging    = false;
     }
-    status->vbus_good = s_filtered_vbus_good;
 
-    uint8_t vbat_raw[2] = {0};
-    if (i2c_read_buff(axp2101_dev_handle, AXP2101_REG_VBAT_H, vbat_raw, 2) == ESP_OK) {
-        uint16_t mv = ((uint16_t)(vbat_raw[0] & 0x3F) << 8) | vbat_raw[1];
-        status->battery_voltage_v = (float)mv / 1000.0f;
+    if (bat_present) {
+        uint8_t vbat_raw[2] = {0};
+        if (i2c_read_buff(axp2101_dev_handle, AXP2101_REG_VBAT_H, vbat_raw, 2) == ESP_OK) {
+            uint16_t mv = ((uint16_t)(vbat_raw[0] & 0x3F) << 8) | vbat_raw[1];
+            if (mv >= 2500 && mv <= 4550) {
+                status->battery_voltage_v = (float)mv / 1000.0f;
+            }
+        }
+    } else {
+        status->battery_voltage_v = 0.0f;
     }
 
     uint8_t pct = 0;

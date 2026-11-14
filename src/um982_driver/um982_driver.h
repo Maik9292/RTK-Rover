@@ -9,6 +9,8 @@
 extern "C" {
 #endif
 
+extern volatile GpsTimeSync_t gps_time_sync;
+
 void um982_driver_init(void);
 void um982_configure_rover_defaults(void);
 void um982_run_powerup_selftest(void);

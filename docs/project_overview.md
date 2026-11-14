@@ -1,9 +1,9 @@
 # RTK Rover - Project Overview
 
-**Document Version:** `v2.6.0`  
-**Last Updated:** November 7, 2026  
-**Firmware Target:** `v0.8.0`  
-**Python Ecosystem Target:** `v3.4.1`  
+**Document Version:** `v2.7.0`  
+**Last Updated:** November 14, 2026  
+**Firmware Target:** `v0.8.5`  
+**Python Ecosystem Target:** `v3.5.2`  
 **License:** GNU General Public License v3.0 (`GPLv3`)  
 
 This document serves as the master technical specification for the **RTK Rover** project. It details the mechanical setup, dual-antenna lever-arm kinematics, electrical pinouts, FreeRTOS + LVGL 9 firmware architecture, operational modes, and companion Python scripts.
@@ -27,30 +27,30 @@ This document serves as the master technical specification for the **RTK Rover**
    * Mounted on the survey pole T-bar with Master (Position) and Slave (Heading) antennas separated by `0.555 m` (`55.5 cm`, configurable via `antenna_spacing_m` in `settings.json`).
    * The survey pole centerline sits at the **exact midpoint** (`27.75 cm`) between Master and Slave antennas, at height `antenna_height_m` (default `1.800 m`) above the ground tip.
 3. **RTCM Correction Radio:** **Ebyte E220-900T30S** (900MHz LoRa UART Transceiver)
-   * Receives RTCM3 differential corrections streamed from the RTK Base Station in transparent mode at `115200` baud (forwarded by the ESP32 Core 0 bridge to UM982 COM2 at `115200` baud).
+   * Receives RTCM3 differential corrections streamed from the RTK Base Station in transparent mode at `115200` baud (forwarded by the ESP32 Core 0 bridge to `UM982 COM1` at `115200` baud via `s_com1_tx_mutex`).
    * **Radio Configuration (Verified on both Base and Rover, Profile Rev 2):**
      * **RF Channel (`e220_channel`):** `75` (`0x4B` $\rightarrow$ $850.125 + 75 = 925.125\text{ MHz}$, ranked `#1` cleanest US 902-928 MHz ISM channel in `test/e220-scan.csv` at `-96.23 dBm` avg, `+10.125 MHz` clear of `915.0 MHz` weather telemetry).
-     * **UART Rate (`e220_uart_baud`):** `115200` bps, `8N1` (`REG0 = 0xE6`; matching UM982 COM2 baud rate).
-     * **Air Data Rate (`e220_air_rate_kbps`):** `38.4` kbps (`REG0 = 0xE6`; supports `2.4, 4.8, 9.6, 19.2, 38.4, 62.5`).
+     * **UART Rate (`e220_uart_baud`):** `115200` bps, `8N1` (`REG0 = 0xE5` @ `19.2k` baseline; matching `UM982 COM1` baud rate).
+     * **Air Data Rate (`e220_air_rate_kbps`):** `19.2` kbps default with synchronized 3-rate switching across `19.2k / 9.6k / 4.8k` (`REG0 = 0xE5 / 0xE4 / 0xE3`; also supports `2.4, 38.4, 62.5`).
      * **Packet Size (`e220_subpacket_bytes`):** `200 bytes` (`REG1` bits `[7:6] = 0b00`, utilizing native `400-byte` buffer atomic framing).
-     * **Mode 0 Live RSSI Register (`REG1` Bit 5 = `0x20`):** Enabled (`REG1 = 0x23`), allowing on-demand `C0 C1 C2 C3 00 02` ambient noise floor and last-packet RSSI queries (4-byte and 5-byte reply parser synchronized to post-`1094` inter-epoch quiet gap) without appending extra bytes to RX UART frames (`REG3 = 0x00`).
+     * **Mode 0 Live RSSI Register (`REG1` Bit 5 = `0x20`):** Enabled (`REG1 = 0x23`), allowing on-demand `C0 C1 C2 C3 00 02` ambient noise floor and last-packet RSSI queries (dual 4-byte `C1 00 <noise> <pkt>` and 5-byte `C1 00 02 <noise> <pkt>` parser synchronized to post-terminal-MSM `inter_epoch_gap` and Second 0 `post_uplink_gap`) without appending extra bytes to RX UART frames (`REG3 = 0x00`).
      * **Transmit Power (`e220_tx_power_dbm`):** Level 3 (`21 dBm` / `125 mW` close/medium-range testing; `30 dBm` / `1 W` long-range field production, `REG1 = 0x23` / `0x20`). Note: keep Base and Rover separated by $\ge 30\text{--}100\text{ ft}$ even at `21 dBm` to prevent `E220-900T30S` `+14 dB` RX LNA front-end saturation (`> -35 dBm`).
      * **Transmission Mode & LBT (`e220_lbt_enable`):** Transparent Mode, LBT Disabled, Appended RSSI Byte Disabled (`REG3 = 0x00`).
-     * **Target EEPROM Profile:** `ADDH=0x00 ADDL=0x00 REG0=0xE6 REG1=0x23 CHAN=0x4B REG3=0x00`.
-   * **Base Station Software & Datasheet Section 5.6.2 Pacing Architecture:**
-     * **RTKBase Stream Filtering:** RTKBase port `5016` is filtered via `str2str` to `"1006(5),1074,1084,1094,1230(10)"`, producing a lean, high-fidelity stream of ~625-650 Bytes/s (GPS MSM4, GLONASS MSM4, Galileo MSM4, Base ARP, and GLONASS biases).
-     * **Two-Regime AUX + Hardware-Calibrated Time-on-Air Pacing (`scripts/e220_pacer.py v3.4.0`):**
+     * **Target EEPROM Profile:** `ADDH=0x00 ADDL=0x00 REG0=0xE5 REG1=0x23 CHAN=0x4B REG3=0x00`.
+   * **Base Station Software & Phase 9 GPS-Disciplined 5s Superframe TDMA Architecture:**
+     * **RTKBase Stream Filtering:** RTKBase port `5016` is filtered via `str2str` to `"1006(5),1074,1084,1094,1230(10)"`, producing a lean, high-fidelity stream of ~625-650 Bytes/s (GPS MSM4, GLONASS MSM4, Galileo MSM4, Base ARP, and GLONASS biases). Empty MSM frames (`<= 28 B`) are dropped prior to RF TX.
+     * **Two-Regime AUX + Hardware-Calibrated Time-on-Air Pacing (`scripts/e220_pacer.py v3.5.2`):**
        * Per E220-900T30S Manual Section 5.6.2, `AUX=1` indicates the 400-byte UART buffer emptied into the LLCC68 transceiver, **not** that over-the-air RF transmission has completed.
-       * **Single-Subpacket Frames (`<= 200B`, e.g., `1006`, `1230`, `1084`):** Transfer straight into an idle LLCC68 FIFO without holding `AUX` LOW; paced deterministically by silicon-calibrated LoRa Time-on-Air (`82.2 ms` for `200B`, `58.3 ms` for `122B` @ `38.4k`) plus a `35 ms` receiver UART drain guard delay.
-       * **Two-Subpacket Frames (`201..400B`, e.g., `1074`, `1094`):** Hold `AUX` LOW (~82 ms @ 38.4k) while Subpacket 1 (`200B`) transmits on air, then raise `AUX` HIGH the instant Subpacket 2 (`len - 200`) enters the LLCC68 FIFO and **begins** RF TX; paced by waiting for `AUX` rising edge plus `estimate_subpacket_air_s(len - 200) + 35 ms` guard delay.
+       * **Single-Subpacket Frames (`<= 200B`, e.g., `1006`, `1230`, `1084`):** Transfer straight into an idle LLCC68 FIFO without holding `AUX` LOW; paced deterministically by silicon-calibrated LoRa Time-on-Air plus a `35 ms` receiver UART drain guard delay.
+       * **Two-Subpacket Frames (`201..400B`, e.g., `1074`, `1094`):** Hold `AUX` LOW while Subpacket 1 (`200B`) transmits on air, then raise `AUX` HIGH the instant Subpacket 2 (`len - 200`) enters the LLCC68 FIFO and **begins** RF TX; paced by waiting for `AUX` rising edge plus `estimate_subpacket_air_s(len - 200) + 35 ms` guard delay.
+       * **GPS-Disciplined 5-Second Superframe TDMA:** Anchored to `UTC_Second % 5`: Seconds 1..4 run at 100% Base downlink capacity; Second 0 enforces a hard TX cutoff (`700 ms` @ `<= 9.6k`, `740 ms` @ `>= 19.2k`) before listening strictly for Rover uplink (`45 B` telemetry / `10 B` air-rate switch request). Synchronous 3-rate air-rate switches (`19.2k / 9.6k / 4.8k`) transmit paced primary + backup `ACK_SWITCH` frames in Second 1 (holding RTCM TX until top of Second 2) and reconfigure both E220 modules simultaneously at `0 ms` of Second 2 with a 60-second rollback failsafe.
        * Includes `GPIO 22` hardware reset watchdog if `AUX` locks LOW `> 1.5 s`, `TIOCEXCL` exclusive serial port locking, source `CRC24Q` verification, and startup Channel 75 ambient RF noise floor probing.
      * **Adaptive Constellation Interleaver (at $\le 9.6\text{ kbps}$):**
-       * Interleaves secondary constellations across alternating epochs to prevent LoRa channel saturation at slower air rates: GPS 1074 is transmitted every second ($1.0\text{ Hz}$), while GLONASS 1084, Galileo 1094, and BeiDou 1124 alternate ($0.5\text{ Hz}$ each for 2 secondaries, $0.33\text{ Hz}$ for 3).
+       * Tracks epoch boundaries via `self.last_msm_type` and interleaves secondary constellations across alternating epochs to prevent LoRa channel saturation: at `9.6 kbps`, GPS `1074` runs at `1.0 Hz` while GLONASS `1084` and Galileo `1094` alternate 1:1 (`0.5 Hz` each; `0.33 Hz` for 3 secondaries). At `<= 4.8 kbps`, GPS runs on even epochs and rotates secondaries (`~0.25 Hz` each).
        * Base ARP (1005/1006), antenna (1033), and GLONASS biases (1230) retain 100% passthrough.
-       * Guarantees a $200\text{ ms}$ half-duplex quiet window for receiving Rover uplink telemetry (`0xAA 0x55` 39-byte frames) and remote air-rate switch commands (`0x02` / `0x82`).
-       * Supports `--no-interleave` CLI flag and reports `Interleave:[N skp]` in the console heartbeat.
-     * **Link Budget & Passive-XTAL Thermal Stability at 38.4k:**
-       * Because the `E220-900T30S` (`LLCC68` + 1W PA) uses a passive `32 MHz` crystal (`XTAL`, no `TCXO`), operating at `38.4 kbps` (`500 kHz` LoRa bandwidth, `~37-45%` air duty cycle) provides `2x-4x` wider carrier/thermal drift tolerance on multi-subpacket `201..400B` bursts than `19.2 kbps` (verified across 16 empirical tests: `223` intact `> 200B` frames at `38.4k`/`62.5k` vs `0` at `19.2k`) while maintaining $\approx -123\text{ dBm}$ receiver sensitivity.
+       * Supports `--no-interleave` CLI flag and reports `Interleave:[N skp]` and `EmptyMSM:N` in the console heartbeat.
+     * **VBAT 5V Boost Power Architecture & Passive-XTAL Link Budget:**
+       * A VBAT 5V boost circuit powers both the UM982 and E220 modules on battery, with `com1_online` and `radio_online` live-activity detection independent of USB (`VBUS`) presence. `19.2 kbps` provides `~450 ms` idle margin per 1 Hz epoch for full 4-constellation RTK, while `9.6 kbps` (`+3 dB`) and `4.8 kbps` (`+5 dB`) extend range under heavy canopy.
 
 ---
 
@@ -91,17 +91,16 @@ In dense forest canopy where secondary (Slave) antenna carrier tracking drops, t
 
 | Subsystem | Signal Label | ESP32-S3 GPIO | ESP32 Direction | Function / Bus Assignment |
 | :--- | :--- | :--- | :--- | :--- |
-| **UM982 COM1** | `UM982_TXD0` | `GPIO 17` | **ESP32 RX** (`Serial1`) | UM982 COM1 TX $\rightarrow$ ESP32 RX (`115200 8N1`, NMEA/Heading stream) |
-| **UM982 COM1** | `UM982_RXD0` | `GPIO 18` | **ESP32 TX** (`Serial1`) | ESP32 TX $\rightarrow$ UM982 COM1 RX (`115200 8N1`, Config commands) |
-| **UM982 COM2** | `UM982_TXD1` | `GPIO 47` | **ESP32 RX** (`Serial2`) | UM982 COM2 TX $\rightarrow$ ESP32 RX (`115200 8N1`, Responses) |
-| **UM982 COM2** | `UM982_RXD1` | `GPIO 48` | **ESP32 TX** (`Serial2`) | ESP32 TX $\rightarrow$ UM982 COM2 RX (`115200 8N1`, RTCM3 Stream Forward) |
+| **UM982 COM1** | `UM982_TXD0` | `GPIO 17` | **ESP32 RX** (`Serial1`) | UM982 COM1 TX $\rightarrow$ ESP32 RX (`115200 8N1`, NMEA, Heading & Responses) |
+| **UM982 COM1** | `UM982_RXD0` | `GPIO 18` | **ESP32 TX** (`Serial1`) | ESP32 TX $\rightarrow$ UM982 COM1 RX (`115200 8N1`, RTCM3 & Config commands) |
+| **Legacy COM2** | `(Freed in v0.8.0)` | `GPIO 47 / 48` | **Spare / Freed** | Previously `Serial2` COM2 (consolidated onto `COM1` in Phase 8) |
 | **E220 LoRa** | `E220_TXD` | `GPIO 41` | **ESP32 RX** (`Serial0`) | E220 TXD $\rightarrow$ ESP32 RX (`115200 8N1` Transparent / `9600` Config) |
 | **E220 LoRa** | `E220_RXD` | `GPIO 42` | **ESP32 TX** (`Serial0`) | ESP32 TX $\rightarrow$ E220 RXD |
 | **E220 Control** | `E220_AUX` | `GPIO 21` | **ESP32 Input** | Busy (`LOW`) / Idle & Ready (`HIGH`) status |
 | **E220 Control** | `E220_RST` | `GPIO 38` | **ESP32 Output** | Hardware Reset (`HIGH` = normal operation) |
 | **E220 Control** | `E220_M0` | `GPIO 39` | **ESP32 Output** | Mode 0 (`LOW` = Transparent, `HIGH` = Config) |
 | **E220 Control** | `E220_M1` | `GPIO 40` | **ESP32 Output** | Mode 1 (`LOW` = Transparent, `HIGH` = Config) |
-| **Internal I2C0** | `ESP_SCL/SDA` | `GPIO 7 / 8` | **I2C Master** | Shared by Touch (`0x3B`), TCA9554 (`0x20`), AXP2101 (`0x34`), RTC (`0x51`), IMU (`0x6B`), ES8311 (`0x18`) at `400 kHz` on Core 1 |
+| **Internal I2C0** | `ESP_SCL/SDA` | `GPIO 7 / 8` | **I2C Master** | Shared by Touch (`0x3B`), TCA9554 (`0x20`), AXP2101 (`0x34`), RTC (`0x51`), IMU (`0x6B`), ES8311 (`0x18`), optional `MMC5983MA` (`0x30`) at `400 kHz` on Core 1 |
 | **LCD QSPI** | `CS/CLK/D0..3` | `12, 5, 1..4` | **QSPI Master** | `AXS15231B` `320x480` Portrait Display (`GPIO 6` Backlight PWM) |
 | **SD Card** | `D0/CMD/CLK` | `9, 10, 11` | **1-Bit SD_MMC / SPI** | 3-stage mount fallback (`SD_MMC` 1-bit `EXIO3=High-Z` $\rightarrow$ `SD_MMC` `EXIO3=LOW` $\rightarrow$ `SD` SPI) |
 | **BOOT Button** | `BOOT_SWITCH` | `GPIO 0` | **ESP32 Input** | **Long-Press ($\ge 1.5\text{ s}$):** Capture 24-bit uncompressed BMP screenshot |
@@ -112,8 +111,8 @@ In dense forest canopy where secondary (Slave) antenna carrier tracking drops, t
 
 ### Core Separation
 * **Core 0 (`task_rover_core0` / `"RoverCore0"`, Priority 4 — Zero I2C Access):**
-  * Polls `E220` (`Serial0`), logs raw wire-tap bytes to `rtcm-base_*.txt`, stages incoming bytes in a 1,536-byte **Sliding-Window Store-and-Verify RTCM3 Gatekeeper** (`0xD3` + `CRC24Q == 0`), and forwards **only verified intact RTCM3 frames** atomically to `UM982 COM2` (`Serial2`) while tracking `IO21` `AUX` falling-edge interrupts and 5-second Mode 0 `Noise/Pkt RSSI` (`dBm`).
-  * Polls `UM982 COM1` (`Serial1`) to parse `$GPGGA` (2 Hz), `$GPRMC` (1 Hz), `$GPGST` (2 Hz), `$GPGSV` (1 Hz), `$GNGGAH` (1 Hz slave data), `#BASEINFOA` (1 Hz base station data), and `#UNIHEADINGA` (2 Hz).
+  * Polls `E220` (`Serial0`), logs raw wire-tap bytes to `rtcm-base_*.txt`, stages incoming bytes in a 1,536-byte **Sliding-Window Store-and-Verify RTCM3 Gatekeeper** (`0xD3` + `CRC24Q == 0`), and forwards **only verified intact RTCM3 frames** atomically to `UM982 COM1` (`Serial1` via `s_com1_tx_mutex`) while tracking `IO21` `AUX` falling-edge interrupts, GPS-disciplined 5-second superframe TDMA slots, and near-realtime (`~1.8–2.0 s`) Mode 0 `Noise/Pkt RSSI` (`dBm`) polling.
+  * Polls `UM982 COM1` (`Serial1`) through the 3-way line demultiplexer to parse `$GPGGA` (2 Hz), `$GPRMC` (1 Hz), `$GPGST` (2 Hz), `$GPGSV` (1 Hz), `$GNGGAH` (1 Hz slave data), `#BASEINFOA` (1 Hz base station data), `#UNIHEADINGA` (2 Hz), and `#VERSIONA`/`#MODEA`/`#CONFIGA`/`#LOGLISTA` command responses.
   * Runs 30Hz lever-arm kinematic projection and geodesic target guidance (`nav_engine`), waking within `<= 2 ms` via `g_waypoint_change_seq` whenever the operator selects a new waypoint or file.
 * **Core 1 (`task_audio_beep` Priority 4, `rover_lvgl_port_task` Priority 3, `task_display_and_audio` Priority 2, `loopTask` Priority 1 — Exclusive I2C0 Owner):**
   * **`task_audio_beep` (`"RoverAudio"`, Priority 4):** Dedicated real-time audio synthesizer blocking on `beepQueue` (`portMAX_DELAY`) and driving the ES8311 I2S codec within `< 1 ms` of touch contact, completely decoupled from UI rendering and filesystem writes.
@@ -161,7 +160,7 @@ Because prebuilt Arduino-ESP32 (`v3.3.x`, `qio_opi`) compiles with `CONFIG_SPIRA
     * Row 1: `VOL: 20%..100% / MUTE`, `AUD: GEIGER / BEEPS / MUTE`, `BRI: 20%..100%`
     * Row 2: `SERIAL: ON/OFF`, `NMEA: ON/OFF`, `RTCM: ON/OFF`
     * Row 3: `TELEM: ON/OFF`, `IMU: ON/OFF`, `TOUCH: ON/OFF`
-    * Row 4: `WIFI: CONN/STA/AP/OFF` (Multi-state color feedback), `UNITS: IMP/SI`, `LORA: 19.2k / 9.6k`
+    * Row 4: `WIFI: CONN/STA/AP/OFF` (Multi-state color feedback), `UNITS: IMP/SI`, `LORA: 19.2k / 9.6k / 4.8k`
     * Row 5: Centered Wi-Fi status & web portal URL (`http://<ip>/`).
 * **Tile 2 (Screen 3) -- Waypoint CSV Browser & Multi-File Selector:**
   * Top navigation bar with `< Prev` and `Next >` file buttons and circular marquee for filenames.
@@ -177,9 +176,9 @@ Because prebuilt Arduino-ESP32 (`v3.3.x`, `qio_opi`) compiles with `CONFIG_SPIRA
   * Compact **Tare** button (`62x28 px`) nested in the bottom-right of the circle's bounding rectangle (`TARE` Blue / `RST` Orange).
   * Centered Pole Tilt angle readout (`dX` / `dY`) below circle.
 * **Tile 4 (Screen 5) -- Hardware Diagnostics & Live Observers:**
-  * **Pinned Top Header Deck:** Fixed firmware header (`RTK ROVER v0.7.7` in Montserrat 16 White).
-  * **Dual-Power & UPS Card:** Displays external VBUS line voltage, 5V rail status, internal battery voltage/percentage, charging/float status, and auto-shutdown timer countdown.
-  * **Pinned LoRa RF Survey Card ($y = 26$):** Elevated to the top of the tile for permanent visibility of noise floor, packet RSSI, AUX edges, RTCM message counters, and truncation drops.
+  * **Pinned Top Header Deck:** Fixed firmware header (`RTK ROVER v0.8.5` in Montserrat 16 White).
+  * **Dual-Power & UPS Card:** Displays external VBUS status (`AXP2101` `0x00` `VBUS_GOOD` register bit + masked ADC voltage), VBAT 5V boost peripheral power rail, internal battery voltage/percentage, charging/float status, and auto-shutdown timer countdown.
+  * **Pinned LoRa RF Survey Card ($y = 26$):** Elevated to the top of the tile for permanent visibility of noise floor, packet RSSI (`~1.8–2.0 s` near-realtime updates, `6.0 s` freshness window across 5s superframes), AUX edges, RTCM message counters, and truncation drops.
   * **Expanded Scrollable Container (+57 px Viewport):** Multi-line auto-wrapping telemetry cards:
     * Storage status in Electric Cyan (`#22D3EE`).
     * Antenna Master (ANT1) and Slave (ANT2) metrics with live coordinates.
@@ -192,7 +191,7 @@ Because prebuilt Arduino-ESP32 (`v3.3.x`, `qio_opi`) compiles with `CONFIG_SPIRA
 
 ## 7. Python Survey & Ingestion Scripts (`scripts/`)
 
-* **`e220_pacer.py` (v3.4.0):** Datasheet Section 5.6.2 hardware-paced LoRa driver for RTKBase. Handles atomic RTCM3 frame pacing, `GPIO 22` hardware watchdog, `TIOCEXCL` locking, Mode 0 ambient noise floor probing, bi-directional uplink telemetry logging (dual-format 39B/45B auto-detecting unpacker recording ANT1 RTK fix, ANT2 slave fix `SLV_FIX`/`SLV_FLT`, 3D baseline length, crossbar pitch, explicit heading source, `PWR:USB` / `Bat:xx%` power status, RAM JSON + rolling daily CSV), clean ASCII `deg` units in console heartbeat, remote air-rate switching (`0x02`/`0x82`), terminal burst quiet-window enforcement, and Adaptive Constellation Interleaving at $\le 9.6\text{ kbps}$ (interleaving GLONASS 1084, Galileo 1094, and BeiDou 1124 across epochs while preserving 1.0 Hz GPS 1074).
+* **`e220_pacer.py` (v3.5.2):** Datasheet Section 5.6.2 hardware-paced LoRa driver for RTKBase with Phase 9 GPS-Disciplined 5-Second Superframe TDMA. Handles atomic RTCM3 frame pacing, empty MSM filtering (`<= 28 B`), `GPIO 22` hardware watchdog, `TIOCEXCL` locking, Mode 0 ambient noise floor probing, bi-directional uplink telemetry logging (dual-format 39B/45B auto-detecting unpacker recording ANT1 RTK fix, ANT2 slave fix `SLV_FIX`/`SLV_FLT`, 3D baseline length, crossbar pitch, explicit heading source, `PWR:USB` / `Bat:xx%` power status, RAM JSON + rolling daily CSV), clean ASCII `deg` units in console heartbeat, synchronous 3-rate air-rate switching (`19.2k / 9.6k / 4.8k`) with paced primary + backup Second 1 `ACK_SWITCH` and Second 2 hardware switch, and epoch-tracked Adaptive Constellation Interleaving at $\le 9.6\text{ kbps}$.
 * **`cogo_solver.py` (v1.1.0):** Schema-driven Coordinate Geometry (COGO) traverse solver. Ingests standard parcel JSON schemas ([`docs/schemas/cadastral_schema.json`](schemas/cadastral_schema.json)) and control anchor CSV files, performs forward geodesic projections, verifies loop closure precision, applies Bowditch / Compass Rule adjustments, solves circular road curve geometry, reconciles common boundaries, and exports to Google Earth KML, Rover `/waypoints.csv`, GeoJSON, AutoCAD DXF (with layer organization), and text closure audits. Detailed documentation in [`docs/cogo_solver_guide.md`](cogo_solver_guide.md).
 * **`check_secrets.py` (v1.1.1):** Pre-push security verification scanner. Scans Git tracked files and unpushed commits for generic credentials, private keys, and local absolute filesystem paths, plus personal signatures defined in an unversioned `.secrets.local` configuration.
 * **`install_git_hooks.py` (v1.1.0):** Automatically installs the pre-push security verification hook into `.git/hooks/pre-push`.

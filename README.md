@@ -2,16 +2,21 @@
 
 High-precision handheld and pole-mounted RTK GNSS Waypoint Guidance, Property Pin Seeker, Field Survey Logger, and Dual-Antenna Moving-Baseline Compass built on the **Waveshare ESP32-S3-Touch-LCD-3.5B**, **Holybro H-RTK Unicore UM982**, and **Ebyte E220-900T30S** 900MHz LoRa transceiver.
 
-**Firmware Version:** `v0.8.0`  
+**Firmware Version:** `v0.8.5`  
 **License:** GNU General Public License v3.0 ([GPLv3](LICENSE))  
 **User Documentation:** [Field User Manual](docs/user_manual.md)  
 **Engineering Review:** [Critical Design Review (CDR)](docs/critical_design_review.md) | [Project Retrospective](docs/project_retrospective.md)  
-**Next-Gen Architecture:** [Plan Smart Pole and Android App](docs/plan_smart_pole_and_android_app.md) | [Phase 8 Single-UART UM982 & MMC5983MA Plan](docs/plan_phase8_single_uart_um982_and_mmc5983ma_compass.md) | [Phase 7 Cellular NTRIP Bridge Plan](docs/plan_phase7_cellular_ntrip_bridge.md)
+**Architecture & Plans:** [Plan Smart Pole and Android App](docs/plan_smart_pole_and_android_app.md) | [Phase 9 GPS-Disciplined TDMA Plan](docs/plan_phase9_gps_disciplined_tdma.md) | [Phase 8 Single-UART UM982 & MMC5983MA Plan](docs/plan_phase8_single_uart_um982_and_mmc5983ma_compass.md) | [Phase 7 Cellular NTRIP Bridge Plan](docs/plan_phase7_cellular_ntrip_bridge.md)
 
 ---
 
 ## 1. Overview & Key Capabilities
 
+* **GPS-Disciplined 5-Second Superframe TDMA, 3-Rate LoRa Selector & VBAT 5V Boost Fixes (Phase 9 / `v0.8.1` - `v0.8.5` & `e220_pacer.py v3.5.2`):**
+  * **5-Second Superframe Half-Duplex TDMA (`GpsTimeSync_t`):** Anchors Base (`e220_pacer.py v3.5.2`) and Rover (`e220_driver.cpp`) to GPS UTC seconds (`UTC_Second % 5`): Seconds 1..4 deliver 100% downlink capacity, while Second 0 enforces a Base downlink cutoff (`700 ms` @ `<=9.6k`, `740 ms` @ `>=19.2k`) before opening the deterministic Rover uplink slot (`45 B` telemetry or `10 B` air-rate switch request). Includes empty MSM frame dropping (`<= 28 B`) and fixed `9.6k` 1:1 secondary-constellation interleaving (`1084` GLONASS / `1094` Galileo).
+  * **3-Rate Synchronized LoRa Switching (`19.2k` -> `9.6k` -> `4.8k` -> `19.2k`):** Tile 1 `LORA` button supports cycling across all three air rates with pre-TX queue updates/cancellation, paced Second 1 primary + backup `ACK_SWITCH` delivery, Second 1 RTCM hold prior to the Second 2 hardware switch, and a 60-second rollback watchdog that disarms only after verified post-switch RTCM frames.
+  * **Near-Realtime Mode 0 RSSI Polling (4-Byte & 5-Byte Replies):** Queries `C0 C1 C2 C3 00 02` every `~1.8–2.0 s` inside guaranteed post-terminal-MSM inter-epoch idle gaps (`420..780 ms`) and post-uplink Second 0 gaps, preserving both 4-byte (`C1 00 <noise> <pkt>`) and 5-byte (`C1 00 02 <noise> <pkt>`) E220-900T30S replies while preventing false red/offline UI dropouts across 5-second superframe transitions.
+  * **AXP2101 VBUS Unplug Fix & VBAT 5V Boost Live Detection:** Hardware `0x00` `VBUS_GOOD` register status check + ADC masking fixes false `16.37 V` readings on USB unplug (`v0.8.1`), while `com1_online` and `radio_online` detect live peripheral activity independently of USB power (`v0.8.2`) for systems running the UM982 and E220 from the VBAT 5V boost circuit.
 * **Single-UART `UM982 COM1` Consolidation, Receiver State Audit & Auto-Detected 9-DOF `MMC5983MA` Compass (Phase 8 / `v0.8.0`):**
   * **Single-UART `UM982 COM1` Multiplexing (`Serial1`, `GPIO 17/18` @ `115200` baud):** Consolidates `RTCM3.x` binary corrections + ASCII commands onto `COM1 TX` (guarded by `s_com1_tx_mutex` and a `4096 B` TX ring buffer) and `NMEA`/`#UNIHEADINGA`/`#BASEINFOA` + command responses onto `COM1 RX` (with a 3-way line demultiplexer and XOR checksum verification that prevents command responses from entering `.nmea` logs). Frees `Serial2` (`COM2`, `GPIO 47/48`) and ~6 KB of internal `DRAM0`.
   * **`um982_query_receiver_state()` (`VERSIONA`, `MODE`, `CONFIG`, `LOGLIST`):** Queries and verifies the live UM982 firmware build, Rover mode, port baud/protocol configuration, and active sentence schedule at boot, printing a structured summary to Serial Monitor and populating the Tile 4 `[UM982 RECEIVER STATE & LOGLIST]` card.
@@ -26,7 +31,7 @@ High-precision handheld and pole-mounted RTK GNSS Waypoint Guidance, Property Pi
   * **AXP2101 PMIC Constant-Current Charging:** Configured to $500\text{ mA}$ for safe charging and float maintenance of an internal 1S LiPo buffer.
   * **Hot-Swap VBUS USB Sense:** 14-bit ADC monitoring of external USB line voltage (`vbus_voltage_v >= 4.0V`) with debounce filter. Seamlessly powers the high-current UM982 GNSS and E220 1W LoRa radio from an external 5V pack, while battery keeps the ESP32-S3 and LCD alive across power interruptions with zero rebooting.
   * **Auto-Shutdown on Battery Timeout:** User-configurable idle battery timer (`auto_shutdown_battery_min` in `settings.json`, default 5 min) triggering soft power-off ($<40\,\mu\text{A}$) when external power is removed and the rover is left idle. Any touchscreen tap resets the timer.
-  * **Minimalist Row 1 Power Widget & Sensor Offline Badges:** Displays `[USB] 5.04V+` (charging) or `[USB] 5.04V` (float), switching to `[Bat] 85% 3.92V` on battery. When on battery without USB, Row 2/3 fix badges switch to red `[OFF]` and radio displays `LoRa: OFF`.
+  * **Minimalist Row 1 Power Widget & Live Peripheral Status Badges:** Displays `[USB] 5.04V+` (charging) or `[USB] 5.04V` (float), switching cleanly to `[Bat] 85% 3.92V` on battery via `AXP2101` register `0x00` `VBUS_GOOD` sensing. When running on the VBAT 5V boost circuit without USB, `UM982` (`com1_online`) and `E220` (`radio_online`) status remain online based on live UART/register activity rather than USB presence.
 * **Wi-Fi Multi-State Visual Cues & Internal `DRAM0` / PSRAM Memory Architecture (Phase 6.1 / `v0.7.5` - `v0.7.7`):**
   * **Multi-Color Button & Icon States with Instant Tap-to-Cancel:** Tile 1 Wi-Fi button illuminates Vivid Amber (`WIFI: CONN`, tap again to abort connection within `<= 100 ms`), Emerald Green (`WIFI: STA`, online immediately upon DHCP `GOT_IP` prior to best-effort NTP), Vivid Violet (`WIFI: AP`), or Navy Blue (`WIFI: OFF`). Header icon matches state with Amber, Electric Cyan, Violet, and Slate Gray.
   * **Octal PSRAM Offload & `DRAM0` Radio Headroom (`v0.7.5`):** Migrated `82.9 KB` of static `.dram0.bss` logger/waypoint buffers (`serial_logger`, `g_waypoints`, `rtcm_logger`, `nmea_logger`) and `~50 KB` of LVGL 9 UI widget trees into 8 MB Octal PSRAM (reducing static global dynamic RAM from `44%` to `20%` / `37.1 KB .bss`) and trimmed the QSPI DMA bounce strip to 24 lines (`15.3 KB`), restoring `>150 KB` of contiguous internal 8-bit/DMA SRAM required by `esp_wifi_init()` / `esp_wifi_start()`.
@@ -45,9 +50,9 @@ High-precision handheld and pole-mounted RTK GNSS Waypoint Guidance, Property Pi
   * Interactive Tile 0 tri-mode toggle: `[TACTICAL GUIDANCE]` (Course-Up & Centimeter Bullseye) $\rightarrow$ `[LINE STAKEOUT]` (Deed Vector with Left/Right guidance prompts and quadrant bearings e.g. `S 62°15'12" W`) $\rightarrow$ `[MAP VIEW]` (2D Geodetic Canvas with Zoom, Pan, Boundary Polygon, Pins, and Breadcrumbs).
   * One-tap baseline direction swap (`[ <-> SWAP ]`) and Geiger audio guidance tracking deed line proximity.
 * **Bi-Directional LoRa Protocol & Remote Air-Rate Switching (Phase 3 & Phase 5.1):**
-  * 45-byte packed binary uplink telemetry (`0xAA 0x55`, CRC16-CCITT) transmitted in the half-duplex quiet window ($t = 0.10\text{ s} \dots 0.45\text{ s}$ post-epoch, $\approx 31\text{ ms}$ airtime) every 5 seconds. Reports ANT1 position fix, ANT2 slave fix (`SLV_FIX`/`SLV_FLT`), measured 3D baseline length (`BL: 55.4cm`), crossbar pitch, explicit heading source (`DUAL_FIX`, `WALK`, `GYRO`, `HLD`), satellite counts, ground-tip coordinates, and battery/USB health.
-  * Base Station [`e220_pacer.py`](scripts/e220_pacer.py) (v3.4.0) features a dual-format auto-detecting unpacker (39B/45B), outputs live telemetry heartbeats to console with clean ASCII `deg` units and `PWR:USB` / `Bat:xx%` power formatting, writes atomic JSON to `/run/rtk_rover_status.json` (`tmpfs` in RAM, zero SD wear), and appends to rolling daily CSV with 30-day auto-pruning.
-  * Over-the-air dynamic air-rate switching (`19.2k` $\leftrightarrow$ `9.6k` deep woods mode) triggered directly from Tile 1 `LORA` button with zero `sudo` passwords, zero service restarts, and 60-second automatic rollback failsafe.
+  * 45-byte packed binary uplink telemetry (`0xAA 0x55`, CRC16-CCITT) transmitted in the GPS-disciplined 5-second superframe Second 0 uplink window ($\approx 31\text{ ms}$ airtime at `19.2k`) every 5 seconds. Reports ANT1 position fix, ANT2 slave fix (`SLV_FIX`/`SLV_FLT`), measured 3D baseline length (`BL: 55.4cm`), crossbar pitch, explicit heading source (`DUAL_FIX`, `WALK`, `GYRO`, `HLD`, `COMP`), satellite counts, ground-tip coordinates, and battery/USB health.
+  * Base Station [`e220_pacer.py`](scripts/e220_pacer.py) (`v3.5.2`) features a dual-format auto-detecting unpacker (39B/45B), outputs live telemetry heartbeats to console with clean ASCII `deg` units and `PWR:USB` / `Bat:xx%` power formatting, writes atomic JSON to `/run/rtk_rover_status.json` (`tmpfs` in RAM, zero SD wear), and appends to rolling daily CSV with 30-day auto-pruning.
+  * Over-the-air dynamic 3-rate air-rate switching (`19.2k` -> `9.6k` -> `4.8k` -> `19.2k`) triggered directly from Tile 1 `LORA` button with synchronous Second 1 `ACK` / Second 2 switch, zero `sudo` passwords, zero service restarts, and 60-second automatic rollback failsafe.
 * **Dual-Antenna Moving-Baseline RTK Kinematics:** Powered by the Holybro H-RTK Unicore UM982. Phase centers for Master (Position) and Slave (Heading) are spaced at `55.5 cm` along a rigid crossbar. Kinematic algorithms project coordinates to the exact pole centerline midpoint and down to the ground tip (`1.80 m`), completely eliminating position orbit when rotating the pole.
 * **Dual-Mode Hybrid Navigation Engine (Tile 0):**
   * **Coarse Tactical Grid ($> 1.5\text{ m}$):** Dynamic Course-Up grid with antenna crossbar beam arrow, line-of-sight tracking vector, turn prompts, dynamic auto-scaling, and a 64-point on-screen breadcrumb trail.
@@ -65,7 +70,7 @@ High-precision handheld and pole-mounted RTK GNSS Waypoint Guidance, Property Pi
     * Row 1: `VOL: xx%` / `VOL: MUTE`, `AUD: GEIGER / BEEPS / MUTE`, `BRI: xx%`
     * Row 2: `SERIAL: ON/OFF`, `NMEA: ON/OFF`, `RTCM: ON/OFF`
     * Row 3: `TELEM: ON/OFF`, `IMU: ON/OFF`, `TOUCH: ON/OFF`
-    * Row 4: `WIFI: CONN/STA/AP/OFF`, `UNITS: IMP/SI`, `LORA: 19.2k / 9.6k`
+    * Row 4: `WIFI: CONN/STA/AP/OFF`, `UNITS: IMP/SI`, `LORA: 19.2k / 9.6k / 4.8k`
   * Centered Wi-Fi status banner below grid (`Wi-Fi: Inactive (Tap to start)` / `Portal: http://...`).
 * **Multi-File Waypoint Browser & Selector (Tile 2):**
   * Multi-file CSV selector scanning `/waypoints.csv` and all `/waypoints_*.csv` on MicroSD card or internal flash.
@@ -143,17 +148,16 @@ All peripheral UART pin labels are **device-relative** (`<DEV>_TXD` is an output
 
 | Subsystem | Signal Name | ESP32-S3 GPIO | Direction (ESP32 View) | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| **UM982 COM1** | `UM982_TXD0` | `GPIO 17` | **ESP32 RX** (`Serial1`) | UM982 COM1 TX $\rightarrow$ ESP32 RX (`115200 8N1`, NMEA & Heading stream) |
-| **UM982 COM1** | `UM982_RXD0` | `GPIO 18` | **ESP32 TX** (`Serial1`) | ESP32 TX $\rightarrow$ UM982 COM1 RX (`115200 8N1`, Configuration commands) |
-| **UM982 COM2** | `UM982_TXD1` | `GPIO 47` | **ESP32 RX** (`Serial2`) | UM982 COM2 TX $\rightarrow$ ESP32 RX (`115200 8N1`, Response telemetry) |
-| **UM982 COM2** | `UM982_RXD1` | `GPIO 48` | **ESP32 TX** (`Serial2`) | ESP32 TX $\rightarrow$ UM982 COM2 RX (`115200 8N1`, RTCM3 correction stream) |
+| **UM982 COM1** | `UM982_TXD0` | `GPIO 17` | **ESP32 RX** (`Serial1`) | UM982 COM1 TX $\rightarrow$ ESP32 RX (`115200 8N1`, NMEA, Heading & Responses) |
+| **UM982 COM1** | `UM982_RXD0` | `GPIO 18` | **ESP32 TX** (`Serial1`) | ESP32 TX $\rightarrow$ UM982 COM1 RX (`115200 8N1`, RTCM3 & Config commands) |
+| **Legacy COM2** | `(Freed in v0.8.0)` | `GPIO 47 / 48` | **Spare / Freed** | Previously `Serial2` COM2 (consolidated onto `COM1` in Phase 8) |
 | **E220 LoRa** | `E220_TXD` | `GPIO 41` | **ESP32 RX** (`Serial0`) | E220 TXD $\rightarrow$ ESP32 RX (`115200 8N1` Transparent / `9600` Config) |
 | **E220 LoRa** | `E220_RXD` | `GPIO 42` | **ESP32 TX** (`Serial0`) | ESP32 TX $\rightarrow$ E220 RXD |
 | **E220 Control** | `E220_AUX` | `GPIO 21` | **ESP32 Input** | Module Busy (`LOW`) / Idle & Ready (`HIGH`) status |
 | **E220 Control** | `E220_RST` | `GPIO 38` | **ESP32 Output** | Hardware Reset (`HIGH` = normal operation) |
 | **E220 Control** | `E220_M0` | `GPIO 39` | **ESP32 Output** | Mode 0 (`LOW` = Transparent Mode, `HIGH` = Config Mode) |
 | **E220 Control** | `E220_M1` | `GPIO 40` | **ESP32 Output** | Mode 1 (`LOW` = Transparent Mode, `HIGH` = Config Mode) |
-| **Internal I2C0** | `ESP_SCL` / `SDA` | `GPIO 7` / `8` | **I2C Master** | Shared by Touch (`0x3B`), TCA9554 (`0x20`), AXP2101 (`0x34`), RTC (`0x51`), IMU (`0x6B`), ES8311 (`0x18`) at `400 kHz` |
+| **Internal I2C0** | `ESP_SCL` / `SDA` | `GPIO 7` / `8` | **I2C Master** | Shared by Touch (`0x3B`), TCA9554 (`0x20`), AXP2101 (`0x34`), RTC (`0x51`), IMU (`0x6B`), ES8311 (`0x18`), optional `MMC5983MA` (`0x30`) at `400 kHz` |
 | **LCD QSPI** | `CS/CLK/D0..3` | `12, 5, 1..4` | **QSPI Master** | `AXS15231B` $320 \times 480$ Portrait Display (`GPIO 6` Backlight PWM) |
 | **SD Card** | `D0/CMD/CLK` | `9, 10, 11` | **1-Bit SD_MMC / SPI** | 3-stage mount fallback (`SD_MMC` 1-bit `EXIO3=High-Z` $\rightarrow$ `EXIO3=LOW` $\rightarrow$ `SD` SPI) |
 | **BOOT Button** | `BOOT_SWITCH` | `GPIO 0` | **ESP32 Input** | **Long-Press ($\ge 1.5\text{ s}$):** Capture full-screen BMP screenshot to storage |
@@ -165,9 +169,9 @@ All peripheral UART pin labels are **device-relative** (`<DEV>_TXD` is an output
 ```mermaid
 flowchart TD
     subgraph Core0["Core 0: High-Throughput Real-Time Task (Priority 4)"]
-        E220_RX["E220 LoRa UART0 (IO41/42 @ 115200)"] --> RTCM_FWD["Forward RTCM3 Bytes"]
-        RTCM_FWD --> COM2_TX["UM982 COM2 UART2 (IO47/48 @ 115200)"]
-        COM1_RX["UM982 COM1 UART1 (IO17/18 @ 115200)"] --> NMEA_PARSE["NMEA & UNIHEADINGA Parser\n(GPGGA, GPRMC, GPGST, GPGSV, GNGGAH, BASEINFOA)"]
+        E220_RX["E220 LoRa UART0 (IO41/42 @ 115200)"] --> RTCM_FWD["Verify CRC24Q & Forward RTCM3"]
+        RTCM_FWD --> COM1_TX["UM982 COM1 UART1 TX (IO18 @ 115200, Mutex)"]
+        COM1_RX["UM982 COM1 UART1 RX (IO17 @ 115200)"] --> NMEA_PARSE["NMEA, UNIHEADINGA & BASEINFOA Demux\n(GPGGA, GPRMC, GPGST, GPGSV, GNGGAH, BASEINFOA)"]
         NMEA_PARSE --> KINEMATICS["3D Lever-Arm & Ground Tip Kinematics\n(Midpoint 27.75cm, Height 1.80m)"]
         KINEMATICS --> NAV_ENGINE["Geodesic Nav Engine\n(Range, Bearing, Offsets)"]
         NAV_ENGINE --> QUEUE["roverStateQueue (xQueueOverwrite)"]
@@ -233,7 +237,7 @@ Python command-line tools in scripts/ automate cadastral COGO network solving, w
 * **install_git_hooks.py (v1.1.0):** Installs the pre-push security verification hook into .git/hooks/pre-push.
 * **kml_to_waypoints.py (v1.0.0):** Converts Google Earth or GIS .kml boundary polygons, paths, and placemarks directly into the rover's 19-column waypoints.csv format with automatic label sanitization and multi-line description handling.
 * **validate_waypoints.py** (v1.2.0): Checks syntax, column count, bounds, and computes leg-by-leg distances, bearings, and closed-loop perimeter for any waypoint CSV file.
-* **`e220_pacer.py` (v3.4.0):** Base station hardware pacer daemon for RTKBase streams with silicon-calibrated Time-on-Air, Section 5.6.2 two-regime pacing, 45-byte bi-directional uplink telemetry (`PWR:USB` / `Bat:xx%`), remote air-rate switching, and Adaptive Constellation Interleaving at $\le 9.6\text{ kbps}$.
+* **`e220_pacer.py` (v3.5.2):** Base station hardware pacer daemon for RTKBase streams with silicon-calibrated Time-on-Air, Section 5.6.2 two-regime pacing, GPS-disciplined 5-second superframe TDMA, empty MSM dropper (`<= 28 B`), 45-byte bi-directional uplink telemetry (`PWR:USB` / `Bat:xx%`), synchronized 3-rate air-rate switching (`19.2k` / `9.6k` / `4.8k`), and Adaptive Constellation Interleaving at $\le 9.6\text{ kbps}$.
 
 ---
 
