@@ -69,7 +69,7 @@ except ImportError:
 
 __filename__ = "e220_pacer.py"
 __app_name__ = "e220_pacer"
-__version__ = "3.6.2"
+__version__ = "3.6.3"
 __date__ = "2026-11-15"
 
 # Force unbuffered output so systemd journalctl displays entries in real time
@@ -293,7 +293,7 @@ class E220Pacer:
         self.backlog_shed_frames = 0
         self.rtcm_stats: dict[int, int] = {}
 
-        # Adaptive Constellation Interleaver State
+        # Adaptive Constellation Interleaver State (Closed-Loop Airtime Budgeting)
         self.enable_interleave = not no_interleave
         self.seen_secondary_types: set[int] = set()
         self.epoch_counter = 0
@@ -301,6 +301,11 @@ class E220Pacer:
         self.last_msm_type: int = 0
         self.head_frame_approved: bool = False
         self.interleave_dropped_frames = 0
+        self.msm_last_len: dict[int, int] = {1074: 232, 1084: 150, 1094: 335, 1124: 240}
+        self.msm_epochs_since_tx: dict[int, int] = {1074: 0}
+        self.epoch_target_msm: int = 1074
+        self.sec_tx_utc: int = 0
+        self.sec_tx_count: int = 0
 
         # Phase 9: Empty MSM Dropper & GPS-Disciplined 5s Superframe Synchronous Switch State
         self.empty_msm_dropped = 0
@@ -668,17 +673,16 @@ class E220Pacer:
             )
         else:
             # -----------------------------------------------------------------
-            # REGIME B: Two-Subpacket Frame (201..400B, e.g. 1074, 1094)
-            # Subpacket 1 (200B) starts RF TX while Subpacket 2 (tail_len) sits
-            # in the UART buffer holding AUX LOW (~109ms @ 19.2k).
-            # CRITICAL (Sec 5.6.2): AUX rises HIGH the instant Subpacket 2 moves
-            # into the LLCC68 FIFO and BEGINS transmitting over the air! We MUST
-            # wait tail_air_s + guard_delay_s after AUX rises so the next frame
-            # does not collide with Subpacket 2.
+            # REGIME B: Multi-Subpacket Frame (> 200B, e.g. 1074, 1094, 1124)
+            # Supports 2 subpackets (201..400B) or 3+ subpackets (>400B) cleanly.
+            # Subpacket 1 (200B) starts RF TX while trailing subpacket(s) drain
+            # through UART RAM holding AUX LOW. Enforce both tail wait and full
+            # multi-subpacket ToA floor + >=48ms guard for Rover UART drain.
             # -----------------------------------------------------------------
-            num_subpkts = 2
-            tail_len = total_len - self.packet_size
-            head_est_s = self.estimate_subpacket_air_s(self.packet_size)
+            num_subpkts = (total_len + self.packet_size - 1) // self.packet_size
+            full_heads = num_subpkts - 1
+            tail_len = total_len - (full_heads * self.packet_size)
+            head_est_s = float(full_heads) * self.estimate_subpacket_air_s(self.packet_size)
             tail_air_s = self.estimate_subpacket_air_s(tail_len)
             aux_dropped = False
             drop_ms = 0.0
@@ -695,17 +699,17 @@ class E220Pacer:
                 if aux_dropped:
                     t_low = time.monotonic()
                     if not self.wait_aux(timeout=AUX_RISE_WATCHDOG_S):
-                        self.hardware_reset_e220(f"AUX stuck LOW >{AUX_RISE_WATCHDOG_S}s on 2-pkt {total_len}B")
+                        self.hardware_reset_e220(f"AUX stuck LOW >{AUX_RISE_WATCHDOG_S}s on {num_subpkts}-pkt {total_len}B")
                     aux_low_s = time.monotonic() - t_low
                     # At <=9.6 kbps, the E220 MCU empties its UART RAM buffer and raises AUX HIGH
                     # ~100-145ms BEFORE Subpacket 1 (200B) finishes transmitting on RF!
-                    # Enforce both the Subpacket 2 tail wait and full 2-subpacket ToA floor.
+                    # Enforce both the final subpacket tail wait and full multi-subpacket ToA floor.
                     elapsed_since_flush = time.monotonic() - t_after_flush
                     total_air_est_s = head_est_s + tail_air_s
                     rem_air_s = max(tail_air_s, total_air_est_s - elapsed_since_flush)
                     time.sleep(rem_air_s)
                 else:
-                    # Fallback if AUX edge was missed: sleep full calculated 2-subpacket air time
+                    # Fallback if AUX edge was missed: sleep full calculated multi-subpacket air time
                     elapsed_since_flush = time.monotonic() - t_after_flush
                     rem_air_s = max(0.0, (head_est_s + tail_air_s) - elapsed_since_flush)
                     if rem_air_s > 0.0:
@@ -714,8 +718,9 @@ class E220Pacer:
                 rem_air_s = tail_air_s
                 time.sleep(head_est_s + tail_air_s)
 
-            eff_guard_s = self._get_effective_guard_delay_s()
+            eff_guard_s = max(self._get_effective_guard_delay_s(), 0.048)
             time.sleep(eff_guard_s)
+            pkt_desc = f"2 pkts ({self.packet_size}+{tail_len}B)" if num_subpkts == 2 else f"{num_subpkts} pkts ({full_heads}x{self.packet_size}+{tail_len}B)"
             if aux_dropped:
                 tail_note = (
                     f"TailWait={rem_air_s*1000:.1f}ms(Tail={tail_air_s*1000:.1f}ms)"
@@ -723,13 +728,13 @@ class E220Pacer:
                     else f"TailAir={tail_air_s*1000:.1f}ms"
                 )
                 detail = (
-                    f"2 pkts ({self.packet_size}+{tail_len}B) | "
+                    f"{pkt_desc} | "
                     f"AUX_low={aux_low_s*1000:.1f}ms(drop={drop_ms:.1f}ms) + "
                     f"{tail_note} + Guard={eff_guard_s*1000:.0f}ms"
                 )
             else:
                 detail = (
-                    f"2 pkts ({self.packet_size}+{tail_len}B) | "
+                    f"{pkt_desc} | "
                     f"NO-AUX-DROP EstAir={(head_est_s+tail_air_s)*1000:.1f}ms + Guard={eff_guard_s*1000:.0f}ms"
                 )
 
@@ -797,22 +802,46 @@ class E220Pacer:
                     flush=True,
                 )
 
+    def _select_epoch_target_msm(self) -> int:
+        """Selects the priority MSM constellation for this epoch so no constellation ever starves."""
+        all_types = [1074] + sorted(self.seen_secondary_types)
+        for m in all_types:
+            self.msm_epochs_since_tx[m] = self.msm_epochs_since_tx.get(m, 0) + 1
+
+        if not self.seen_secondary_types:
+            self.epoch_target_msm = 1074
+            return self.epoch_target_msm
+
+        secondaries = sorted(self.seen_secondary_types)
+        best_secondary = max(secondaries, key=lambda m: (self.msm_epochs_since_tx.get(m, 0), -m))
+
+        if self.air_rate_kbps <= 4.8:
+            if (self.epoch_counter % 2) == 0 or self.msm_epochs_since_tx.get(1074, 0) >= 2:
+                self.epoch_target_msm = 1074
+            else:
+                self.epoch_target_msm = best_secondary
+        elif self.air_rate_kbps <= 10.0:
+            if self.msm_epochs_since_tx.get(1074, 0) >= 2:
+                self.epoch_target_msm = 1074
+            else:
+                self.epoch_target_msm = best_secondary
+        else:
+            starved = [m for m in all_types if self.msm_epochs_since_tx.get(m, 0) >= 2]
+            if starved:
+                self.epoch_target_msm = max(starved, key=lambda m: (self.msm_epochs_since_tx.get(m, 0), -m))
+            else:
+                self.epoch_target_msm = 1074
+
+        return self.epoch_target_msm
+
     def should_send_rtcm_frame(self, msg_type: int) -> bool:
         """
-        Adaptive Constellation Interleaver:
-        At air rates <= 9.6 kbps, the full multi-constellation MSM set (~650B) exceeds
-        the 1.0s Time-on-Air budget + 200ms half-duplex quiet window.
-        - 1005, 1006, 1033, 1230 (Base ARP, antenna, GLONASS biases): ALWAYS TRANSMITTED.
-        - Air rate >= 19.2 kbps: 100% passthrough (sufficient RF channel capacity).
-        - Air rate == 9.6 kbps: GPS (1074) transmitted every second (1 Hz).
-          Secondary constellations (GLO 1084, GAL 1094, BDS 1124) are interleaved across epochs:
-            - If 2 secondaries active: alternate even/odd epochs (0.5 Hz each).
-            - If 3 secondaries active: rotate across 3 epochs (0.33 Hz each).
-        - Air rate <= 4.8 kbps: Rotate 1 constellation per second (GPS -> GAL -> GPS -> GLO).
+        Adaptive Constellation Interleaver (Closed-Loop Airtime Budgeting):
+        Selects candidate MSM constellations based on active air-rate and starvation age,
+        then pairs with closed-loop airtime admission and reservation checks in process_stream()
+        so any satellite count or constellation count fits cleanly inside each superframe second.
         """
         if msg_type in (1005, 1006, 1033, 1230):
-            if self.enable_interleave and self.air_rate_kbps <= 4.8 and self.epoch_counter > 1:
-                return (self.epoch_counter % 2) == 1
             return True
 
         now = time.monotonic()
@@ -827,39 +856,34 @@ class E220Pacer:
             if is_new_epoch:
                 self.epoch_counter += 1
                 self.last_epoch_start_time = now
+                self._select_epoch_target_msm()
 
         if msg_type in (1084, 1094, 1124):
             self.seen_secondary_types.add(msg_type)
+            if msg_type not in self.msm_epochs_since_tx:
+                self.msm_epochs_since_tx[msg_type] = 1
 
         if not self.enable_interleave or self.air_rate_kbps >= 19.2:
             return True
 
-        # GPS (1074): Primary constellation
+        if self.air_rate_kbps <= 4.8:
+            return msg_type == self.epoch_target_msm
+
+        # 9.6 kbps: admit GPS (1074) plus the target/most-starved secondary constellation;
+        # closed-loop airtime reservation and Fit-or-Skip checks decide exact pairing.
         if msg_type == 1074:
-            if self.air_rate_kbps == 9.6:
-                return True
-            elif self.air_rate_kbps <= 4.8:
-                # At <=4.8k, GPS sent on even epochs (0.5 Hz)
-                return (self.epoch_counter % 2) == 0
+            return True
 
-        # Secondary constellations: Interleave at <= 9.6k
         if msg_type in (1084, 1094, 1124):
-            active = sorted(self.seen_secondary_types)
-            if not active:
+            if not self.seen_secondary_types:
                 return True
-
-            if self.air_rate_kbps == 9.6:
-                if len(active) == 1:
-                    return (self.epoch_counter % 2) == 0
-                target_idx = self.epoch_counter % len(active)
-                return active[target_idx] == msg_type
-
-            elif self.air_rate_kbps <= 4.8:
-                # At <=4.8k, secondary constellation sent on odd epochs (0.5 Hz / N)
-                if (self.epoch_counter % 2) == 1:
-                    sec_epoch = (self.epoch_counter // 2) % len(active)
-                    return active[sec_epoch] == msg_type
-                return False
+            if self.epoch_target_msm != 1074:
+                return msg_type == self.epoch_target_msm
+            sec_m = max(
+                sorted(self.seen_secondary_types),
+                key=lambda m: (self.msm_epochs_since_tx.get(m, 0), -m),
+            )
+            return msg_type == sec_m
 
         return True
 
@@ -889,22 +913,27 @@ class E220Pacer:
         return 700.0 if self.air_rate_kbps <= 9.6 else 740.0
 
     def _get_sec1_to_4_downlink_cutoff_ms(self) -> float:
-        """Returns the Seconds 1..4 downlink cutoff in ms, reserving 850..1000ms for 1.0 Hz Rover RSSI."""
-        return 850.0 if self.air_rate_kbps > 5.0 else 960.0
+        """Returns the Seconds 1..4 downlink cutoff in ms, reserving 850..1000ms for collision-free RSSI."""
+        return 850.0
 
     def _estimate_frame_toa_ms(self, frame_len: int) -> float:
-        """Estimates total UART + RF Time-on-Air + guard delay in ms for a complete RTCM3 frame."""
+        """Estimates total UART + RF Time-on-Air + multi-subpacket handover/guard delay in ms."""
         if frame_len <= 0:
             return 0.0
         pkt_sz = max(int(self.packet_size), 32)
         rem = frame_len
         air_s = 0.0
+        num_subpkts = 0
         while rem > 0:
             chunk = min(rem, pkt_sz)
             air_s += self.estimate_subpacket_air_s(chunk)
             rem -= chunk
+            num_subpkts += 1
         uart_s = (float(frame_len) * 10.0) / max(float(self.baud), 9600.0)
-        return (air_s + uart_s + self._get_effective_guard_delay_s()) * 1000.0
+        guard_s = self._get_effective_guard_delay_s()
+        if num_subpkts >= 2:
+            guard_s = max(guard_s, 0.048) + 0.008 * float(num_subpkts - 1)
+        return (air_s + uart_s + guard_s) * 1000.0
 
     def _transmit_pending_switch_ack_if_due(self, utc_sec: int, ms_in_sec: float) -> None:
         if self.pending_switch_ack_frame is None or self.ser is None or not self.ser.is_open:
@@ -1440,8 +1469,11 @@ class E220Pacer:
                         )
                     continue
 
-                # 4c. Adaptive Constellation Interleaver (evaluated BEFORE Second 0 cutoff so skipped
-                #     frames are discarded immediately in 0ms without stalling Second 0 or leaking into Second 1)
+                # 4c. Adaptive Constellation Interleaver (evaluated BEFORE cutoff checks so skipped
+                #     frames are discarded immediately in 0ms without stalling or queuing stale epochs)
+                if msg_type in (1074, 1084, 1094, 1124):
+                    self.msm_last_len[msg_type] = total_frame_len
+
                 if not self.head_frame_approved:
                     if not self.should_send_rtcm_frame(msg_type):
                         del buffer[:total_frame_len]
@@ -1460,23 +1492,80 @@ class E220Pacer:
                         continue
                     self.head_frame_approved = True
 
-                # 4d. Second 0 & End-of-Second Downlink Cutoff Guards:
-                #     - Second 0: hold before 700ms/740ms so Second 0 uplink slot stays clear.
-                #     - Seconds 1..4 (> 5.0 kbps): hold after 400ms if frame would bleed past 850ms,
-                #       preserving 850..1000ms as a collision-free 1.0 Hz Mode 0 RSSI micro-slot.
+                # 4d. Closed-Loop Airtime Budget, Constellation Reservation & TDD Cutoff Guards:
+                #     - Second 0: hold/skip before 700ms/740ms so Second 0 uplink slot stays clear.
+                #     - Seconds 1..4: enforce 850ms ceiling on follow-on frames (and late leads >=180ms)
+                #       using Fit-or-Skip for MSM so frames never bleed across seconds or build backlogs.
                 utc_sec, sf_sec, ms_in_sec = self._get_superframe_timing()
+                if utc_sec != self.sec_tx_utc:
+                    self.sec_tx_utc = utc_sec
+                    self.sec_tx_count = 0
                 est_toa_ms = self._estimate_frame_toa_ms(total_frame_len)
-                cutoff_ms = self._get_sec0_downlink_cutoff_ms()
-                sec1_4_cutoff_ms = self._get_sec1_to_4_downlink_cutoff_ms()
+                cutoff_ms = (
+                    self._get_sec0_downlink_cutoff_ms()
+                    if sf_sec == 0
+                    else self._get_sec1_to_4_downlink_cutoff_ms()
+                )
+
+                if (
+                    self.enable_interleave
+                    and msg_type in (1074, 1084, 1094, 1124)
+                    and msg_type != self.epoch_target_msm
+                    and self.msm_epochs_since_tx.get(self.epoch_target_msm, 0) >= 1
+                    and msg_type < self.epoch_target_msm
+                ):
+                    target_len = self.msm_last_len.get(self.epoch_target_msm, 320)
+                    target_toa_ms = self._estimate_frame_toa_ms(target_len)
+                    if (ms_in_sec + est_toa_ms + target_toa_ms) > cutoff_ms:
+                        del buffer[:total_frame_len]
+                        self.head_frame_approved = False
+                        self.interleave_dropped_frames += 1
+                        if self.verbose:
+                            print(
+                                f"[INTERLEAVE] Yielded Type:{msg_type:<4d} ({total_frame_len}B, {est_toa_ms:.0f}ms) "
+                                f"to reserve {self.air_rate_kbps}k slot for Type:{self.epoch_target_msm} ({target_toa_ms:.0f}ms)",
+                                flush=True,
+                            )
+                        continue
+
                 if sf_sec == 0 and (ms_in_sec + est_toa_ms) > cutoff_ms:
+                    if msg_type in (1074, 1084, 1094, 1124):
+                        del buffer[:total_frame_len]
+                        self.head_frame_approved = False
+                        self.interleave_dropped_frames += 1
+                        if self.verbose:
+                            print(
+                                f"[SEC0 SKIP] Skipped Type:{msg_type:<4d} ({total_frame_len}B, {est_toa_ms:.0f}ms) "
+                                f"at {ms_in_sec:.0f}ms > {cutoff_ms:.0f}ms",
+                                flush=True,
+                            )
+                        if ms_in_sec >= (cutoff_ms - 100.0):
+                            sec0_cutoff_reached = True
+                            break
+                        continue
                     sec0_cutoff_reached = True
                     break
+
                 if (
                     sf_sec != 0
-                    and self.air_rate_kbps > 5.0
-                    and (ms_in_sec + est_toa_ms) > sec1_4_cutoff_ms
-                    and ms_in_sec >= 400.0
+                    and (ms_in_sec + est_toa_ms) > cutoff_ms
+                    and (self.sec_tx_count > 0 or ms_in_sec >= 180.0)
                 ):
+                    if msg_type in (1074, 1084, 1094, 1124):
+                        del buffer[:total_frame_len]
+                        self.head_frame_approved = False
+                        self.interleave_dropped_frames += 1
+                        if self.verbose:
+                            print(
+                                f"[BUDGET SKIP] Skipped Type:{msg_type:<4d} ({total_frame_len}B, {est_toa_ms:.0f}ms) "
+                                f"at {ms_in_sec:.0f}ms > {cutoff_ms:.0f}ms",
+                                flush=True,
+                            )
+                        if self._is_terminal_burst_msg(msg_type) or ms_in_sec >= 650.0:
+                            sec_end_rssi_window_reached = True
+                            sec_end_target_utc_sec = utc_sec
+                            break
+                        continue
                     sec_end_rssi_window_reached = True
                     sec_end_target_utc_sec = utc_sec
                     break
@@ -1485,6 +1574,9 @@ class E220Pacer:
                 self.head_frame_approved = False
 
                 self.send_rtcm_frame(frame, msg_type)
+                self.sec_tx_count += 1
+                if msg_type in (1074, 1084, 1094, 1124):
+                    self.msm_epochs_since_tx[msg_type] = 0
 
                 # Poll uplink and watchdog immediately after each frame transmission
                 self.poll_uplink()

@@ -5,6 +5,18 @@ All notable changes to the **RTK Rover** project will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.8.10] - 2026-11-15
+
+### Fixed
+- **Satellite-Count-Invariant Closed-Loop Airtime Budgeting & Reservation Scheduler (`scripts/e220_pacer.py v3.6.3`):**
+  - Replaced open-loop modulo constellation interleaving and the `ms_in_sec >= 400.0` `850 ms` cutoff loophole exposed in `test/_041` (`175` `[WARN] Shed` events at `9.6 kbps` caused by odd epochs `1074 + 1094 = 938 ms > 850 ms` splitting across second boundaries) with **closed-loop Fit-or-Skip admission control** and **starvation-age constellation reservation (`_select_epoch_target_msm()`, `msm_epochs_since_tx`, `msm_last_len`)**.
+  - Whenever an earlier constellation (`1074`/`1084`) would squeeze the epoch's priority starved constellation past `cutoff_ms` (`700/740 ms` in Second 0, `850 ms` in Seconds `1..4`), it yields automatically; any MSM frame exceeding remaining second airtime skips cleanly in `0 ms` instead of stalling the queue into the next second. Scales cleanly across rising satellite counts or additional constellations (`1124`).
+  - Generalized `send_packet()` Regime B to support `2` or `3+` subpackets cleanly with a `>= 48 ms` multi-subpacket inter-frame guard (`max(guard, 0.048)`), calibrated `_estimate_frame_toa_ms()` multi-subpacket handover overhead (`+8 ms` per extra subpacket) against empirical `test/_041` hardware timings, and enforced an `850 ms` follow-on frame ceiling across all air rates (`sec_tx_count > 0` or `ms_in_sec >= 180.0 ms` in Seconds `1..4`).
+- **Hardened Collision-Free TDD RSSI Gating & Carrier-Contaminated Noise Filter (`src/e220_driver/e220_driver.cpp`):**
+  - Fixed the `4.8 kbps` mid-packet RSSI collision (`Noise:-30..-34 dBm` and orphan `Subpacket 2` tails in `test/_041` Phase 2) by removing the permissive `(now - s_last_valid_rtcm_ms <= 750U)` fallback on `end_of_sec_gap`: Seconds `1..4` RSSI polling (`885..935 ms`) at `<= 5.0 kbps` now triggers strictly only when `s_last_valid_msm_utc_sec == sf_utc_sec` (proving the second's single MSM frame already passed `CRC24Q`).
+  - Tightened Second 0 `post_uplink_gap` (`810..935 ms`), tightened `idle_link_probe` (`sf_ms <= 900 ms`), reduced `E220_RSSI_REPLY_TIMEOUT_MS` from `180 ms` to `65 ms`, and added a hard `sf_ms >= 985 ms` expiry so RSSI queries never bleed across `.000 s` into the next second's lead RTCM frame.
+  - Added a carrier-contamination guard in `e220_record_rssi_reply()` rejecting ambient noise readings above `-65 dBm` within `8 dB` of `cand_pkt_dbm`.
+
 ## [v0.8.9] - 2026-11-15
 
 ### Fixed

@@ -34,6 +34,7 @@ static float             s_active_air_rate        = 19.2f;
 static float             s_fallback_air_rate      = 19.2f;
 static uint32_t          s_rate_switch_done_ms    = 0;
 static uint32_t          s_last_valid_rtcm_ms     = 0;
+static uint32_t          s_last_valid_msm_utc_sec = 0xFFFFFFFFU;
 static bool              s_switched_requires_watchdog = false;
 static uint32_t          s_tx_air_busy_until_ms   = 0;
 
@@ -148,13 +149,13 @@ extern "C" bool e220_is_uplink_slot_active(uint32_t now_ms)
 // =========================================================================
 // Non-Blocking Mode 0 Live RSSI / Ambient Noise Register Poll State
 // Queries C0 C1 C2 C3 00 02 once per Second 0 post-uplink quiet window and
-// in the GPS-disciplined end-of-second micro-slot (880..950ms in Seconds 1..4).
+// in the GPS-disciplined end-of-second micro-slot (885..935ms in Seconds 1..4).
 // Parses both 4-byte (C1 00 <noise> <pkt>) and 5-byte (C1 00 02 <noise> <pkt>)
 // E220-900T30S replies (requires REG1 Bit 5 = 0x20).
 // =========================================================================
 #define E220_RSSI_POLL_INTERVAL_MS  750U
 #define E220_RSSI_IDLE_POLL_MS      2000U
-#define E220_RSSI_REPLY_TIMEOUT_MS  180U
+#define E220_RSSI_REPLY_TIMEOUT_MS  65U
 
 static bool     rssi_query_active       = false;
 static uint32_t last_rssi_poll_ms       = 0;
@@ -877,6 +878,13 @@ static void e220_process_rx_stage(void)
                     e220_stats.msg_1094_count++;
                 }
 
+                if (msg_type == 1074U || msg_type == 1084U || msg_type == 1094U || msg_type == 1124U) {
+                    uint32_t rx_utc_sec = 0;
+                    if (e220_get_superframe_clock(ok_now, &rx_utc_sec, NULL, NULL)) {
+                        s_last_valid_msm_utc_sec = rx_utc_sec;
+                    }
+                }
+
                 if ((s_active_air_rate > 10.0f && msg_type == 1094 &&
                      last_1074_rx_ms > 0 && (ok_now - last_1074_rx_ms) <= 850U) ||
                     (s_active_air_rate > 5.0f && s_active_air_rate <= 10.0f &&
@@ -995,11 +1003,18 @@ static void e220_ingest_rx_bytes(const uint8_t *data, size_t len, uint32_t now)
 
 static void e220_record_rssi_reply(uint8_t noise_raw, uint8_t pkt_raw, uint32_t now)
 {
-    if (noise_raw > 0x80U && noise_raw <= 0xE4U) {
-        e220_stats.ambient_noise_dbm = (int16_t)noise_raw - 256;
+    int16_t cand_noise_dbm = (int16_t)noise_raw - 256;
+    int16_t cand_pkt_dbm   = (int16_t)pkt_raw - 256;
+    // Reject ambient noise samples contaminated by active close-range RF carrier demodulation
+    bool carrier_contaminated = (cand_noise_dbm > -65) &&
+                                (cand_pkt_dbm > -65) &&
+                                ((cand_noise_dbm - cand_pkt_dbm) >= -8) &&
+                                ((cand_noise_dbm - cand_pkt_dbm) <= 8);
+    if (noise_raw > 0x80U && noise_raw <= 0xE4U && !carrier_contaminated) {
+        e220_stats.ambient_noise_dbm = cand_noise_dbm;
     }
     if (e220_stats.rx_bytes_total > 0 && pkt_raw >= 0x80U && pkt_raw <= 0xF6U) {
-        e220_stats.last_pkt_rssi_dbm = (int16_t)pkt_raw - 256;
+        e220_stats.last_pkt_rssi_dbm = cand_pkt_dbm;
         e220_stats.rssi_valid        = true;
     }
     e220_stats.radio_online      = true;
@@ -1081,27 +1096,33 @@ extern "C" void e220_poll_and_forward_rtcm(void)
             }
         }
 
-        if (rssi_query_active && (millis() - rssi_query_start_ms > E220_RSSI_REPLY_TIMEOUT_MS)) {
-            rssi_query_active     = false;
-            isr_aux_fall_us       = 0;
-            e220_suppress_aux_isr = false;
-            if (rssi_reply_len > 0 && rssi_reply_buf[0] != 0xC1) {
-                uint8_t saved_len = rssi_reply_len;
-                rssi_reply_len    = 0;
-                e220_ingest_rx_bytes(rssi_reply_buf, saved_len, millis());
-            } else {
-                rssi_reply_len = 0;
-                if (s_rssi_timeout_streak < 255U) {
-                    s_rssi_timeout_streak++;
-                }
-                uint32_t rx_silence_ms = (e220_stats.last_rx_ms > 0) ? (millis() - e220_stats.last_rx_ms) : 0xFFFFFFFFU;
-                if (s_rssi_timeout_streak >= 3U && rx_silence_ms > 10000U) {
-                    if (e220_stats.radio_online) {
-                        Serial.println("[E220 LORA] WARNING: Radio link OFFLINE (3 consecutive Mode 0 poll timeouts & >10s RX silence).");
+        if (rssi_query_active) {
+            uint32_t q_now_ms = millis();
+            uint32_t q_sf_ms  = 0;
+            bool     has_q_sf = e220_get_superframe_clock(q_now_ms, NULL, NULL, &q_sf_ms);
+            if ((q_now_ms - rssi_query_start_ms > E220_RSSI_REPLY_TIMEOUT_MS) ||
+                (has_q_sf && q_sf_ms >= 985U)) {
+                rssi_query_active     = false;
+                isr_aux_fall_us       = 0;
+                e220_suppress_aux_isr = false;
+                if (rssi_reply_len > 0 && rssi_reply_buf[0] != 0xC1) {
+                    uint8_t saved_len = rssi_reply_len;
+                    rssi_reply_len    = 0;
+                    e220_ingest_rx_bytes(rssi_reply_buf, saved_len, q_now_ms);
+                } else {
+                    rssi_reply_len = 0;
+                    if (s_rssi_timeout_streak < 255U) {
+                        s_rssi_timeout_streak++;
                     }
-                    e220_stats.radio_online = false;
-                    e220_stats.rssi_valid   = false;
-                    s_was_radio_online      = false;
+                    uint32_t rx_silence_ms = (e220_stats.last_rx_ms > 0) ? (q_now_ms - e220_stats.last_rx_ms) : 0xFFFFFFFFU;
+                    if (s_rssi_timeout_streak >= 3U && rx_silence_ms > 10000U) {
+                        if (e220_stats.radio_online) {
+                            Serial.println("[E220 LORA] WARNING: Radio link OFFLINE (3 consecutive Mode 0 poll timeouts & >10s RX silence).");
+                        }
+                        e220_stats.radio_online = false;
+                        e220_stats.rssi_valid   = false;
+                        s_was_radio_online      = false;
+                    }
                 }
             }
         }
@@ -1174,8 +1195,8 @@ extern "C" void e220_poll_and_forward_rtcm(void)
     // 5. Synchronized Mode 0 Ambient Noise & Last Packet RSSI query:
     //    - Suppressed while an air-rate switch request/ACK handshake, pending Mode 3 switch/rollback,
     //      or single-subpacket RF TX is actively in flight on the LLCC68.
-    //    - In Second 0: poll strictly after uplink RF transmission finishes (760..955ms).
-    //    - In Seconds 1..4: poll inside the GPS-disciplined end-of-second quiet micro-slot (880..950ms)
+    //    - In Second 0: poll strictly after uplink RF transmission finishes (810..935ms).
+    //    - In Seconds 1..4: poll inside the GPS-disciplined end-of-second quiet micro-slot (885..935ms)
     //      while Base enforces an 850ms downlink TX cutoff, giving 1.0 Hz updates with zero collisions.
     uint32_t sf_utc_sec = 0;
     uint32_t sf_sec     = 0;
@@ -1204,14 +1225,17 @@ extern "C" void e220_poll_and_forward_rtcm(void)
         bool post_uplink_gap = has_sf && (sf_sec == 0U) &&
                                (s_last_uplink_utc_sec == sf_utc_sec) &&
                                (s_last_rssi_poll_utc_sec != sf_utc_sec) &&
-                               (sf_ms >= 760U) && (sf_ms <= 955U);
+                               (sf_ms >= 810U) && (sf_ms <= 935U);
 
+        bool msm_done_this_sec = (s_last_valid_msm_utc_sec == sf_utc_sec);
         bool end_of_sec_gap  = has_sf && (sf_sec != 0U) &&
                                (s_last_rssi_poll_utc_sec != sf_utc_sec) &&
-                               (sf_ms >= 880U) && (sf_ms <= 950U) &&
+                               (sf_ms >= 885U) && (sf_ms <= 935U) &&
                                (e220_stats.last_rx_ms == 0 || (now - e220_stats.last_rx_ms >= 25U)) &&
-                               (s_active_air_rate > 5.0f ||
-                                (s_last_valid_rtcm_ms > 0 && (now - s_last_valid_rtcm_ms <= 750U)));
+                               (msm_done_this_sec ||
+                                (s_active_air_rate > 5.0f &&
+                                 e220_stats.last_rx_ms > 0 &&
+                                 (now - e220_stats.last_rx_ms >= 200U)));
 
         bool unsynced_gap    = !has_sf &&
                                (s_active_air_rate > 5.0f) &&
@@ -1221,7 +1245,7 @@ extern "C" void e220_poll_and_forward_rtcm(void)
                                (now - last_rssi_poll_ms >= 1800U);
 
         bool idle_link_probe = (e220_stats.last_rx_ms == 0 || (now - e220_stats.last_rx_ms > 3000U)) &&
-                               (!has_sf || sf_sec != 0U || sf_ms < 650U) &&
+                               (!has_sf || ((sf_sec != 0U || sf_ms < 650U) && sf_ms <= 900U)) &&
                                (now - last_rssi_poll_ms >= 2000U);
 
         if (post_uplink_gap || end_of_sec_gap || unsynced_gap || idle_link_probe) {
