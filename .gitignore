@@ -14,6 +14,7 @@ test/
 docs/test_results/
 plots/
 temp_cal/
+.agents/
 GEMINI.md
 gemini.md
 session_handoff.md
