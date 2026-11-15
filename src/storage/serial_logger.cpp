@@ -95,8 +95,7 @@ static size_t format_record_timestamp(char *buf, size_t max_len) {
 
     // If real-world epoch is valid (year >= 2025, epoch >= 1735689600)
     if (tv.tv_sec >= 1735689600) {
-        time_t local_sec = tv.tv_sec + (time_t)(current_settings.minutesOffsetToUTC * 60);
-        int sec_in_day = (int)(local_sec % 86400);
+        int sec_in_day = (int)(tv.tv_sec % 86400);
         if (sec_in_day < 0) sec_in_day += 86400;
         int hh   = sec_in_day / 3600;
         int mm   = (sec_in_day % 3600) / 60;

@@ -20,8 +20,8 @@ fs::FS& get_active_fs(void) {
 }
 
 struct SystemSettings current_settings = {
-    -240,             // minutesOffsetToUTC (EDT default)
-    "EDT",            // timezone_label
+    -300,             // minutesOffsetToUTC (EST default)
+    "EST",            // timezone_label
     false,            // use_imperial_units (false = SI m/cm, true = Imperial ft/in)
     1.800f,           // antenna_height_m (pole height from ground tip to antenna plane)
     0.555f,           // antenna_spacing_m (Master to Slave separation, pole at center)

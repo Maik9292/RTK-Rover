@@ -5,6 +5,19 @@ All notable changes to the **RTK Rover** project will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.8.8] - 2026-11-15
+
+### Fixed
+- **Collision-Free 1.0 Hz GPS-Disciplined RSSI Micro-Slot (`src/e220_driver/e220_driver.cpp`, `scripts/e220_pacer.py v3.6.2`):**
+  - Replaced heuristic mid-epoch `inter_epoch_gap` (`420..780 ms`) polling — which collided with queued `1006`/`1230`/back-to-back RTCM bursts at `9.6k`/`19.2k` in `test/_039` — with a deterministic **1.0 Hz GPS-disciplined end-of-second quiet slot (`880..950 ms` in Seconds 1..4)** paired with a Base downlink cutoff (`_get_sec1_to_4_downlink_cutoff_ms() = 850.0 ms` @ `> 5.0 kbps`, plus `760..955 ms` post-uplink in Second 0, `E220_RSSI_POLL_INTERVAL_MS = 750 ms`), keeping full **1.0 Hz real-time Signal Quality Meter (RSSI + Ambient Noise Floor)** responsiveness with zero RTCM collisions.
+  - Gated late `0xC1 0x00` RSSI interception in `e220_process_rx_stage()` strictly to within `250 ms` of an issued `C0 C1 C2 C3` query (`allow_late_rssi`) and bounded `noise_raw` (`0x80..0xE4`, `-128..-28 dBm`) / `pkt_raw` (`0x80..0xF6`, `-128..-10 dBm`) across direct and late parsers so RTCM payloads cannot spoof RSSI readings.
+- **4.8 kbps ToA Calibration, Guard Delay & `1074` Starvation Elimination (`scripts/e220_pacer.py v3.6.2`):**
+  - Calibrated `estimate_subpacket_air_s()` at `<= 5.0 kbps` (`eff = 0.60`, preamble `0.022 s`, giving `622.0 ms` for `200 B` and `180.3 ms` for `41 B`) and enforced a `>= 50 ms` inter-frame guard delay (`_get_effective_guard_delay_s()`) so Subpacket 2 tails on `1074` are never clipped by subsequent frames at `4.8 kbps`.
+  - Removed `[SEC0 SKIP 4.8K]` dropping so oversized `1074` frames hitting Second 0 hold cleanly until Second 1 `000 ms`, and gated `1005/1006/1033/1230` to odd epochs at `<= 4.8 kbps` (`epoch_counter > 1`) so they pair with short single-subpacket secondary MSMs (`1084`/`1094`) without starving `1074`.
+- **Continuous Sub-5ms GPS UTC Clock Discipline & Pure UTC Internal Log Timestamps (`src/um982_driver/um982_driver.cpp`, `src/rtc_bsp/rtc_bsp.cpp`, `src/storage/serial_logger.cpp`, `src/settings_manager/settings_manager.cpp`, `scripts/e220_pacer.py v3.6.2`):**
+  - Fixed the `1 hour + 5.3 s` serial log timestamp skew found in `test/_039`: updated `handle_rmc_sentence()` to continuously discipline the ESP32 POSIX clock (`settimeofday()`) to GPS UTC within `< 5 ms` (using `utc_ymdhms_to_epoch()` and `gps_time_sync.last_sync_millis` microsecond alignment), compensated `um982_poll_pending_rtc_sync()` for boot/task latency (`elapsed_s` since latch) with 15-minute `PCF85063` re-discipline, and prevented 1-second `i2c_rtc_setTime()` calls from overwriting sub-5ms GPS time once GNSS sync is active.
+  - Removed timezone offset shifting from `format_record_timestamp()` in `serial_logger.cpp` and switched `e220_pacer.py` `[PACER HEARTBEAT]` timestamps to `time.gmtime()` so all internal logs use pure UTC `[HH:MM:SS.mmm]`, reserving `minutesOffsetToUTC` (default updated to `-300` / `"EST"`) strictly for UI display and ISO8601 filenames.
+
 ## [v0.8.7] - 2026-11-15
 
 ### Changed

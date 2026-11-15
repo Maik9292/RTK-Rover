@@ -7,6 +7,7 @@
 #include "rtc_bsp.h"
 #include "../i2c_bsp/i2c_bsp.h"
 #include "../settings_manager/settings_manager.h"
+#include "../um982_driver/um982_driver.h"
 #include "esp_log.h"
 #include "driver/i2c_master.h"
 
@@ -73,7 +74,9 @@ extern "C" void i2c_rtc_setTime(uint16_t year, uint8_t month, uint8_t day, uint8
     cached_rtc_time.minute = minute;
     cached_rtc_time.second = second;
     last_rtc_read_ms       = millis();
-    sync_system_clock(year, month, day, hour, minute, second);
+    if (!gps_time_sync.time_synced) {
+        sync_system_clock(year, month, day, hour, minute, second);
+    }
 }
 
 extern "C" RtcDateTime_t i2c_rtc_get(void)

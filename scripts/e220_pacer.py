@@ -69,7 +69,7 @@ except ImportError:
 
 __filename__ = "e220_pacer.py"
 __app_name__ = "e220_pacer"
-__version__ = "3.6.1"
+__version__ = "3.6.2"
 __date__ = "2026-11-15"
 
 # Force unbuffered output so systemd journalctl displays entries in real time
@@ -315,16 +315,22 @@ class E220Pacer:
     def estimate_subpacket_air_s(self, n_bytes: int) -> float:
         """
         Estimate single-subpacket LoRa Time-on-Air (seconds) for E220-900T30S (LLCC68).
-        Calibrated directly against Test _022 hardware AUX_low telemetry (t_uart + AUX_low = 165.0 ms
-        -> 148.1 ms true Time-on-Air for 200B @ 19.2 kbps; ~0.68 net payload coding efficiency after
-        LoRa preamble, explicit header, CRC16, FEC coding rate, and 3-char UART idle detect):
-          - @ 38.4 kbps: 200B -> 82.2 ms, 144B -> 65.0 ms, 122B -> 58.3 ms, 27B -> 29.2 ms
-          - @ 19.2 kbps: 200B -> 148.4 ms, 144B -> 114.0 ms, 122B -> 100.6 ms, 27B -> 42.3 ms
+        Calibrated directly against Test _022 and _039 hardware AUX_low / tail telemetry:
+          - @ >= 9.6 kbps: eff ~ 0.68, preamble 0.016s (200B @ 19.2k -> 148.4ms)
+          - @ <= 4.8 kbps: eff ~ 0.60, preamble 0.022s (200B @ 4.8k -> 622.0ms, 41B -> 180.3ms)
         """
         if n_bytes <= 0:
             return 0.0
         rate_bps = max(self.air_rate_kbps, 2.4) * 1000.0
+        if self.air_rate_kbps <= 5.0:
+            return 0.022 + ((float(n_bytes) + 16.0) * 8.0) / (rate_bps * 0.60)
         return 0.016 + ((float(n_bytes) + 16.0) * 8.0) / (rate_bps * 0.68)
+
+    def _get_effective_guard_delay_s(self) -> float:
+        """Enforces >= 50ms inter-frame guard delay at <= 4.8 kbps for Rover UART drain and PLL turn-around."""
+        if self.air_rate_kbps <= 5.0:
+            return max(self.guard_delay_s, 0.050)
+        return self.guard_delay_s
 
     @staticmethod
     def _safe_flush(ser_obj: "serial.Serial") -> bool:
@@ -653,11 +659,12 @@ class E220Pacer:
             if rem_air_s > 0.0:
                 time.sleep(rem_air_s)
 
-            time.sleep(self.guard_delay_s)
+            eff_guard_s = self._get_effective_guard_delay_s()
+            time.sleep(eff_guard_s)
             detail = (
                 f"1 pkt | EstAir={est_air_s*1000:.1f}ms"
                 + (f"(AUX_low={aux_low_s*1000:.1f}ms)" if aux_dropped else "")
-                + f" + Guard={self.guard_delay_s*1000:.0f}ms"
+                + f" + Guard={eff_guard_s*1000:.0f}ms"
             )
         else:
             # -----------------------------------------------------------------
@@ -707,7 +714,8 @@ class E220Pacer:
                 rem_air_s = tail_air_s
                 time.sleep(head_est_s + tail_air_s)
 
-            time.sleep(self.guard_delay_s)
+            eff_guard_s = self._get_effective_guard_delay_s()
+            time.sleep(eff_guard_s)
             if aux_dropped:
                 tail_note = (
                     f"TailWait={rem_air_s*1000:.1f}ms(Tail={tail_air_s*1000:.1f}ms)"
@@ -717,12 +725,12 @@ class E220Pacer:
                 detail = (
                     f"2 pkts ({self.packet_size}+{tail_len}B) | "
                     f"AUX_low={aux_low_s*1000:.1f}ms(drop={drop_ms:.1f}ms) + "
-                    f"{tail_note} + Guard={self.guard_delay_s*1000:.0f}ms"
+                    f"{tail_note} + Guard={eff_guard_s*1000:.0f}ms"
                 )
             else:
                 detail = (
                     f"2 pkts ({self.packet_size}+{tail_len}B) | "
-                    f"NO-AUX-DROP EstAir={(head_est_s+tail_air_s)*1000:.1f}ms + Guard={self.guard_delay_s*1000:.0f}ms"
+                    f"NO-AUX-DROP EstAir={(head_est_s+tail_air_s)*1000:.1f}ms + Guard={eff_guard_s*1000:.0f}ms"
                 )
 
         total_dt = time.monotonic() - t0
@@ -803,6 +811,8 @@ class E220Pacer:
         - Air rate <= 4.8 kbps: Rotate 1 constellation per second (GPS -> GAL -> GPS -> GLO).
         """
         if msg_type in (1005, 1006, 1033, 1230):
+            if self.enable_interleave and self.air_rate_kbps <= 4.8 and self.epoch_counter > 1:
+                return (self.epoch_counter % 2) == 1
             return True
 
         now = time.monotonic()
@@ -878,6 +888,10 @@ class E220Pacer:
         """Returns the Second 0 Base Downlink TX cutoff in milliseconds for the active air-rate."""
         return 700.0 if self.air_rate_kbps <= 9.6 else 740.0
 
+    def _get_sec1_to_4_downlink_cutoff_ms(self) -> float:
+        """Returns the Seconds 1..4 downlink cutoff in ms, reserving 850..1000ms for 1.0 Hz Rover RSSI."""
+        return 850.0 if self.air_rate_kbps > 5.0 else 960.0
+
     def _estimate_frame_toa_ms(self, frame_len: int) -> float:
         """Estimates total UART + RF Time-on-Air + guard delay in ms for a complete RTCM3 frame."""
         if frame_len <= 0:
@@ -890,7 +904,7 @@ class E220Pacer:
             air_s += self.estimate_subpacket_air_s(chunk)
             rem -= chunk
         uart_s = (float(frame_len) * 10.0) / max(float(self.baud), 9600.0)
-        return (air_s + uart_s + self.guard_delay_s) * 1000.0
+        return (air_s + uart_s + self._get_effective_guard_delay_s()) * 1000.0
 
     def _transmit_pending_switch_ack_if_due(self, utc_sec: int, ms_in_sec: float) -> None:
         if self.pending_switch_ack_frame is None or self.ser is None or not self.ser.is_open:
@@ -1361,6 +1375,8 @@ class E220Pacer:
                 self._shed_stale_backlog(buffer)
 
             sec0_cutoff_reached = False
+            sec_end_rssi_window_reached = False
+            sec_end_target_utc_sec = 0
             while not switch_hold and len(buffer) >= 3:
                 if self._service_superframe_events(buffer):
                     switch_hold = True
@@ -1444,28 +1460,25 @@ class E220Pacer:
                         continue
                     self.head_frame_approved = True
 
-                # 4d. Second 0 Downlink Cutoff Guard: do not start any approved frame whose Time-on-Air bleeds past 700ms/740ms
-                _, sf_sec, ms_in_sec = self._get_superframe_timing()
+                # 4d. Second 0 & End-of-Second Downlink Cutoff Guards:
+                #     - Second 0: hold before 700ms/740ms so Second 0 uplink slot stays clear.
+                #     - Seconds 1..4 (> 5.0 kbps): hold after 400ms if frame would bleed past 850ms,
+                #       preserving 850..1000ms as a collision-free 1.0 Hz Mode 0 RSSI micro-slot.
+                utc_sec, sf_sec, ms_in_sec = self._get_superframe_timing()
                 est_toa_ms = self._estimate_frame_toa_ms(total_frame_len)
                 cutoff_ms = self._get_sec0_downlink_cutoff_ms()
+                sec1_4_cutoff_ms = self._get_sec1_to_4_downlink_cutoff_ms()
                 if sf_sec == 0 and (ms_in_sec + est_toa_ms) > cutoff_ms:
-                    if (
-                        self.air_rate_kbps <= 5.0
-                        and (1071 <= msg_type <= 1130)
-                        and est_toa_ms > cutoff_ms
-                    ):
-                        # At 4.8 kbps, 2-subpacket MSM frames (e.g. 1074 ~760-790ms) can never fit inside
-                        # Second 0's 700ms window; drop cleanly instead of stalling Second 0 and building backlog.
-                        del buffer[:total_frame_len]
-                        self.head_frame_approved = False
-                        self.interleave_dropped_frames += 1
-                        if self.verbose:
-                            print(
-                                f"[SEC0 SKIP 4.8K] Dropped Type:{msg_type} ({total_frame_len}B, ToA:{est_toa_ms:.0f}ms > {cutoff_ms:.0f}ms)",
-                                flush=True,
-                            )
-                        continue
                     sec0_cutoff_reached = True
+                    break
+                if (
+                    sf_sec != 0
+                    and self.air_rate_kbps > 5.0
+                    and (ms_in_sec + est_toa_ms) > sec1_4_cutoff_ms
+                    and ms_in_sec >= 400.0
+                ):
+                    sec_end_rssi_window_reached = True
+                    sec_end_target_utc_sec = utc_sec
                     break
 
                 del buffer[:total_frame_len]
@@ -1505,6 +1518,15 @@ class E220Pacer:
                     self.poll_uplink()
                     self._check_watchdog_revert()
                     time.sleep(0.005)
+            elif sec_end_rssi_window_reached:
+                # Hold TX cleanly through 850..1000ms so Rover can poll Mode 0 RSSI collision-free
+                while running:
+                    cur_sec, _, _ = self._get_superframe_timing()
+                    if cur_sec != sec_end_target_utc_sec:
+                        break
+                    self.poll_uplink()
+                    self._check_watchdog_revert()
+                    time.sleep(0.005)
 
             now = time.monotonic()
             if (now - last_report) >= 5.0:
@@ -1512,7 +1534,7 @@ class E220Pacer:
                 rate_in = self.total_bytes_in / dt
                 rate_out = self.total_bytes_out / dt
                 duty_pct = min(100.0, (self.total_wait_time_s / dt) * 100.0)
-                t_str = time.strftime("%H:%M:%S")
+                t_str = time.strftime("%H:%M:%S", time.gmtime())
                 frames_summary = ", ".join(f"{t}:{c}" for t, c in sorted(self.rtcm_stats.items())) or "None"
                 uplink_str = f"Uplink:[{self.uplink_packets_received} pkts, {self.rate_switch_count} sw]"
                 interleave_str = f"Interleave:[{self.interleave_dropped_frames} skp]" if self.enable_interleave else "Interleave:[OFF]"

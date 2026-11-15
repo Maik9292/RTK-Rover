@@ -147,11 +147,12 @@ extern "C" bool e220_is_uplink_slot_active(uint32_t now_ms)
 
 // =========================================================================
 // Non-Blocking Mode 0 Live RSSI / Ambient Noise Register Poll State
-// Queries C0 C1 C2 C3 00 02 once per Second 0 post-uplink quiet window (or
-// every 2s when idle). Parses both 4-byte (C1 00 <noise> <pkt>) and 5-byte
-// (C1 00 02 <noise> <pkt>) E220-900T30S replies (requires REG1 Bit 5 = 0x20).
+// Queries C0 C1 C2 C3 00 02 once per Second 0 post-uplink quiet window and
+// in the GPS-disciplined end-of-second micro-slot (880..950ms in Seconds 1..4).
+// Parses both 4-byte (C1 00 <noise> <pkt>) and 5-byte (C1 00 02 <noise> <pkt>)
+// E220-900T30S replies (requires REG1 Bit 5 = 0x20).
 // =========================================================================
-#define E220_RSSI_POLL_INTERVAL_MS  900U
+#define E220_RSSI_POLL_INTERVAL_MS  750U
 #define E220_RSSI_IDLE_POLL_MS      2000U
 #define E220_RSSI_REPLY_TIMEOUT_MS  180U
 
@@ -691,15 +692,16 @@ static void e220_process_rx_stage(void)
             continue;
         }
 
-        // 0b. Intercept Late Mode 0 RSSI Replies:
-        //     4-byte E220-900T30S reply: 0xC1 0x00 <noise>=0x80..0xFA> <pkt>=0x80..0xFA>
-        //     5-byte datasheet reply:    0xC1 0x00 0x02 <noise>=0x80..0xFA> <pkt>=0x80..0xFA>
-        if (rx_stage_len >= 2 && rx_stage[0] == 0xC1 && rx_stage[1] == 0x00) {
+        // 0b. Intercept Late Mode 0 RSSI Replies (strictly within 250ms of an issued query):
+        //     4-byte E220-900T30S reply: 0xC1 0x00 <noise>=0x80..0xE4> <pkt>=0x80..0xF6>
+        //     5-byte datasheet reply:    0xC1 0x00 0x02 <noise>=0x80..0xE4> <pkt>=0x80..0xF6>
+        bool allow_late_rssi = (last_rssi_poll_ms > 0) && ((millis() - last_rssi_poll_ms) <= 250U);
+        if (allow_late_rssi && rx_stage_len >= 2 && rx_stage[0] == 0xC1 && rx_stage[1] == 0x00) {
             if (rx_stage_len < 3) {
                 break; // Wait for byte 2 (0x02 or >= 0x80)
             }
             bool is_5b_hdr = (rx_stage[2] == 0x02U);
-            bool is_4b_hdr = (rx_stage[2] >= 0x80U && rx_stage[2] <= 0xFAU);
+            bool is_4b_hdr = (rx_stage[2] >= 0x80U && rx_stage[2] <= 0xE4U);
             if (!is_5b_hdr && !is_4b_hdr) {
                 e220_stats.rtcm_orphan_bytes++;
                 e220_shift_stage_one_byte();
@@ -711,7 +713,7 @@ static void e220_process_rx_stage(void)
             }
             uint8_t noise_raw = is_5b_hdr ? rx_stage[3] : rx_stage[2];
             uint8_t pkt_raw   = is_5b_hdr ? rx_stage[4] : rx_stage[3];
-            if (noise_raw < 0x80U || noise_raw > 0xFAU || pkt_raw < 0x80U || pkt_raw > 0xFAU) {
+            if (noise_raw < 0x80U || noise_raw > 0xE4U || pkt_raw < 0x80U || pkt_raw > 0xF6U) {
                 e220_stats.rtcm_orphan_bytes++;
                 e220_shift_stage_one_byte();
                 continue;
@@ -738,11 +740,12 @@ static void e220_process_rx_stage(void)
                     rx_stage[sync_pos + 1] == ROVER_TELEM_SYNC1) {
                     break;
                 }
-                if (sync_pos + 2 < rx_stage_len &&
+                if (allow_late_rssi &&
+                    sync_pos + 2 < rx_stage_len &&
                     rx_stage[sync_pos] == 0xC1 &&
                     rx_stage[sync_pos + 1] == 0x00 &&
                     (rx_stage[sync_pos + 2] == 0x02U ||
-                     (rx_stage[sync_pos + 2] >= 0x80U && rx_stage[sync_pos + 2] <= 0xFAU))) {
+                     (rx_stage[sync_pos + 2] >= 0x80U && rx_stage[sync_pos + 2] <= 0xE4U))) {
                     break;
                 }
                 sync_pos++;
@@ -937,10 +940,10 @@ static void e220_ingest_rx_bytes(const uint8_t *data, size_t len, uint32_t now)
 
 static void e220_record_rssi_reply(uint8_t noise_raw, uint8_t pkt_raw, uint32_t now)
 {
-    if (noise_raw > 0x80U && noise_raw <= 0xFAU) {
+    if (noise_raw >= 0x80U && noise_raw <= 0xE4U) {
         e220_stats.ambient_noise_dbm = (int16_t)noise_raw - 256;
     }
-    if (e220_stats.rx_bytes_total > 0 && pkt_raw >= 0x81U && pkt_raw <= 0xFAU) {
+    if (e220_stats.rx_bytes_total > 0 && pkt_raw >= 0x80U && pkt_raw <= 0xF6U) {
         e220_stats.last_pkt_rssi_dbm = (int16_t)pkt_raw - 256;
         e220_stats.rssi_valid        = true;
     }
@@ -993,9 +996,11 @@ extern "C" void e220_poll_and_forward_rtcm(void)
                 (rssi_reply_len == 1 && rssi_reply_buf[0] != 0xC1) ||
                 (rssi_reply_len == 2 && rssi_reply_buf[1] != 0x00) ||
                 (rssi_reply_len == 3 && rssi_reply_buf[2] != 0x02U &&
-                 (rssi_reply_buf[2] < 0x80U || rssi_reply_buf[2] > 0xFAU)) ||
-                (rssi_reply_len >= 4 && (rssi_reply_buf[3] < 0x80U || rssi_reply_buf[3] > 0xFAU)) ||
-                (rssi_reply_len == 5 && (rssi_reply_buf[4] < 0x80U || rssi_reply_buf[4] > 0xFAU));
+                 (rssi_reply_buf[2] < 0x80U || rssi_reply_buf[2] > 0xE4U)) ||
+                (rssi_reply_len == 4 &&
+                 ((rssi_reply_buf[2] == 0x02U && (rssi_reply_buf[3] < 0x80U || rssi_reply_buf[3] > 0xE4U)) ||
+                  (rssi_reply_buf[2] != 0x02U && (rssi_reply_buf[3] < 0x80U || rssi_reply_buf[3] > 0xF6U)))) ||
+                (rssi_reply_len == 5 && (rssi_reply_buf[4] < 0x80U || rssi_reply_buf[4] > 0xF6U));
 
             if (prefix_mismatch) {
                 // An incoming LoRa packet arrived simultaneously -> cancel RSSI intercept and feed zero-loss to RTCM stage!
@@ -1114,9 +1119,9 @@ extern "C" void e220_poll_and_forward_rtcm(void)
     // 5. Synchronized Mode 0 Ambient Noise & Last Packet RSSI query:
     //    - Suppressed while an air-rate switch request/ACK handshake, pending Mode 3 switch/rollback,
     //      or single-subpacket RF TX is actively in flight on the LLCC68.
-    //    - In Second 0: poll strictly after uplink RF transmission finishes (760..950ms).
-    //    - In Seconds 1..4 (>= 9.6k only): poll inside guaranteed end-of-epoch idle gap after a terminal
-    //      MSM frame completes (1074 already received in same epoch; 15..45ms post-frame and sf_ms 420..780ms).
+    //    - In Second 0: poll strictly after uplink RF transmission finishes (760..955ms).
+    //    - In Seconds 1..4: poll inside the GPS-disciplined end-of-second quiet micro-slot (880..950ms)
+    //      while Base enforces an 850ms downlink TX cutoff, giving 1.0 Hz updates with zero collisions.
     uint32_t sf_utc_sec = 0;
     uint32_t sf_sec     = 0;
     uint32_t sf_ms      = 0;
@@ -1144,15 +1149,14 @@ extern "C" void e220_poll_and_forward_rtcm(void)
         bool post_uplink_gap = has_sf && (sf_sec == 0U) &&
                                (s_last_uplink_utc_sec == sf_utc_sec) &&
                                (s_last_rssi_poll_utc_sec != sf_utc_sec) &&
-                               (sf_ms >= 760U) && (sf_ms <= 950U);
+                               (sf_ms >= 760U) && (sf_ms <= 955U);
 
-        bool inter_epoch_gap = has_sf && (sf_sec != 0U) &&
-                               (s_active_air_rate > 5.0f) &&
-                               (last_terminal_msm_rx_ms > 0) &&
-                               (now - last_terminal_msm_rx_ms >= 15U) &&
-                               (now - last_terminal_msm_rx_ms <= 45U) &&
-                               (sf_ms >= 420U) && (sf_ms <= 780U) &&
-                               (now - last_rssi_poll_ms >= 1800U);
+        bool end_of_sec_gap  = has_sf && (sf_sec != 0U) &&
+                               (s_last_rssi_poll_utc_sec != sf_utc_sec) &&
+                               (sf_ms >= 880U) && (sf_ms <= 950U) &&
+                               (e220_stats.last_rx_ms == 0 || (now - e220_stats.last_rx_ms >= 25U)) &&
+                               (s_active_air_rate > 5.0f ||
+                                (s_last_valid_rtcm_ms > 0 && (now - s_last_valid_rtcm_ms <= 750U)));
 
         bool unsynced_gap    = !has_sf &&
                                (s_active_air_rate > 5.0f) &&
@@ -1165,7 +1169,7 @@ extern "C" void e220_poll_and_forward_rtcm(void)
                                (!has_sf || sf_sec != 0U || sf_ms < 650U) &&
                                (now - last_rssi_poll_ms >= 2000U);
 
-        if (post_uplink_gap || inter_epoch_gap || unsynced_gap || idle_link_probe) {
+        if (post_uplink_gap || end_of_sec_gap || unsynced_gap || idle_link_probe) {
             static const uint8_t kRssiCmd[6] = {0xC0, 0xC1, 0xC2, 0xC3, 0x00, 0x02};
             last_rssi_poll_ms       = now;
             if (has_sf) {

@@ -6,6 +6,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include <sys/time.h>
+#include <time.h>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -19,14 +21,12 @@ static bool              com1_line_overflow = false;
 static SemaphoreHandle_t s_com1_tx_mutex    = NULL;
 static volatile bool     s_com1_tx_boot_complete = false;
 
-static bool              rtc_synced_from_gnss = false;
-static volatile bool     rtc_sync_pending     = false;
-static uint16_t          pending_rtc_yy       = 2026;
-static uint8_t           pending_rtc_mo       = 1;
-static uint8_t           pending_rtc_dd       = 1;
-static uint8_t           pending_rtc_hh       = 0;
-static uint8_t           pending_rtc_mm       = 0;
-static uint8_t           pending_rtc_ss       = 0;
+static bool              rtc_synced_from_gnss    = false;
+static volatile bool     rtc_sync_pending        = false;
+static volatile time_t   s_pending_rtc_epoch     = 0;
+static volatile uint32_t s_pending_rtc_sync_ms   = 0;
+static uint32_t          s_last_rtc_chip_sync_ms = 0;
+static uint32_t          s_last_sysclock_sync_ms = 0;
 
 static volatile bool     version_ack_received    = false;
 static volatile bool     saveconfig_ack_received = false;
@@ -178,6 +178,17 @@ static void handle_ggah_sentence(char *line)
     }
 }
 
+static time_t utc_ymdhms_to_epoch(int year, int month, int day, int hour, int minute, int second)
+{
+    int y = year - (month <= 2 ? 1 : 0);
+    int era = (y >= 0 ? y : y - 399) / 400;
+    int yoe = y - era * 400;
+    int doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+    int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    int64_t days = (int64_t)era * 146097LL + (int64_t)doe - 719468LL;
+    return (time_t)(days * 86400LL + (int64_t)hour * 3600LL + (int64_t)minute * 60LL + (int64_t)second);
+}
+
 static void handle_rmc_sentence(char *line)
 {
     char *f[14] = {0};
@@ -218,24 +229,52 @@ static void handle_rmc_sentence(char *line)
         }
     }
 
-    if (!rtc_synced_from_gnss && pos_active && strlen(f[1]) >= 6 && strlen(f[9]) == 6) {
-        int hh = (f[1][0] - '0') * 10 + (f[1][1] - '0');
-        int mm = (f[1][2] - '0') * 10 + (f[1][3] - '0');
-        int ss = (f[1][4] - '0') * 10 + (f[1][5] - '0');
+    if (pos_active && strlen(f[1]) >= 6 && strlen(f[9]) == 6) {
+        bool digits_ok = true;
+        for (int i = 0; i < 6; i++) {
+            if (f[1][i] < '0' || f[1][i] > '9' || f[9][i] < '0' || f[9][i] > '9') {
+                digits_ok = false;
+                break;
+            }
+        }
+        if (digits_ok) {
+            int hh = (f[1][0] - '0') * 10 + (f[1][1] - '0');
+            int mm = (f[1][2] - '0') * 10 + (f[1][3] - '0');
+            int ss = (f[1][4] - '0') * 10 + (f[1][5] - '0');
 
-        int dd = (f[9][0] - '0') * 10 + (f[9][1] - '0');
-        int mo = (f[9][2] - '0') * 10 + (f[9][3] - '0');
-        int yy = 2000 + (f[9][4] - '0') * 10 + (f[9][5] - '0');
+            int dd = (f[9][0] - '0') * 10 + (f[9][1] - '0');
+            int mo = (f[9][2] - '0') * 10 + (f[9][3] - '0');
+            int yy = 2000 + (f[9][4] - '0') * 10 + (f[9][5] - '0');
 
-        if (yy >= 2025 && mo >= 1 && mo <= 12 && dd >= 1 && dd <= 31) {
-            pending_rtc_yy       = (uint16_t)yy;
-            pending_rtc_mo       = (uint8_t)mo;
-            pending_rtc_dd       = (uint8_t)dd;
-            pending_rtc_hh       = (uint8_t)hh;
-            pending_rtc_mm       = (uint8_t)mm;
-            pending_rtc_ss       = (uint8_t)ss;
-            rtc_synced_from_gnss = true;
-            rtc_sync_pending     = true;
+            if (yy >= 2025 && mo >= 1 && mo <= 12 && dd >= 1 && dd <= 31 &&
+                hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59 && ss >= 0 && ss <= 59) {
+                time_t rmc_epoch = utc_ymdhms_to_epoch(yy, mo, dd, hh, mm, ss);
+                uint32_t cur_ms = millis();
+                uint32_t sync_ms = gps_time_sync.last_sync_millis;
+                uint32_t elapsed_ms = cur_ms - sync_ms;
+                time_t target_sec = rmc_epoch + (time_t)(elapsed_ms / 1000U);
+                suseconds_t target_usec = (suseconds_t)((elapsed_ms % 1000U) * 1000U);
+
+                struct timeval cur_tv;
+                gettimeofday(&cur_tv, NULL);
+                int64_t diff_us = ((int64_t)target_sec - (int64_t)cur_tv.tv_sec) * 1000000LL +
+                                  ((int64_t)target_usec - (int64_t)cur_tv.tv_usec);
+
+                if (llabs(diff_us) >= 5000LL || s_last_sysclock_sync_ms == 0U || (cur_ms - s_last_sysclock_sync_ms >= 60000U)) {
+                    struct timeval tv = { .tv_sec = target_sec, .tv_usec = target_usec };
+                    settimeofday(&tv, NULL);
+                    s_last_sysclock_sync_ms = (cur_ms == 0U) ? 1U : cur_ms;
+                }
+
+                if (!rtc_synced_from_gnss || llabs(diff_us) >= 2000000LL || (cur_ms - s_last_rtc_chip_sync_ms >= 900000U)) {
+                    s_pending_rtc_epoch   = rmc_epoch;
+                    s_pending_rtc_sync_ms = sync_ms;
+                    __sync_synchronize();
+                    rtc_synced_from_gnss    = true;
+                    s_last_rtc_chip_sync_ms = (cur_ms == 0U) ? 1U : cur_ms;
+                    rtc_sync_pending        = true;
+                }
+            }
         }
     }
 }
@@ -1071,12 +1110,20 @@ extern "C" void um982_get_port_stats(Um982PortStats_t *stats_out)
 extern "C" bool um982_poll_pending_rtc_sync(uint16_t *yy, uint8_t *mo, uint8_t *dd, uint8_t *hh, uint8_t *mm, uint8_t *ss)
 {
 	if (!rtc_sync_pending) return false;
-	rtc_sync_pending = false;
-	if (yy) *yy = pending_rtc_yy;
-	if (mo) *mo = pending_rtc_mo;
-	if (dd) *dd = pending_rtc_dd;
-	if (hh) *hh = pending_rtc_hh;
-	if (mm) *mm = pending_rtc_mm;
-	if (ss) *ss = pending_rtc_ss;
+	time_t latched_epoch = s_pending_rtc_epoch;
+	uint32_t latched_ms  = s_pending_rtc_sync_ms;
+	rtc_sync_pending     = false;
+
+	uint32_t elapsed_s = (millis() - latched_ms + 500U) / 1000U;
+	time_t live_epoch  = latched_epoch + (time_t)elapsed_s;
+	struct tm tm_utc;
+	if (!gmtime_r(&live_epoch, &tm_utc)) return false;
+
+	if (yy) *yy = (uint16_t)(tm_utc.tm_year + 1900);
+	if (mo) *mo = (uint8_t)(tm_utc.tm_mon + 1);
+	if (dd) *dd = (uint8_t)tm_utc.tm_mday;
+	if (hh) *hh = (uint8_t)tm_utc.tm_hour;
+	if (mm) *mm = (uint8_t)tm_utc.tm_min;
+	if (ss) *ss = (uint8_t)tm_utc.tm_sec;
 	return true;
 }
