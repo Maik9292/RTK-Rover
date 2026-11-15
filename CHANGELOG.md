@@ -5,6 +5,24 @@ All notable changes to the **RTK Rover** project will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.8.7] - 2026-11-15
+
+### Changed
+- **Empirical E220 Hardware Documentation (`docs/e220-reference.md v2.5`):**
+  - Documented four empirical `E220-900T30S` silicon behaviors verified during `test/_038`: (1) Mode 0 `C0 C1 C2 C3` queuing during active `<= 200 B` single-subpacket RF TX (`AUX` pulled `LOW` `100-130 ms` until TX completes, `~166 ms` reply latency); (2) early `AUX` release on `201..400 B` 2-subpacket frames at `4.8 / 9.6 kbps` (`AUX_low` capped at `398.5 ms` @ `4.8k` vs `505-545 ms` Subpacket 1 RF ToA); (3) Mode 3 `got 4 bytes` / baud-switch glitch recovery; and (4) dynamic pre-switch fallback tracking across 3 air rates (`19.2k / 9.6k / 4.8k`).
+
+### Fixed
+- **Two-Subpacket (`201..400 B`) Early `AUX` Release & `4.8 kbps` Pacing (`scripts/e220_pacer.py v3.6.1`):**
+  - Enforced a full 2-subpacket Time-on-Air floor after `AUX` rises `HIGH` in `send_packet()` Regime B (`rem_air_s = max(tail_air_s, (head_est_s + tail_air_s) - elapsed_since_flush) + guard_delay_s`), eliminating `[RTCM DROP TRUNC]` tail drops on `1074` (`200 B`) and subsequent `1094` head losses when `AUX` releases `100-147 ms` early at `4.8 kbps` and `9.6 kbps`.
+  - Updated `process_stream()` Second 0 downlink cutoff guard at `4.8 kbps` to skip oversized MSM frames (`est_toa_ms > cutoff_ms`, e.g., `1074 ~787 ms > 700 ms`) instead of stalling Second 0 and accumulating stale MSM backlogs, while preserving compact `1006`/`1230`/`1084` Second 0 frames and full `1074`/`1084`/`1094` delivery in Seconds 1..4.
+- **Mode 3 Register Write Hardening & State Synchronization (`src/e220_driver/e220_driver.cpp`, `scripts/e220_pacer.py v3.6.1`):**
+  - Upgraded `e220_write_default_config_registers()` to cancel pending Mode 0 RSSI queries, wait for in-flight single-subpacket RF TX completion (`s_tx_air_busy_until_ms`), switch UART baud to `9600` before entering Mode 3, scan for an aligned `0xC1/0xC0 0x00 0x06` reply across up to 3 attempts with `(0,0)->(1,1)` reset between retries, and read back `REG0` via `e220_read_config_registers()` if all attempts fail so `s_active_air_rate` never diverges from hardware EEPROM.
+  - Updated `inspect_and_configure_eeprom()` and `reconfigure_air_rate()` in `e220_pacer.py` to return actual readback verification status and restore `self.air_rate_kbps` on EEPROM write failure.
+- **Dynamic Pre-Switch 60-Second Rollback Watchdog (`src/e220_driver/e220_driver.cpp`, `scripts/e220_pacer.py v3.6.1`):**
+  - Replaced hardcoded `19.2k` watchdog fallback on both Rover (`s_fallback_air_rate`) and Base (`self.fallback_air_rate`) with dynamic tracking of the previous verified working air rate so failed transitions (e.g., `4.8k -> 19.2k`) roll both nodes back to their prior rate (`4.8k`).
+- **Mode 0 RSSI Polling Air-Time & Switch/Rollback Conflict Guards (`src/e220_driver/e220_driver.cpp`):**
+  - Added `e220_estimate_tx_air_ms()` and `s_tx_air_busy_until_ms` so Mode 0 RSSI queries wait until single-subpacket `<= 200 B` uplink RF transmissions finish airing (`E220_RSSI_REPLY_TIMEOUT_MS = 180 ms`, Second 0 window `760..950 ms`), restricted `inter_epoch_gap` to `> 5.0 kbps` links with `1074` already received within `<= 850 ms` of `1084`/`1094`, suppressed RSSI polls whenever Mode 3 switch or rollback execution is due, and cleared `isr_aux_fall_us = 0` when unmasking `e220_suppress_aux_isr`.
+
 ## [v0.8.6] - 2026-11-14
 
 ### Added

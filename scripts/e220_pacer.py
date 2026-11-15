@@ -69,8 +69,8 @@ except ImportError:
 
 __filename__ = "e220_pacer.py"
 __app_name__ = "e220_pacer"
-__version__ = "3.6.0"
-__date__ = "2026-11-14"
+__version__ = "3.6.1"
+__date__ = "2026-11-15"
 
 # Force unbuffered output so systemd journalctl displays entries in real time
 if hasattr(sys.stdout, "reconfigure"):
@@ -233,7 +233,7 @@ class E220Pacer:
         self.rate_switch_count = 0
         self.watchdog_rate_switch_time = 0.0
         self.watchdog_rate_revert_time = 0.0
-        self.fallback_air_rate = 19.2
+        self.fallback_air_rate = air_rate_kbps
         self.active_air_rate = air_rate_kbps
 
         # Log Retention & Storage
@@ -429,6 +429,7 @@ class E220Pacer:
             else:
                 print("[WARN] Could not read Base E220 registers in Mode 3 (check UART/power/M0/M1).", flush=True)
 
+            eeprom_ok = True
             needs_update = (current_regs != target_regs)
             if needs_update and self.auto_config:
                 write_ok = False
@@ -455,6 +456,7 @@ class E220Pacer:
                     self.rssi_reg_enabled = bool(verify[6] & 0x20)
                     print(f"[AUTO-CONFIG] VERIFIED! EEPROM matches target: {verify[3:].hex().upper()}", flush=True)
                 else:
+                    eeprom_ok = False
                     actual = verify[3:].hex().upper() if len(verify) == 11 else f"LEN_{len(verify)}"
                     print(
                         f"[ERROR] EEPROM readback mismatch (write_ack={write_ok}): "
@@ -474,7 +476,7 @@ class E220Pacer:
         time.sleep(0.06)
         self.wait_aux(2.0)
         time.sleep(0.04)
-        return True
+        return eeprom_ok
 
     def probe_ambient_noise(self) -> None:
         """Query Channel ambient RF noise floor in Mode 0 via C0 C1 C2 C3 00 01 (requires REG1 Bit 5 = 0x20)."""
@@ -688,23 +690,34 @@ class E220Pacer:
                     if not self.wait_aux(timeout=AUX_RISE_WATCHDOG_S):
                         self.hardware_reset_e220(f"AUX stuck LOW >{AUX_RISE_WATCHDOG_S}s on 2-pkt {total_len}B")
                     aux_low_s = time.monotonic() - t_low
-                    # Subpacket 2 (tail_len) just started RF transmission when AUX rose HIGH:
-                    time.sleep(tail_air_s)
+                    # At <=9.6 kbps, the E220 MCU empties its UART RAM buffer and raises AUX HIGH
+                    # ~100-145ms BEFORE Subpacket 1 (200B) finishes transmitting on RF!
+                    # Enforce both the Subpacket 2 tail wait and full 2-subpacket ToA floor.
+                    elapsed_since_flush = time.monotonic() - t_after_flush
+                    total_air_est_s = head_est_s + tail_air_s
+                    rem_air_s = max(tail_air_s, total_air_est_s - elapsed_since_flush)
+                    time.sleep(rem_air_s)
                 else:
                     # Fallback if AUX edge was missed: sleep full calculated 2-subpacket air time
                     elapsed_since_flush = time.monotonic() - t_after_flush
-                    rem_s = (head_est_s + tail_air_s) - elapsed_since_flush
-                    if rem_s > 0.0:
-                        time.sleep(rem_s)
+                    rem_air_s = max(0.0, (head_est_s + tail_air_s) - elapsed_since_flush)
+                    if rem_air_s > 0.0:
+                        time.sleep(rem_air_s)
             else:
+                rem_air_s = tail_air_s
                 time.sleep(head_est_s + tail_air_s)
 
             time.sleep(self.guard_delay_s)
             if aux_dropped:
+                tail_note = (
+                    f"TailWait={rem_air_s*1000:.1f}ms(Tail={tail_air_s*1000:.1f}ms)"
+                    if rem_air_s > (tail_air_s + 0.002)
+                    else f"TailAir={tail_air_s*1000:.1f}ms"
+                )
                 detail = (
                     f"2 pkts ({self.packet_size}+{tail_len}B) | "
                     f"AUX_low={aux_low_s*1000:.1f}ms(drop={drop_ms:.1f}ms) + "
-                    f"TailAir={tail_air_s*1000:.1f}ms + Guard={self.guard_delay_s*1000:.0f}ms"
+                    f"{tail_note} + Guard={self.guard_delay_s*1000:.0f}ms"
                 )
             else:
                 detail = (
@@ -919,22 +932,25 @@ class E220Pacer:
 
         if self.pending_switch_exec_sec > 0 and utc_sec >= self.pending_switch_exec_sec:
             target_rate = self.pending_switch_target_rate
+            prev_rate = self.air_rate_kbps
             self.pending_switch_exec_sec = 0
             self.pending_switch_ack_frame = None
             self.pending_switch_ack_sent = False
             self.pending_switch_ack_repeat_sent = False
             ok = self.reconfigure_air_rate(target_rate)
             if ok:
+                self.fallback_air_rate = prev_rate
+                self.active_air_rate = target_rate
                 self.rate_switch_count += 1
                 self.watchdog_rate_switch_time = time.monotonic()
                 self.watchdog_rate_revert_time = self.watchdog_rate_switch_time + 60.0
                 print(
                     f"[LORA SWITCH] Synchronously reconfigured Base E220 to {target_rate}k at Second 2 boundary! "
-                    f"Rollback watchdog armed (60s).",
+                    f"Rollback watchdog armed (60s -> fallback {self.fallback_air_rate}k).",
                     flush=True,
                 )
             else:
-                print(f"[ERROR] Failed to reconfigure Base E220 to {target_rate}k!", flush=True)
+                print(f"[ERROR] Failed to reconfigure Base E220 to {target_rate}k! Staying on {prev_rate}k.", flush=True)
             if buffer is not None and len(buffer) > 1024:
                 self._shed_stale_backlog(buffer)
 
@@ -1115,22 +1131,34 @@ class E220Pacer:
         self.auto_config = prev_auto
         self._open_operational_uart()
         if ok:
+            self.active_air_rate = new_air_rate
             print(f"[RECONFIG] Base E220 air-rate switched {old_rate}k -> {new_air_rate}k successfully!", flush=True)
         else:
-            print(f"[RECONFIG] Base E220 air-rate switch to {new_air_rate}k failed!", flush=True)
+            self.air_rate_kbps = old_rate
+            self.active_air_rate = old_rate
+            print(f"[RECONFIG] Base E220 air-rate switch to {new_air_rate}k failed! Restored {old_rate}k.", flush=True)
         return ok
 
     def _check_watchdog_revert(self) -> None:
-        """Rolls back to 19.2k fallback if 60 seconds elapse after an air-rate switch without rover traffic."""
+        """Rolls back to previous working fallback rate if 60 seconds elapse after a switch without rover traffic."""
         if self.watchdog_rate_revert_time > 0:
             now = time.monotonic()
             if self.last_rover_rx_time > self.watchdog_rate_switch_time:
                 self.watchdog_rate_revert_time = 0.0
-                print("[LORA WATCHDOG] Verified uplink at new air-rate! Rollback watchdog disarmed.", flush=True)
+                self.fallback_air_rate = self.air_rate_kbps
+                print(
+                    f"[LORA WATCHDOG] Verified uplink at {self.air_rate_kbps}k! Rollback watchdog disarmed.",
+                    flush=True,
+                )
             elif now >= self.watchdog_rate_revert_time:
                 self.watchdog_rate_revert_time = 0.0
-                print(f"[LORA WATCHDOG] 60s silence after rate switch! Reverting to {self.fallback_air_rate}k fallback...", flush=True)
-                self.reconfigure_air_rate(self.fallback_air_rate)
+                revert_rate = self.fallback_air_rate if 2.0 <= self.fallback_air_rate <= 65.0 else 19.2
+                print(
+                    f"[LORA WATCHDOG] 60s silence after switch to {self.air_rate_kbps}k! Reverting to {revert_rate}k fallback...",
+                    flush=True,
+                )
+                if abs(self.air_rate_kbps - revert_rate) >= 0.2:
+                    self.reconfigure_air_rate(revert_rate)
 
     def _handle_telemetry_packet(self, cand: bytes) -> None:
         self.uplink_packets_received += 1
@@ -1418,7 +1446,25 @@ class E220Pacer:
 
                 # 4d. Second 0 Downlink Cutoff Guard: do not start any approved frame whose Time-on-Air bleeds past 700ms/740ms
                 _, sf_sec, ms_in_sec = self._get_superframe_timing()
-                if sf_sec == 0 and (ms_in_sec + self._estimate_frame_toa_ms(total_frame_len)) > self._get_sec0_downlink_cutoff_ms():
+                est_toa_ms = self._estimate_frame_toa_ms(total_frame_len)
+                cutoff_ms = self._get_sec0_downlink_cutoff_ms()
+                if sf_sec == 0 and (ms_in_sec + est_toa_ms) > cutoff_ms:
+                    if (
+                        self.air_rate_kbps <= 5.0
+                        and (1071 <= msg_type <= 1130)
+                        and est_toa_ms > cutoff_ms
+                    ):
+                        # At 4.8 kbps, 2-subpacket MSM frames (e.g. 1074 ~760-790ms) can never fit inside
+                        # Second 0's 700ms window; drop cleanly instead of stalling Second 0 and building backlog.
+                        del buffer[:total_frame_len]
+                        self.head_frame_approved = False
+                        self.interleave_dropped_frames += 1
+                        if self.verbose:
+                            print(
+                                f"[SEC0 SKIP 4.8K] Dropped Type:{msg_type} ({total_frame_len}B, ToA:{est_toa_ms:.0f}ms > {cutoff_ms:.0f}ms)",
+                                flush=True,
+                            )
+                        continue
                     sec0_cutoff_reached = True
                     break
 
