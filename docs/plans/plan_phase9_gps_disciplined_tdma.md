@@ -1,4 +1,7 @@
-# Plan Phase 9: GPS-Disciplined 5-Second Superframe TDMA & Data-Path Integrity Hardening
+# [COMPLETED & DEPRECATED] Plan Phase 9: GPS-Disciplined 5-Second Superframe TDMA & Data-Path Integrity Hardening
+
+> [!NOTE]
+> **Status: COMPLETED & DEPRECATED (November 15, 2026)** — Fully implemented and field-hardened across Rover firmware `v0.8.1` - `v0.8.7` and Base Station `e220_pacer.py v3.5.0` - `v3.6.1`. This planning document is retained in `docs/plans/` for historical reference only; see [`docs/project_overview.md`](../project_overview.md) and [`docs/e220-reference.md`](../e220-reference.md) (`v2.5`) for authoritative production specifications.
 
 **Document Version:** `1.2.0`  
 **Date:** November 14, 2026  
