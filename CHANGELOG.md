@@ -5,6 +5,17 @@ All notable changes to the **RTK Rover** project will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.8.9] - 2026-11-15
+
+### Fixed
+- **E220 Mode 3 EEPROM Write Framing Order & Pre-Write Sync (`src/e220_driver/e220_driver.cpp`):**
+  - Fixed the Mode 3 `FF FF FF` / `got 3 bytes` EEPROM write failure observed during `9.6k -> 4.8k` air-rate switching in `test/_040`: `e220_write_default_config_registers()` now flushes `Serial0`, asserts Mode 3 (`M0=1, M1=1`) **before** calling `Serial0.updateBaudRate(9600)` (matching `e220_read_config_registers()` and `e220_pacer.py`), and issues a `0xC1 0x00 0x06` Mode 3 sync read (`e220_mode3_sync_read()`) to align the transceiver UART before sending `0xC0 0x00 0x06`.
+  - Eliminated M0/M1 bounce glitches between initial write attempts (Attempts 1..3 remain in Mode 3; only Attempt 4 performs a clean baud-matched Mode 0 -> Mode 3 reset), tightened the write reply timeout from `500 ms` to `280 ms` with `35 ms` frame-end early exit (`idx >= 3`), and added hex byte logging on write warnings.
+- **Mode 0 `-128 dBm` Noise Sentinel Filter (`src/e220_driver/e220_driver.cpp`):**
+  - Changed `e220_record_rssi_reply()` lower bound on `noise_raw` from `>= 0x80U` to `> 0x80U` so `0x80` (`-128 dBm`) post-TX glitches recorded in `test/_040` do not overwrite valid ambient noise floor readings.
+- **Post-Block Buffered NMEA GNSS Clock Discipline Guard (`src/um982_driver/um982_driver.cpp`):**
+  - Tracked inter-poll gaps (`> 60 ms`) and initial RX queue depth (`entry_avail > 256`) in `um982_poll_com1()` via `s_com1_rx_backlog_active`, gating `update_gps_utc_sync_from_nmea_field()`, `settimeofday()`, and `rtc_sync_pending` in `handle_gga_sentence()` and `handle_rmc_sentence()` until the backlog drains (`!s_com1_rx_backlog_active && Serial1.available() < 180`). Prevents stale buffered NMEA sentences queued across blocking Core 0 work (such as Mode 3 register switching) from transiently jumping `gettimeofday()` and the `PCF85063` RTC backward.
+
 ## [v0.8.8] - 2026-11-15
 
 ### Fixed

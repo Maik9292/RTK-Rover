@@ -375,6 +375,41 @@ static void e220_log_decoded_registers(const char *tag)
                   e220_stats.config_matched ? "YES" : "NO");
 }
 
+/**
+ * Probe Mode 3 register read (0xC1 0x00 0x06) to drain and align the E220 UART
+ * after entering configuration mode before issuing an EEPROM write command.
+ */
+static bool e220_mode3_sync_read(void)
+{
+    const uint8_t read_cmd[3] = { 0xC1U, 0x00U, 0x06U };
+    while (Serial0.available()) Serial0.read();
+    Serial0.write(read_cmd, sizeof(read_cmd));
+    Serial0.flush();
+
+    uint8_t raw[24] = {0};
+    size_t idx = 0;
+    uint32_t start = millis();
+    uint32_t last_rx = start;
+
+    while (millis() - start < 180U && idx < sizeof(raw)) {
+        if (Serial0.available()) {
+            raw[idx++] = (uint8_t)Serial0.read();
+            last_rx = millis();
+            for (size_t k = 0; k + 9U <= idx; ++k) {
+                if (raw[k] == 0xC1U && raw[k + 1] == 0x00U && raw[k + 2] == 0x06U) {
+                    return true;
+                }
+            }
+        } else {
+            if ((idx >= 9U) || (idx >= 3U && (millis() - last_rx >= 35U))) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+    }
+    return false;
+}
+
 extern "C" bool e220_write_default_config_registers(void)
 {
     // Cancel any active Mode 0 RSSI intercept and wait for any in-flight RF TX before Mode 3
@@ -391,6 +426,7 @@ extern "C" bool e220_write_default_config_registers(void)
         vTaskDelay(pdMS_TO_TICKS(5));
     }
     e220_wait_aux_high(300);
+    Serial0.flush();
 
     uint8_t reg0 = e220_build_reg0_from_settings();
     uint8_t reg1 = e220_build_reg1_from_settings();
@@ -410,20 +446,29 @@ extern "C" bool e220_write_default_config_registers(void)
         reg3
     };
 
-    // Switch baud before entering Mode 3 so 115200->9600 transitions do not inject glitch bytes
-    Serial0.updateBaudRate(ROVER_E220_CONFIG_BAUD);
+    uint32_t baud = (current_settings.e220_uart_baud > 0) ? current_settings.e220_uart_baud : ROVER_E220_TRANSPARENT_BAUD;
+
+    // Enter Mode 3 BEFORE switching UART baud so the E220 is off 115200-baud Mode 0 before ESP32 changes to 9600
     e220_set_mode(1, 1);
+    Serial0.updateBaudRate(ROVER_E220_CONFIG_BAUD);
+    vTaskDelay(pdMS_TO_TICKS(60));
+    e220_mode3_sync_read();
 
     bool ok = false;
-    for (uint8_t attempt = 1; attempt <= 3 && !ok; ++attempt) {
-        if (attempt > 1) {
-            // Re-toggle Mode 0 -> Mode 3 to reset any wedged Mode 3 parser state on retry
+    for (uint8_t attempt = 1; attempt <= 4U && !ok; ++attempt) {
+        if (attempt == 4U) {
+            // Last-resort clean Mode 0 -> Mode 3 bounce with matching baud rates to recover a wedged parser
             e220_set_mode(0, 0);
+            Serial0.updateBaudRate(baud);
             vTaskDelay(pdMS_TO_TICKS(30));
+            while (Serial0.available()) Serial0.read();
             e220_set_mode(1, 1);
-            vTaskDelay(pdMS_TO_TICKS(80));
-        } else {
+            Serial0.updateBaudRate(ROVER_E220_CONFIG_BAUD);
             vTaskDelay(pdMS_TO_TICKS(60));
+            e220_mode3_sync_read();
+        } else {
+            // Stay in Mode 3 between initial attempts to avoid M0/M1 bounce framing glitches
+            vTaskDelay(pdMS_TO_TICKS(35));
         }
         while (Serial0.available()) Serial0.read();
 
@@ -437,7 +482,7 @@ extern "C" bool e220_write_default_config_registers(void)
         bool matched = false;
         size_t match_off = 0;
 
-        while (millis() - start < 500U && idx < sizeof(raw)) {
+        while (millis() - start < 280U && idx < sizeof(raw)) {
             if (Serial0.available()) {
                 raw[idx++] = (uint8_t)Serial0.read();
                 last_rx = millis();
@@ -460,7 +505,7 @@ extern "C" bool e220_write_default_config_registers(void)
                     }
                 }
             } else {
-                if (idx >= 9U && (millis() - last_rx >= 60U)) {
+                if (idx >= 3U && (millis() - last_rx >= 35U)) {
                     break;
                 }
                 vTaskDelay(pdMS_TO_TICKS(5));
@@ -482,20 +527,30 @@ extern "C" bool e220_write_default_config_registers(void)
             ok = true;
             e220_log_decoded_registers("E220 WRITE OK");
         } else {
-            Serial.printf("[E220 WRITE WARN] Attempt %u/3 failed (got %u bytes, AUX=%d)\n",
-                          attempt, (unsigned)idx, digitalRead(ROVER_PIN_E220_AUX));
+            char hex_buf[80];
+            size_t hex_pos = 0;
+            if (idx == 0U) {
+                snprintf(hex_buf, sizeof(hex_buf), "none");
+            } else {
+                for (size_t i = 0; i < idx && hex_pos + 4U < sizeof(hex_buf); ++i) {
+                    int n = snprintf(hex_buf + hex_pos, sizeof(hex_buf) - hex_pos,
+                                     (i == 0U) ? "%02X" : " %02X", raw[i]);
+                    if (n > 0) hex_pos += (size_t)n;
+                }
+            }
+            Serial.printf("[E220 WRITE WARN] Attempt %u/4 failed (got %u bytes, AUX=%d, hex=%s)\n",
+                          attempt, (unsigned)idx, digitalRead(ROVER_PIN_E220_AUX), hex_buf);
         }
     }
 
     // Return to Mode 0 (Transparent: M0=0, M1=0) at configured operational UART baud
-    uint32_t baud = (current_settings.e220_uart_baud > 0) ? current_settings.e220_uart_baud : ROVER_E220_TRANSPARENT_BAUD;
     e220_set_mode(0, 0);
     Serial0.updateBaudRate(baud);
     vTaskDelay(pdMS_TO_TICKS(10));
     while (Serial0.available()) Serial0.read();
 
     if (!ok) {
-        Serial.println("[E220 WRITE FAIL] All 3 Mode 3 write attempts failed! Reading actual hardware REG0...");
+        Serial.println("[E220 WRITE FAIL] All 4 Mode 3 write attempts failed! Reading actual hardware REG0...");
         if (e220_read_config_registers()) {
             float actual_rate = e220_decode_air_rate_from_reg0(e220_stats.cfg_reg0);
             s_active_air_rate                   = actual_rate;
@@ -940,7 +995,7 @@ static void e220_ingest_rx_bytes(const uint8_t *data, size_t len, uint32_t now)
 
 static void e220_record_rssi_reply(uint8_t noise_raw, uint8_t pkt_raw, uint32_t now)
 {
-    if (noise_raw >= 0x80U && noise_raw <= 0xE4U) {
+    if (noise_raw > 0x80U && noise_raw <= 0xE4U) {
         e220_stats.ambient_noise_dbm = (int16_t)noise_raw - 256;
     }
     if (e220_stats.rx_bytes_total > 0 && pkt_raw >= 0x80U && pkt_raw <= 0xF6U) {

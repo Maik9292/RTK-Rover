@@ -25,8 +25,10 @@ static bool              rtc_synced_from_gnss    = false;
 static volatile bool     rtc_sync_pending        = false;
 static volatile time_t   s_pending_rtc_epoch     = 0;
 static volatile uint32_t s_pending_rtc_sync_ms   = 0;
-static uint32_t          s_last_rtc_chip_sync_ms = 0;
-static uint32_t          s_last_sysclock_sync_ms = 0;
+static uint32_t          s_last_rtc_chip_sync_ms  = 0;
+static uint32_t          s_last_sysclock_sync_ms  = 0;
+static uint32_t          s_last_com1_poll_ms      = 0;
+static bool              s_com1_rx_backlog_active = false;
 
 static volatile bool     version_ack_received    = false;
 static volatile bool     saveconfig_ack_received = false;
@@ -125,7 +127,7 @@ static void handle_gga_sentence(char *line)
     gps_time_sync.last_gga_ms = now_ms;
 
     int qual = f[6] ? atoi(f[6]) : 0;
-    if (qual > 0 && f[1] && f[1][0]) {
+    if (qual > 0 && f[1] && f[1][0] && !s_com1_rx_backlog_active && Serial1.available() < 180) {
         update_gps_utc_sync_from_nmea_field(f[1], now_ms);
     }
     gnss_state.fix_type = (GnssFixType_t)qual;
@@ -199,8 +201,9 @@ static void handle_rmc_sentence(char *line)
     gps_time_sync.last_rmc_ms = now_ms;
 
     // Field 2: Status ('A'=Active, 'V'=Void, or 'D'=Differential)
-    bool pos_active = (f[2] && (f[2][0] == 'A' || f[2][0] == 'D'));
-    if (pos_active && f[1] && f[1][0]) {
+    bool pos_active  = (f[2] && (f[2][0] == 'A' || f[2][0] == 'D'));
+    bool clock_fresh = (!s_com1_rx_backlog_active && Serial1.available() < 180);
+    if (pos_active && f[1] && f[1][0] && clock_fresh) {
         update_gps_utc_sync_from_nmea_field(f[1], now_ms);
     }
 
@@ -229,7 +232,7 @@ static void handle_rmc_sentence(char *line)
         }
     }
 
-    if (pos_active && strlen(f[1]) >= 6 && strlen(f[9]) == 6) {
+    if (pos_active && clock_fresh && strlen(f[1]) >= 6 && strlen(f[9]) == 6) {
         bool digits_ok = true;
         for (int i = 0; i < 6; i++) {
             if (f[1][i] < '0' || f[1][i] > '9' || f[9][i] < '0' || f[9][i] > '9') {
@@ -950,9 +953,18 @@ extern "C" void um982_forward_rtcm_to_com2(const uint8_t *data, size_t len)
 
 extern "C" void um982_poll_com1(void)
 {
+    uint32_t entry_ms = millis();
+    int entry_avail = Serial1.available();
+    bool has_backlog = (s_last_com1_poll_ms > 0U && (entry_ms - s_last_com1_poll_ms) > 60U) ||
+                       (entry_avail > 256);
+    int backlog_bytes_remaining = has_backlog ? (entry_avail + (int)com1_line_pos + 64) : 0;
+
     while (Serial1.available() > 0) {
         char c = (char)Serial1.read();
         port_stats.com1_rx_bytes++;
+        if (backlog_bytes_remaining > 0) {
+            backlog_bytes_remaining--;
+        }
 
         if (c == '\r' || c == '\n') {
             if (com1_line_overflow) {
@@ -960,6 +972,8 @@ extern "C" void um982_poll_com1(void)
                 com1_line_pos = 0;
             } else if (com1_line_pos > 0) {
                 com1_line_buf[com1_line_pos] = '\0';
+                // Suppress GNSS wall-clock discipline while draining stale NMEA queued across blocking Core 0 work
+                s_com1_rx_backlog_active = (backlog_bytes_remaining > 0);
                 process_com1_line(com1_line_buf, com1_line_pos);
                 com1_line_pos = 0;
             }
@@ -973,6 +987,7 @@ extern "C" void um982_poll_com1(void)
             }
         }
     }
+    s_com1_rx_backlog_active = false;
 
     uint32_t now_ms = millis();
     bool is_online = (port_stats.last_com1_rx_ms > 0) &&
@@ -1000,6 +1015,8 @@ extern "C" void um982_poll_com1(void)
             }
         }
     }
+
+    s_last_com1_poll_ms = millis();
 }
 
 extern "C" void um982_poll_com2(void)

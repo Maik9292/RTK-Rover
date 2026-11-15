@@ -1,8 +1,8 @@
 # Ebyte E220-900T30S Practical Engineering Reference
 
-**Document Version:** 2.6  
+**Document Version:** 2.7  
 **Last Updated:** November 15, 2026  
-**Firmware Target:** `v0.8.8`  
+**Firmware Target:** `v0.8.9`  
 **Companion Software:** `e220_pacer.py v3.6.2`  
 **Target Hardware:** Ebyte `E220-900T30S` (`850.125 - 930.125 MHz`, `1 W` / `+30 dBm` SMD UART LoRa Module)  
 **Applicability:** Directly applies to `E220-900T30S` / `E220-900T30D` (`1 W`) and `E220-900T22S` / `E220-900T22D` (`160 mW`, noting TX power bit differences in Section 4.4).  
@@ -121,8 +121,9 @@ When switching between any two modes, the E220 pulls `AUX` **`LOW` for `9..11 ms
 
 ### 4.1 Mode 3 Serial Rules
 * **Mode 3 (`M1=1, M0=1`) ALWAYS uses `9600 bps, 8N1`**, regardless of the operational baud rate in `REG0`.
-* Wait `AUX == HIGH` + `>= 40-60 ms` settle time after asserting `M0=1, M1=1` before sending commands.
-* Wait `AUX == HIGH` + `>= 60 ms` after returning to `M0=0, M1=0` before switching host UART back to operational baud (`115200`).
+* Flush Mode 0 UART TX, assert **`M0=1, M1=1` BEFORE switching host UART to `9600 bps`**, and wait `>= 60 ms` settle time. Switching the ESP32 UART to `9600` while the E220 is still listening at `115200` in Mode 0 injects a baud-mismatch framing glitch into the transceiver RX shift register (`test/_040`).
+* Issue a pre-write Mode 3 read probe (`C1 00 06`) to verify UART alignment before sending `C0 00 06`, and keep `M0=1, M1=1` steady between initial retries instead of toggling `Mode 0 -> Mode 3` at `9600` baud.
+* Wait `AUX == HIGH` + `>= 60 ms` (or flush Mode 3 reply) after returning to `M0=0, M1=0` when restoring operational baud (`115200`).
 
 ### 4.2 Binary Command Frame Formats
 
@@ -132,7 +133,7 @@ When switching between any two modes, the E220 pulls `AUX` **`LOW` for `9..11 ms
 | **Read Registers** | `C1 <START> <LEN>` | `C1 <START> <LEN> <DATA[0..LEN-1]>` | Read-only |
 | **Write Temp RAM** | `C2 <START> <LEN> <DATA[0..LEN-1]>` | `C1` *(or `C2`)* `<START> <LEN> <DATA...>` | Lost on power-cycle or `RST` |
 
-> **`0xC0` vs `0xC1` Acknowledgment & Mode 3 Retry Protocol (`v0.8.7`):** Certain E220 firmware builds echo `0xC0` instead of `0xC1` upon successful EEPROM write. Always accept `reply[0] in (0xC0, 0xC1)`. In addition, field testing (`test/_038`) showed that entering Mode 3 while a Mode 0 RSSI command or RF transmission is still active — or switching host UART to `9600` baud after raising `M0/M1` — can inject a leading glitch byte or provoke an `FF FF FF` format-error reply (`got 4 bytes`). Firmware `v0.8.7` cancels any active Mode 0 RSSI query, waits for `s_tx_air_busy_until_ms` and `AUX == HIGH`, switches UART baud to `9600 8N1` *before* asserting `M0=1, M1=1`, scans the RX buffer for a sync-aligned `0xC1/0xC0 0x00 0x06` response matching all written registers across up to 3 attempts (re-toggling `Mode 0 -> Mode 3` between retries), and performs a `REG0` readback resync if all attempts fail so software state (`s_active_air_rate`) never diverges from hardware EEPROM.
+> **`0xC0` vs `0xC1` Acknowledgment & Mode 3 Retry Protocol (`v0.8.7` / `v0.8.9`):** Certain E220 firmware builds echo `0xC0` instead of `0xC1` upon successful EEPROM write. Always accept `reply[0] in (0xC0, 0xC1)`. Field testing (`test/_038`, `test/_040`) showed that entering Mode 3 while a Mode 0 RSSI command or RF transmission is still active — or switching ESP32 UART to `9600` baud *before* raising `M0/M1` / bouncing `M0/M1` while locked at `9600` baud — injects a framing glitch and provokes repeated `FF FF FF` format-error replies (`got 3 bytes` / `got 4 bytes`) even while a subsequent `e220_read_config_registers()` (`set_mode(1,1)` *then* `9600`) succeeds immediately. Firmware `v0.8.9` cancels active Mode 0 RSSI queries, waits for `s_tx_air_busy_until_ms` + `AUX == HIGH` + `Serial0.flush()`, asserts **`e220_set_mode(1, 1)` BEFORE `Serial0.updateBaudRate(9600)`**, runs `e220_mode3_sync_read()` (`0xC1 0x00 0x06`), retries Attempts `1..3` in Mode 3 without bouncing `M0/M1` (`280 ms` timeout with `35 ms` frame-end exit for `>= 3 B` error frames), reserves a clean baud-matched `Mode 0 (115200) -> Mode 3 (9600)` bounce + sync read for Attempt `4`, and falls back to `e220_read_config_registers()` to resync `s_active_air_rate` if all attempts fail.
 
 ### 4.3 Production Register Profiles (Profile Rev 2)
 
@@ -276,7 +277,7 @@ Raw bytes lie in `0x80 .. 0xF5` (`>= 128`, representing `-128 dBm .. -11 dBm`).
 Never issue `C0 C1 C2 C3 00 02` blindly during active reception, during single-subpacket RF TX (`< s_tx_air_busy_until_ms`), or when a Mode 3 rate-switch / rollback is due:
 1. **Second 0 Post-Uplink Gap (`sf_sec == 0`):** Poll strictly *after* the Rover's uplink TX finishes RF airing (`now >= s_tx_air_busy_until_ms` and `sf_ms` in `760..955 ms`), accommodating `48 B` uplink air time at all rates (`~60 ms` @ `19.2k`, `~105 ms` @ `9.6k`, `~168 ms` @ `4.8k`).
 2. **Seconds 1..4 End-of-Second Micro-Slot (`sf_sec != 0`):** Instead of heuristic mid-epoch polling (which collides when `1006`/`1230` or back-to-back epochs follow `1084`/`1094`), the Base (`e220_pacer.py v3.6.2`) enforces an **`850 ms` downlink cutoff** at `> 5.0 kbps` after `400 ms` into the second (`ms_in_sec + est_toa_ms <= 850.0 ms`). The Rover polls inside the deterministic silent window at **`sf_ms = 880..950 ms`** (`E220_RSSI_POLL_INTERVAL_MS = 750 ms`, `last_rx_ms` idle `>= 25 ms`), delivering **full 1.0 Hz real-time Signal Quality Meter (RSSI + Ambient Noise Floor)** updates with zero RTCM collisions. At `<= 5.0 kbps`, `end_of_sec_gap` additionally requires a valid RTCM frame within `<= 750 ms`.
-3. **Bounded Late Intercept, Timeout & ISR Cleanup:** Set `E220_RSSI_REPLY_TIMEOUT_MS = 180 ms`. Gate Stage `0b` `0xC1 0x00` interception strictly within `250 ms` of an issued query (`last_rssi_poll_ms`) and bound `noise_raw` (`0x80..0xE4`, `-128..-28 dBm`) and `pkt_raw` (`0x80..0xF6`, `-128..-10 dBm`) across all parsers so binary RTCM bytes cannot spoof RSSI readings. Clear `isr_aux_fall_us = 0` whenever unmasking `e220_suppress_aux_isr` so suppressed edges never corrupt subsequent `RX BURST` LOW-width diagnostics. On mismatch (incoming packet collision), abort immediately and pipe bytes into `e220_ingest_rx_bytes()`. Never mark `radio_online = false` or `rssi_valid = false` on poll timeout streak if RTCM bytes arrived within the last `10 s`.
+3. **Bounded Late Intercept, Timeout & ISR Cleanup:** Set `E220_RSSI_REPLY_TIMEOUT_MS = 180 ms`. Gate Stage `0b` `0xC1 0x00` interception strictly within `250 ms` of an issued query (`last_rssi_poll_ms`) and bound `noise_raw` (`0x81..0xE4`, `-127..-28 dBm` — rejecting `0x80` / `-128 dBm` post-TX sentinel glitches observed in `test/_040`) and `pkt_raw` (`0x80..0xF6`, `-128..-10 dBm`) across all parsers so binary RTCM bytes cannot spoof RSSI readings. Clear `isr_aux_fall_us = 0` whenever unmasking `e220_suppress_aux_isr` so suppressed edges never corrupt subsequent `RX BURST` LOW-width diagnostics. On mismatch (incoming packet collision), abort immediately and pipe bytes into `e220_ingest_rx_bytes()`. Never mark `radio_online = false` or `rssi_valid = false` on poll timeout streak if RTCM bytes arrived within the last `10 s`.
 
 ---
 
@@ -421,7 +422,7 @@ Never pass raw E220 UART output directly to a downstream GNSS receiver or parser
 | **`201..400 B` frames lose Subpacket 2 when followed by another frame.** | Sending next frame immediately when `AUX` rises `HIGH` (`AUX` rises when Subpacket 2 *starts* airing, not when it ends). | After `AUX` rises `HIGH`, sleep `ToA(N - 200) + 35 ms` before writing the next frame (Section 5.3). |
 | **RTCM `1074` (`201..253 B`) loses Subpacket 2 (`[RTCM DROP TRUNC] 200B`) at `4.8k` or `9.6k` followed by missing `1094` head.** | At `<= 9.6 kbps`, E220 raises `AUX` `HIGH` `100-147 ms` *before* Subpacket 1 (`200 B`) finishes airing, causing `send_packet()` to transmit the next frame while Subpacket 2 is still on air. | Upgrade to `e220_pacer.py v3.6.1` enforcing `max(ToA(tail), ToA(200)+ToA(tail)-elapsed) + Guard` (Section 5.3). |
 | **Mode 0 RSSI query at `4.8k` pulls `AUX` `LOW` for `100-130 ms` and replies after `166 ms` (`[E220 RX BURST] 5 B`).** | `C0 C1 C2 C3 00 02` was written right after `48 B` uplink `flush()` while the single-subpacket TX was still airing on `LLCC68`. | Track `s_tx_air_busy_until_ms` after uplink TX and use `180 ms` RSSI timeout in `v0.8.7` (Section 5.2 & 7.3). |
-| **`[E220 WRITE FAIL] got 4 bytes` or Base/Rover stranded on mismatched rates after rollback.** | Mode 3 UART baud switch glitch / active Mode 0 query during `M0/M1` assert, plus hardcoded `19.2k` fallback. | Upgrade to `v0.8.7` + `e220_pacer.py v3.6.1` (3-attempt Mode 3 write w/ sync scan, `REG0` resync, dynamic `fallback_air_rate`). |
+| **`[E220 WRITE FAIL] got 3 bytes` (`FF FF FF`) or `got 4 bytes` on rate switch, followed immediately by `E220 READ OK`.** | UART switched to `9600` baud *before* raising `M0/M1` (or `M0/M1` bounced at `9600`), injecting a framing glitch into Mode 3 parser. | Upgrade to `v0.8.9` + `e220_pacer.py v3.6.2` (asserts `M0/M1=1` before `9600` baud switch, runs `0xC1` sync read, avoids bounce on retries `1..3`). |
 | **At 9.6 kbps, Rover loses RTK Fix and Telemetry Heartbeats stop.** | Channel saturated by 4-constellation 650 B/s stream without interleaving. | Enable Adaptive Constellation Interleaving in `e220_pacer.py v3.3.1+` (Section 6.3). |
 | **Subpacket 2 of 340B RTCM frames dropped at 9.6 kbps.** | Receiver truncation timeout too short (`260 ms`). | Scale gatekeeper timeout to `650 ms` at 9.6 kbps (Section 6.4). |
 | **Telemetry shows `Bat:0% (0.00V)` and `Hdg: 0.0deg [NONE]` while Rover screen is valid.** | Telemetry state fed from Core 0 before Core 1 attaches PMIC battery and woods fallback heading. | Move `e220_feed_telemetry_state(&ui_state)` to Core 1 post-sensor-fusion (Section 9.4). |
