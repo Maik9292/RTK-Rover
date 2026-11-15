@@ -69,7 +69,7 @@ except ImportError:
 
 __filename__ = "e220_pacer.py"
 __app_name__ = "e220_pacer"
-__version__ = "3.6.3"
+__version__ = "3.6.4"
 __date__ = "2026-11-15"
 
 # Force unbuffered output so systemd journalctl displays entries in real time
@@ -304,8 +304,10 @@ class E220Pacer:
         self.msm_last_len: dict[int, int] = {1074: 232, 1084: 150, 1094: 335, 1124: 240}
         self.msm_epochs_since_tx: dict[int, int] = {1074: 0}
         self.epoch_target_msm: int = 1074
+        self.epoch_msm_sent: bool = False
         self.sec_tx_utc: int = 0
         self.sec_tx_count: int = 0
+        self.sec_msm_count: int = 0
 
         # Phase 9: Empty MSM Dropper & GPS-Disciplined 5s Superframe Synchronous Switch State
         self.empty_msm_dropped = 0
@@ -761,6 +763,14 @@ class E220Pacer:
                 flush=True,
             )
 
+    def _max_single_epoch_bytes(self) -> int:
+        """Returns the maximum byte size of a single intact multi-constellation epoch."""
+        msm_sum = sum(
+            self.msm_last_len.get(m, 300)
+            for m in ([1074] + sorted(self.seen_secondary_types))
+        )
+        return max(1024, msm_sum + 96)
+
     def _shed_stale_backlog(self, buffer: bytearray) -> None:
         """
         If TCP input ever accumulates >2048B of stale epochs (e.g. after a momentary stall),
@@ -770,7 +780,8 @@ class E220Pacer:
         idx = 0
         shed = 0
         n = len(buffer)
-        while idx + 6 <= n and (n - idx) > 1024:
+        keep_bytes = self._max_single_epoch_bytes()
+        while idx + 6 <= n and (n - idx) > keep_bytes:
             if buffer[idx] != 0xD3 or (buffer[idx + 1] & 0xFC) != 0:
                 idx += 1
                 continue
@@ -804,6 +815,7 @@ class E220Pacer:
 
     def _select_epoch_target_msm(self) -> int:
         """Selects the priority MSM constellation for this epoch so no constellation ever starves."""
+        self.epoch_msm_sent = False
         all_types = [1074] + sorted(self.seen_secondary_types)
         for m in all_types:
             self.msm_epochs_since_tx[m] = self.msm_epochs_since_tx.get(m, 0) + 1
@@ -867,7 +879,11 @@ class E220Pacer:
             return True
 
         if self.air_rate_kbps <= 4.8:
-            return msg_type == self.epoch_target_msm
+            # Allow any MSM constellation until one MSM is sent for this epoch;
+            # process_stream() reserves airtime for epoch_target_msm when it fits,
+            # and opportunistically admits a smaller secondary (e.g. 1084) in Second 0
+            # or late Seconds 1..4 when epoch_target_msm exceeds cutoff_ms.
+            return not self.epoch_msm_sent
 
         # 9.6 kbps: admit GPS (1074) plus the target/most-starved secondary constellation;
         # closed-loop airtime reservation and Fit-or-Skip checks decide exact pairing.
@@ -912,9 +928,18 @@ class E220Pacer:
         """Returns the Second 0 Base Downlink TX cutoff in milliseconds for the active air-rate."""
         return 700.0 if self.air_rate_kbps <= 9.6 else 740.0
 
-    def _get_sec1_to_4_downlink_cutoff_ms(self) -> float:
-        """Returns the Seconds 1..4 downlink cutoff in ms, reserving 850..1000ms for collision-free RSSI."""
-        return 850.0
+    def _get_sec1_to_4_downlink_cutoff_ms(self, sf_sec: int = 1) -> float:
+        """Returns the Seconds 1..4 downlink cutoff in ms.
+
+        At >= 9.6 kbps (or after 1 MSM is already sent in the current second),
+        cap at 850.0 ms so 850..1000 ms stays clear for collision-free RSSI.
+        At <= 4.8 kbps, 1 MSM spans 855..1468 ms and must be allowed to spill once
+        into the next second, capped at 1750 ms in Seconds 1..3 and 1680 ms in
+        Second 4 so spillover never reaches the Second 0 720..800 ms uplink slot.
+        """
+        if self.air_rate_kbps > 5.0 or self.sec_msm_count > 0:
+            return 850.0
+        return 1680.0 if sf_sec == 4 else 1750.0
 
     def _estimate_frame_toa_ms(self, frame_len: int) -> float:
         """Estimates total UART + RF Time-on-Air + multi-subpacket handover/guard delay in ms."""
@@ -1016,7 +1041,7 @@ class E220Pacer:
             self._transmit_pending_switch_ack_if_due(utc_sec_after, ms_after)
 
             # Shed stale queued RTCM backlog at lower air rates to keep differential age fresh
-            if buffer is not None and len(buffer) > 600 and self.air_rate_kbps <= 9.6:
+            if buffer is not None and len(buffer) > self._max_single_epoch_bytes() and self.air_rate_kbps <= 9.6:
                 self._shed_stale_backlog(buffer)
 
             if self.pending_switch_exec_sec > 0 and utc_sec_after < self.pending_switch_exec_sec:
@@ -1400,7 +1425,7 @@ class E220Pacer:
                 self.total_bytes_in += len(data)
                 last_rx_data_time = now
 
-            if len(buffer) > 2048:
+            if len(buffer) > max(2048, self._max_single_epoch_bytes() * 2):
                 self._shed_stale_backlog(buffer)
 
             sec0_cutoff_reached = False
@@ -1486,28 +1511,57 @@ class E220Pacer:
                             )
                         if self._is_terminal_burst_msg(msg_type):
                             self._service_superframe_events(buffer)
-                            if len(buffer) > 600 and self.air_rate_kbps <= 9.6:
+                            if len(buffer) > self._max_single_epoch_bytes() and self.air_rate_kbps <= 9.6:
                                 self._shed_stale_backlog(buffer)
-                            break
+                            if not buffer:
+                                break
                         continue
                     self.head_frame_approved = True
 
                 # 4d. Closed-Loop Airtime Budget, Constellation Reservation & TDD Cutoff Guards:
                 #     - Second 0: hold/skip before 700ms/740ms so Second 0 uplink slot stays clear.
-                #     - Seconds 1..4: enforce 850ms ceiling on follow-on frames (and late leads >=180ms)
-                #       using Fit-or-Skip for MSM so frames never bleed across seconds or build backlogs.
+                #     - Seconds 1..4 (>= 9.6 kbps): enforce 850ms ceiling on follow-on frames and
+                #       late leads >= 180ms so frames never bleed across seconds or build backlogs.
+                #     - Seconds 1..4 (<= 4.8 kbps): permit 1 MSM up to 1750ms (Sec 1..3) or 1680ms
+                #       (Sec 4) while capping follow-on/non-MSM frames at 850ms and admitting a
+                #       smaller secondary MSM when epoch_target_msm cannot fit cutoff_ms.
                 utc_sec, sf_sec, ms_in_sec = self._get_superframe_timing()
                 if utc_sec != self.sec_tx_utc:
                     self.sec_tx_utc = utc_sec
                     self.sec_tx_count = 0
+                    self.sec_msm_count = 0
                 est_toa_ms = self._estimate_frame_toa_ms(total_frame_len)
                 cutoff_ms = (
                     self._get_sec0_downlink_cutoff_ms()
                     if sf_sec == 0
-                    else self._get_sec1_to_4_downlink_cutoff_ms()
+                    else self._get_sec1_to_4_downlink_cutoff_ms(sf_sec)
                 )
 
                 if (
+                    self.enable_interleave
+                    and self.air_rate_kbps <= 4.8
+                    and msg_type in (1074, 1084, 1094, 1124)
+                ):
+                    if self.epoch_msm_sent:
+                        del buffer[:total_frame_len]
+                        self.head_frame_approved = False
+                        self.interleave_dropped_frames += 1
+                        continue
+                    if msg_type < self.epoch_target_msm:
+                        target_len = self.msm_last_len.get(self.epoch_target_msm, 320)
+                        target_toa_ms = self._estimate_frame_toa_ms(target_len)
+                        if (ms_in_sec + target_toa_ms) <= cutoff_ms:
+                            del buffer[:total_frame_len]
+                            self.head_frame_approved = False
+                            self.interleave_dropped_frames += 1
+                            if self.verbose:
+                                print(
+                                    f"[INTERLEAVE] Yielded Type:{msg_type:<4d} ({total_frame_len}B, {est_toa_ms:.0f}ms) "
+                                    f"to reserve {self.air_rate_kbps}k slot for Type:{self.epoch_target_msm} ({target_toa_ms:.0f}ms)",
+                                    flush=True,
+                                )
+                            continue
+                elif (
                     self.enable_interleave
                     and msg_type in (1074, 1084, 1094, 1124)
                     and msg_type != self.epoch_target_msm
@@ -1539,17 +1593,22 @@ class E220Pacer:
                                 f"at {ms_in_sec:.0f}ms > {cutoff_ms:.0f}ms",
                                 flush=True,
                             )
-                        if ms_in_sec >= (cutoff_ms - 100.0):
+                        if self._is_terminal_burst_msg(msg_type) and ms_in_sec >= (cutoff_ms - 100.0):
                             sec0_cutoff_reached = True
                             break
                         continue
                     sec0_cutoff_reached = True
                     break
 
+                effective_cutoff_ms = (
+                    850.0
+                    if (sf_sec != 0 and msg_type in (1005, 1006, 1033, 1230))
+                    else cutoff_ms
+                )
                 if (
                     sf_sec != 0
-                    and (ms_in_sec + est_toa_ms) > cutoff_ms
-                    and (self.sec_tx_count > 0 or ms_in_sec >= 180.0)
+                    and (ms_in_sec + est_toa_ms) > effective_cutoff_ms
+                    and (self.sec_tx_count > 0 or ms_in_sec >= 180.0 or self.air_rate_kbps <= 5.0)
                 ):
                     if msg_type in (1074, 1084, 1094, 1124):
                         del buffer[:total_frame_len]
@@ -1558,10 +1617,10 @@ class E220Pacer:
                         if self.verbose:
                             print(
                                 f"[BUDGET SKIP] Skipped Type:{msg_type:<4d} ({total_frame_len}B, {est_toa_ms:.0f}ms) "
-                                f"at {ms_in_sec:.0f}ms > {cutoff_ms:.0f}ms",
+                                f"at {ms_in_sec:.0f}ms > {effective_cutoff_ms:.0f}ms",
                                 flush=True,
                             )
-                        if self._is_terminal_burst_msg(msg_type) or ms_in_sec >= 650.0:
+                        if self._is_terminal_burst_msg(msg_type):
                             sec_end_rssi_window_reached = True
                             sec_end_target_utc_sec = utc_sec
                             break
@@ -1576,6 +1635,8 @@ class E220Pacer:
                 self.send_rtcm_frame(frame, msg_type)
                 self.sec_tx_count += 1
                 if msg_type in (1074, 1084, 1094, 1124):
+                    self.sec_msm_count += 1
+                    self.epoch_msm_sent = True
                     self.msm_epochs_since_tx[msg_type] = 0
 
                 # Poll uplink and watchdog immediately after each frame transmission
@@ -1587,7 +1648,7 @@ class E220Pacer:
 
                 # End of MSM constellation epoch: shed backlog at lower air rates (Seconds 1..4 stay 100% downlink)
                 if self._is_terminal_burst_msg(msg_type):
-                    if len(buffer) > 600 and self.air_rate_kbps <= 9.6:
+                    if len(buffer) > self._max_single_epoch_bytes() and self.air_rate_kbps <= 9.6:
                         self._shed_stale_backlog(buffer)
                     break  # Yield to outer loop for heartbeat reporting and fresh socket reads
 
