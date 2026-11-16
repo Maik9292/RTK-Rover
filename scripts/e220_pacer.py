@@ -2,17 +2,20 @@
 # -*- coding: utf-8 -*-
 """
 Module: e220_pacer.py
-Description: Datasheet-Accurate Hardware-Paced Ebyte E220-900T30S LoRa Driver for RTKBase.
-             Parses and CRC24Q-validates raw RTCM3 streams into complete frames and
-             transmits each frame intact through the E220 400-byte FIFO using Ebyte
-             E220 Manual Section 5.6.2 two-regime AUX + Time-on-Air pacing:
+Description: Asynchronous Ping-Pong Mailbox & Stage-1 Calibrated Ebyte E220-900T30S LoRa Driver for RTKBase.
+             Consumes raw RTCM3 streams on an asynchronous ingress thread, verifies CRC24Q,
+             filters empty MSM frames, and maintains latest-value ping-pong mailboxes per
+             RTCM message type (zero epoch queue buildup). Transmits intact or <= 200B
+             coalesced batches across a consolidated content-independent N-second macro-cycle
+             (default 5s) anchored to GPS/NTP Second 0 uplink & RSSI windows, using Ebyte
+             E220 Manual Section 5.6.2 two-regime AUX + Stage-1-calibrated Time-on-Air pacing:
                - Single-subpacket frames (<= 200B): Transfer directly into an idle
                  LLCC68 FIFO without holding AUX LOW; paced deterministically by
                  calibrated LoRa Time-on-Air + receiver UART drain guard delay.
                - Two-subpacket frames (201..400B): Hold AUX LOW while Subpacket 1
                  (200B) transmits over the air, then raise AUX HIGH the instant
                  Subpacket 2 (len - 200) enters the LLCC68 FIFO and begins RF TX;
-                 paced by AUX rising edge + Subpacket 2 Time-on-Air + guard delay.
+                 paced by total calibrated Time-on-Air + guard delay.
              Includes GPIO 22 hardware reset watchdog if AUX ever locks LOW (>1.5s),
              POSIX exclusive UART locking (TIOCEXCL), startup EEPROM verification,
              and Mode 0 ambient RF noise floor probing (REG1 Bit 5 = 0x20) on CH 75
@@ -42,7 +45,9 @@ import signal
 import socket
 import struct
 import sys
+import threading
 import time
+from dataclasses import dataclass
 from typing import Optional
 
 try:
@@ -69,8 +74,8 @@ except ImportError:
 
 __filename__ = "e220_pacer.py"
 __app_name__ = "e220_pacer"
-__version__ = "3.6.5"
-__date__ = "2026-11-15"
+__version__ = "3.7.0"
+__date__ = "2026-11-16"
 
 # Force unbuffered output so systemd journalctl displays entries in real time
 if hasattr(sys.stdout, "reconfigure"):
@@ -86,9 +91,15 @@ DEFAULT_PIN_RST = 22
 DEFAULT_SERIAL_PORT = "/dev/ttyAMA0"
 DEFAULT_BAUD = 115200
 DEFAULT_PACKET_SIZE = 200
+DEFAULT_MACRO_CYCLE_S = 5
 
-# Inter-frame guard delay after RF completion (allows Rover E220 17.4ms @ 115200 UART drain + 17.6ms margin)
-DEFAULT_GUARD_DELAY_S = 0.035  # 35 ms
+# Inter-frame guard delay after RF completion (calibrated in Stage 1 for UART drain + turnaround)
+DEFAULT_GUARD_DELAY_S = 0.030  # 30 ms
+
+# Architecture 2B Ping-Pong Mailbox TTL & Static RTCM Metadata Classifications
+STALE_FRAME_TTL_S = 2.5
+STALE_STATIC_TTL_S = 15.0
+STATIC_RTCM_TYPES: frozenset[int] = frozenset((1005, 1006, 1033, 1230))
 
 # Hardware Flow Control & Watchdog Thresholds
 AUX_SINGLE_PROBE_S = 0.008     # 8 ms probe for <=200B frames (normally stays HIGH per Sec 5.6.2)
@@ -185,6 +196,16 @@ def crc16_ccitt(data: bytes) -> int:
     return crc
 
 
+@dataclass
+class MailboxSlot:
+    """Latest-value ping-pong mailbox entry for a single RTCM3 message type."""
+    msg_type: int
+    frame: Optional[bytes]
+    rx_monotonic: float
+    last_tx_monotonic: float = 0.0
+    superseded_count: int = 0
+
+
 class E220Pacer:
     def __init__(
         self,
@@ -208,6 +229,7 @@ class E220Pacer:
         compress_logs: bool = True,
         no_csv: bool = False,
         no_interleave: bool = False,
+        macro_cycle_s: int = DEFAULT_MACRO_CYCLE_S,
     ):
         self.port_name = port
         self.baud = baud
@@ -223,6 +245,7 @@ class E220Pacer:
         self.channel = channel
         self.verbose = verbose
         self.quiet = quiet
+        self.macro_cycle_s = max(2, int(macro_cycle_s))
         self.ser: Optional[serial.Serial] = None
         self.gpio_available = GPIO is not None
         self.rssi_reg_enabled = False
@@ -296,23 +319,22 @@ class E220Pacer:
         self.backlog_shed_frames = 0
         self.rtcm_stats: dict[int, int] = {}
 
-        # Adaptive Constellation Interleaver State (Closed-Loop Airtime Budgeting)
+        # Architecture 2B Ping-Pong Latest-Value Mailboxes & Coalescing Telemetry
         self.enable_interleave = not no_interleave
+        self._mailbox_lock = threading.Lock()
+        self._mailbox_event = threading.Event()
+        self._mailboxes: dict[int, MailboxSlot] = {}
+        self.mailbox_superseded = 0
+        self.mailbox_stale_dropped = 0
+        self.coalesced_batches = 0
+        self.coalesced_frames = 0
+        self.mailbox_max_age_ms = 0.0
         self.seen_secondary_types: set[int] = set()
-        self.epoch_counter = 0
-        self.last_epoch_start_time = 0.0
-        self.last_msm_type: int = 0
-        self.head_frame_approved: bool = False
         self.interleave_dropped_frames = 0
-        self.msm_last_len: dict[int, int] = {1074: 232, 1084: 150, 1094: 335, 1124: 240}
-        self.msm_epochs_since_tx: dict[int, int] = {1074: 0}
-        self.epoch_target_msm: int = 1074
-        self.epoch_msm_sent: bool = False
         self.sec_tx_utc: int = 0
         self.sec_tx_count: int = 0
-        self.sec_msm_count: int = 0
 
-        # Phase 9: Empty MSM Dropper & GPS-Disciplined 5s Superframe Synchronous Switch State
+        # Empty MSM Dropper & GPS-Disciplined Synchronous Switch State
         self.empty_msm_dropped = 0
         self.pending_switch_ack_frame: Optional[bytes] = None
         self.pending_switch_ack_sent: bool = False
@@ -326,21 +348,43 @@ class E220Pacer:
     def estimate_subpacket_air_s(self, n_bytes: int) -> float:
         """
         Estimate single-subpacket LoRa Time-on-Air (seconds) for E220-900T30S (LLCC68).
-        Calibrated directly against Test _022 and _039 hardware AUX_low / tail telemetry:
-          - @ >= 9.6 kbps: eff ~ 0.68, preamble 0.016s (200B @ 19.2k -> 148.4ms)
-          - @ <= 4.8 kbps: eff ~ 0.60, preamble 0.022s (200B @ 4.8k -> 622.0ms, 41B -> 180.3ms)
+        Calibrated against Stage 1 hardware bench measurements (docs/benchmarks/e220_stage1_20261116/):
+          - <= 3.0 kbps (2.4k):   0.095 + 0.00360 * n
+          - <= 5.0 kbps (4.8k):   0.070 + 0.00187 * n  (200B -> 444.0ms, real 442.8ms)
+          - <= 10.0 kbps (9.6k):  0.045 + 0.00119 * n  (200B -> 283.0ms)
+          - <= 20.0 kbps (19.2k): 0.029 + 0.00080 * n  (200B -> 189.0ms)
+          - >  20.0 kbps (38.4k): 0.022 + 0.00050 * n  (200B -> 122.0ms)
         """
         if n_bytes <= 0:
             return 0.0
-        rate_bps = max(self.air_rate_kbps, 2.4) * 1000.0
+        n = float(n_bytes)
+        if self.air_rate_kbps <= 3.0:
+            return 0.095 + 0.00360 * n
         if self.air_rate_kbps <= 5.0:
-            return 0.022 + ((float(n_bytes) + 16.0) * 8.0) / (rate_bps * 0.60)
-        return 0.016 + ((float(n_bytes) + 16.0) * 8.0) / (rate_bps * 0.68)
+            return 0.070 + 0.00187 * n
+        if self.air_rate_kbps <= 10.0:
+            return 0.045 + 0.00119 * n
+        if self.air_rate_kbps <= 20.0:
+            return 0.029 + 0.00080 * n
+        return 0.022 + 0.00050 * n
+
+    def estimate_frame_air_s(self, total_len: int) -> float:
+        """Estimate total multi-subpacket LoRa airtime (seconds) across all subpackets."""
+        if total_len <= 0:
+            return 0.0
+        pkt_sz = max(int(self.packet_size), 32)
+        rem = total_len
+        total_air_s = 0.0
+        while rem > 0:
+            chunk = min(rem, pkt_sz)
+            total_air_s += self.estimate_subpacket_air_s(chunk)
+            rem -= chunk
+        return total_air_s
 
     def _get_effective_guard_delay_s(self) -> float:
-        """Enforces >= 50ms inter-frame guard delay at <= 4.8 kbps for Rover UART drain and PLL turn-around."""
+        """Enforces >= 35ms inter-frame guard at <= 5.0 kbps, default 30ms at >= 9.6 kbps."""
         if self.air_rate_kbps <= 5.0:
-            return max(self.guard_delay_s, 0.050)
+            return max(self.guard_delay_s, 0.035)
         return self.guard_delay_s
 
     @staticmethod
@@ -487,12 +531,12 @@ class E220Pacer:
         finally:
             cfg_ser.close()
 
-        # 2. Return to Transparent Mode 0 (M0=0, M1=0)
+        # 2. Return to Transparent Mode 0 (M0=0, M1=0) and allow Mode 3->Mode 0 settle (>= 55ms + AUX HIGH)
         GPIO.output(self.pin_m0, GPIO.LOW)
         GPIO.output(self.pin_m1, GPIO.LOW)
-        time.sleep(0.06)
+        time.sleep(0.025)
         self.wait_aux(2.0)
-        time.sleep(0.04)
+        time.sleep(0.055)
         return eeprom_ok
 
     def probe_ambient_noise(self) -> None:
@@ -670,7 +714,7 @@ class E220Pacer:
             if rem_air_s > 0.0:
                 time.sleep(rem_air_s)
 
-            eff_guard_s = max(self._get_effective_guard_delay_s(), 0.052 if self.air_rate_kbps <= 9.6 else 0.040)
+            eff_guard_s = self._get_effective_guard_delay_s()
             time.sleep(eff_guard_s)
             detail = (
                 f"1 pkt | EstAir={est_air_s*1000:.1f}ms"
@@ -683,12 +727,12 @@ class E220Pacer:
             # Supports 2 subpackets (201..400B) or 3+ subpackets (>400B) cleanly.
             # Subpacket 1 (200B) starts RF TX while trailing subpacket(s) drain
             # through UART RAM holding AUX LOW. Enforce both tail wait and full
-            # multi-subpacket ToA floor + >=48ms guard for Rover UART drain.
+            # multi-subpacket calibrated ToA floor + effective guard delay.
             # -----------------------------------------------------------------
             num_subpkts = (total_len + self.packet_size - 1) // self.packet_size
             full_heads = num_subpkts - 1
             tail_len = total_len - (full_heads * self.packet_size)
-            head_est_s = float(full_heads) * self.estimate_subpacket_air_s(self.packet_size)
+            total_air_est_s = self.estimate_frame_air_s(total_len)
             tail_air_s = self.estimate_subpacket_air_s(tail_len)
             aux_dropped = False
             drop_ms = 0.0
@@ -708,23 +752,22 @@ class E220Pacer:
                         self.hardware_reset_e220(f"AUX stuck LOW >{AUX_RISE_WATCHDOG_S}s on {num_subpkts}-pkt {total_len}B")
                     aux_low_s = time.monotonic() - t_low
                     # At <=9.6 kbps, the E220 MCU empties its UART RAM buffer and raises AUX HIGH
-                    # ~100-145ms BEFORE Subpacket 1 (200B) finishes transmitting on RF!
+                    # ~100-147ms BEFORE Subpacket 1 (200B) finishes transmitting on RF!
                     # Enforce both the final subpacket tail wait and full multi-subpacket ToA floor.
                     elapsed_since_flush = time.monotonic() - t_after_flush
-                    total_air_est_s = head_est_s + tail_air_s
                     rem_air_s = max(tail_air_s, total_air_est_s - elapsed_since_flush)
                     time.sleep(rem_air_s)
                 else:
                     # Fallback if AUX edge was missed: sleep full calculated multi-subpacket air time
                     elapsed_since_flush = time.monotonic() - t_after_flush
-                    rem_air_s = max(0.0, (head_est_s + tail_air_s) - elapsed_since_flush)
+                    rem_air_s = max(0.0, total_air_est_s - elapsed_since_flush)
                     if rem_air_s > 0.0:
                         time.sleep(rem_air_s)
             else:
                 rem_air_s = tail_air_s
-                time.sleep(head_est_s + tail_air_s)
+                time.sleep(total_air_est_s)
 
-            eff_guard_s = max(self._get_effective_guard_delay_s(), 0.048)
+            eff_guard_s = self._get_effective_guard_delay_s()
             time.sleep(eff_guard_s)
             pkt_desc = f"2 pkts ({self.packet_size}+{tail_len}B)" if num_subpkts == 2 else f"{num_subpkts} pkts ({full_heads}x{self.packet_size}+{tail_len}B)"
             if aux_dropped:
@@ -741,7 +784,7 @@ class E220Pacer:
             else:
                 detail = (
                     f"{pkt_desc} | "
-                    f"NO-AUX-DROP EstAir={(head_est_s+tail_air_s)*1000:.1f}ms + Guard={eff_guard_s*1000:.0f}ms"
+                    f"NO-AUX-DROP EstAir={total_air_est_s*1000:.1f}ms + Guard={eff_guard_s*1000:.0f}ms"
                 )
 
         total_dt = time.monotonic() - t0
@@ -755,215 +798,199 @@ class E220Pacer:
 
         return (num_subpkts, detail, total_dt)
 
-    def send_rtcm_frame(self, frame: bytes, msg_type: int) -> None:
-        """Transmit a verified, CRC24Q-valid RTCM3 frame and record telemetry."""
-        tot_len = len(frame)
-        _, detail, total_dt = self.send_packet(frame)
-        self.rtcm_stats[msg_type] = self.rtcm_stats.get(msg_type, 0) + 1
+    def send_rtcm_batch(self, items: list[tuple[int, bytes, float]]) -> None:
+        """Transmit 1 or more packed RTCM3 frames (<= packet_size when coalesced) and record telemetry."""
+        if not items:
+            return
+        payload = b"".join(frame for _, frame, _ in items)
+        tot_len = len(payload)
+        _, detail, total_dt = self.send_packet(payload)
+        with self._mailbox_lock:
+            for msg_type, _, _ in items:
+                self.rtcm_stats[msg_type] = self.rtcm_stats.get(msg_type, 0) + 1
 
         if not self.quiet:
-            print(
-                f"[TX RTCM] Type:{msg_type:<4d} ({tot_len:3d}B) -> {detail} | Total={total_dt*1000:5.1f}ms",
-                flush=True,
-            )
-
-    def _max_single_epoch_bytes(self) -> int:
-        """Returns the maximum byte size of a single intact multi-constellation epoch."""
-        msm_sum = sum(
-            self.msm_last_len.get(m, 300)
-            for m in ([1074] + sorted(self.seen_secondary_types))
-        )
-        return max(1024, msm_sum + 96)
-
-    def _shed_stale_backlog(self, buffer: bytearray) -> None:
-        """
-        If TCP input ever accumulates >2048B of stale epochs (e.g. after a momentary stall),
-        shed older MSM frames on clean RTCM3 boundaries while preserving 1005/1006/1230 ARP/biases.
-        """
-        preserved = bytearray()
-        idx = 0
-        shed = 0
-        n = len(buffer)
-        keep_bytes = self._max_single_epoch_bytes()
-        while idx + 6 <= n and (n - idx) > keep_bytes:
-            if buffer[idx] != 0xD3 or (buffer[idx + 1] & 0xFC) != 0:
-                idx += 1
-                continue
-            plen = ((buffer[idx + 1] & 0x03) << 8) | buffer[idx + 2]
-            flen = plen + 6
-            if plen < 6 or plen > 1023 or (idx + flen) > n:
-                break
-            candidate = bytes(buffer[idx : idx + flen])
-            if rtcm_crc24q(candidate) == 0:
-                mtype = (candidate[3] << 4) | (candidate[4] >> 4)
-                if mtype in (1005, 1006, 1230):
-                    preserved.extend(candidate)
-                else:
-                    shed += 1
-                idx += flen
-            else:
-                idx += 1
-
-        if idx > 0:
-            remaining = bytes(buffer[idx:])
-            buffer.clear()
-            buffer.extend(preserved)
-            buffer.extend(remaining)
-            self.head_frame_approved = False
-            if shed > 0:
-                self.backlog_shed_frames += shed
+            if len(items) == 1:
+                msg_type, _, age_ms = items[0]
                 print(
-                    f"[WARN] Shed {shed} stale queued MSM frames to keep RTCM differential age real-time (<1s).",
+                    f"[TX RTCM] Type:{msg_type:<4d} ({tot_len:3d}B, age:{age_ms:4.0f}ms) -> {detail} | Total={total_dt*1000:5.1f}ms",
+                    flush=True,
+                )
+            else:
+                desc = "+".join(f"{m}({len(f)}B)" for m, f, _ in items)
+                max_age = max(age_ms for _, _, age_ms in items)
+                print(
+                    f"[TX RTCM] Coalesced[{desc}] ({tot_len:3d}B, age:{max_age:4.0f}ms) -> {detail} | Total={total_dt*1000:5.1f}ms",
                     flush=True,
                 )
 
-    def _select_epoch_target_msm(self) -> int:
-        """Selects the priority MSM constellation for this epoch so no constellation ever starves."""
-        self.epoch_msm_sent = False
-        all_types = [1074] + sorted(self.seen_secondary_types)
-        for m in all_types:
-            self.msm_epochs_since_tx[m] = self.msm_epochs_since_tx.get(m, 0) + 1
+    def send_rtcm_frame(self, frame: bytes, msg_type: int) -> None:
+        """Transmit a verified, CRC24Q-valid RTCM3 frame and record telemetry."""
+        self.send_rtcm_batch([(msg_type, frame, 0.0)])
 
-        if not self.seen_secondary_types:
-            self.epoch_target_msm = 1074
-            return self.epoch_target_msm
-
-        secondaries = sorted(self.seen_secondary_types)
-        best_secondary = max(secondaries, key=lambda m: (self.msm_epochs_since_tx.get(m, 0), -m))
-
-        if self.air_rate_kbps <= 4.8:
-            if (self.epoch_counter % 2) == 0 or self.msm_epochs_since_tx.get(1074, 0) >= 2:
-                self.epoch_target_msm = 1074
+    def _deposit_mailbox_frame(self, msg_type: int, frame: bytes, rx_now: float) -> None:
+        """Deposit a CRC24Q-verified RTCM3 frame into its latest-value ping-pong mailbox."""
+        with self._mailbox_lock:
+            if msg_type in (1084, 1094, 1124):
+                self.seen_secondary_types.add(msg_type)
+            slot = self._mailboxes.get(msg_type)
+            if slot is None:
+                self._mailboxes[msg_type] = MailboxSlot(
+                    msg_type=msg_type,
+                    frame=frame,
+                    rx_monotonic=rx_now,
+                )
             else:
-                self.epoch_target_msm = best_secondary
-        elif self.air_rate_kbps <= 10.0:
-            if self.msm_epochs_since_tx.get(1074, 0) >= 2:
-                self.epoch_target_msm = 1074
-            else:
-                self.epoch_target_msm = best_secondary
-        else:
-            starved = [m for m in all_types if self.msm_epochs_since_tx.get(m, 0) >= 2]
-            if starved:
-                self.epoch_target_msm = max(starved, key=lambda m: (self.msm_epochs_since_tx.get(m, 0), -m))
-            else:
-                self.epoch_target_msm = 1074
+                if slot.frame is not None:
+                    slot.superseded_count += 1
+                    self.mailbox_superseded += 1
+                slot.frame = frame
+                slot.rx_monotonic = rx_now
+        self._mailbox_event.set()
 
-        return self.epoch_target_msm
+    def _clear_pending_mailboxes(self) -> None:
+        """Discard untransmitted mailbox frames on rate transition while preserving starvation history."""
+        with self._mailbox_lock:
+            dropped = 0
+            for slot in self._mailboxes.values():
+                if slot.frame is not None:
+                    slot.frame = None
+                    dropped += 1
+            if dropped > 0:
+                self.backlog_shed_frames += dropped
 
-    def should_send_rtcm_frame(self, msg_type: int) -> bool:
+    def _pop_next_tx_batch(self, remaining_window_ms: float) -> list[tuple[int, bytes, float]]:
         """
-        Adaptive Constellation Interleaver (Closed-Loop Airtime Budgeting):
-        Selects candidate MSM constellations based on active air-rate and starvation age,
-        then pairs with closed-loop airtime admission and reservation checks in process_stream()
-        so any satellite count or constellation count fits cleanly inside each superframe second.
+        Pop the highest-priority pending mailbox frame that fits inside remaining_window_ms,
+        coalescing additional <= packet_size frames while combined length <= packet_size and
+        combined ToA fits inside remaining_window_ms.
         """
-        if msg_type in (1005, 1006, 1033, 1230):
-            return True
+        if remaining_window_ms <= 0.0:
+            return []
 
-        now = time.monotonic()
-        if msg_type in (1074, 1084, 1094, 1124):
-            is_new_epoch = (
-                msg_type == 1074
-                or self.last_msm_type == 0
-                or msg_type <= self.last_msm_type
-                or (now - self.last_epoch_start_time) >= 1.500
-            )
-            self.last_msm_type = msg_type
-            if is_new_epoch:
-                self.epoch_counter += 1
-                self.last_epoch_start_time = now
-                self._select_epoch_target_msm()
+        max_window_ms = (
+            float(max(1, self.macro_cycle_s - 1)) * 1000.0
+            + self._get_sec0_downlink_cutoff_ms()
+        )
 
-        if msg_type in (1084, 1094, 1124):
-            self.seen_secondary_types.add(msg_type)
-            if msg_type not in self.msm_epochs_since_tx:
-                self.msm_epochs_since_tx[msg_type] = 1
+        with self._mailbox_lock:
+            now = time.monotonic()
 
-        if not self.enable_interleave or self.air_rate_kbps >= 19.2:
-            return True
+            # 1. Expire stale untransmitted payloads (2.5s dynamic MSM, 15s static station metadata)
+            for slot in self._mailboxes.values():
+                if slot.frame is None:
+                    continue
+                ttl = STALE_STATIC_TTL_S if slot.msg_type in STATIC_RTCM_TYPES else STALE_FRAME_TTL_S
+                if (now - slot.rx_monotonic) > ttl:
+                    slot.frame = None
+                    self.mailbox_stale_dropped += 1
 
-        if self.air_rate_kbps <= 4.8:
-            # Allow any MSM constellation until one MSM is sent for this epoch;
-            # process_stream() reserves airtime for epoch_target_msm when it fits,
-            # and opportunistically admits a smaller secondary (e.g. 1084) in Second 0
-            # or late Seconds 1..4 when epoch_target_msm exceeds cutoff_ms.
-            return not self.epoch_msm_sent
+            # 2. Gather fitting pending slots ordered cleanly by tier, starvation age, and message type
+            candidates: list[tuple[tuple[int, float, int], MailboxSlot]] = []
+            for slot in self._mailboxes.values():
+                if slot.frame is None:
+                    continue
+                est_toa_ms = self._estimate_frame_toa_ms(len(slot.frame))
+                if est_toa_ms > max_window_ms:
+                    slot.frame = None
+                    self.mailbox_stale_dropped += 1
+                    continue
+                if est_toa_ms > remaining_window_ms:
+                    continue
 
-        # 9.6 kbps: admit GPS (1074) plus the target/most-starved secondary constellation;
-        # closed-loop airtime reservation and Fit-or-Skip checks decide exact pairing.
-        if msg_type == 1074:
-            return True
+                is_static = 0 if slot.msg_type in STATIC_RTCM_TYPES else 1
+                if is_static == 0:
+                    # Oldest pending static metadata frame first
+                    rank_val = -(now - slot.rx_monotonic)
+                elif self.enable_interleave:
+                    # Starvation-fair round robin anchored toward GPS (1074)
+                    starve_s = (now - slot.last_tx_monotonic) if slot.last_tx_monotonic > 0.0 else 9999.0
+                    if slot.msg_type == 1074:
+                        starve_s += 0.35
+                    rank_val = -starve_s
+                else:
+                    rank_val = slot.rx_monotonic
+                candidates.append(((is_static, rank_val, slot.msg_type), slot))
 
-        if msg_type in (1084, 1094, 1124):
-            if not self.seen_secondary_types:
-                return True
-            if self.epoch_target_msm != 1074:
-                return msg_type == self.epoch_target_msm
-            sec_m = max(
-                sorted(self.seen_secondary_types),
-                key=lambda m: (self.msm_epochs_since_tx.get(m, 0), -m),
-            )
-            return msg_type == sec_m
+            if not candidates:
+                return []
 
-        return True
+            candidates.sort(key=lambda pair: pair[0])
+            head = candidates[0][1]
+            assert head.frame is not None
 
-    def _is_terminal_burst_msg(self, msg_type: int) -> bool:
-        """Determines if msg_type is the final MSM constellation frame in the incoming epoch burst."""
-        if msg_type == 1124:
-            return True
-        if msg_type == 1094 and 1124 not in self.seen_secondary_types:
-            return True
-        if msg_type == 1084 and 1094 not in self.seen_secondary_types and 1124 not in self.seen_secondary_types:
-            if self.epoch_counter > 1 or self.rtcm_stats.get(1094, 0) == 0:
-                return True
-        if msg_type == 1074 and not self.seen_secondary_types and self.epoch_counter > 1:
-            return True
-        return False
+            batch_slots: list[MailboxSlot] = [head]
+            batch_len = len(head.frame)
+
+            # 3. Smart <= packet_size (200B) Coalescing into a single Regime-A UART write
+            if batch_len <= self.packet_size:
+                for _, cand in candidates[1:]:
+                    assert cand.frame is not None
+                    cand_len = batch_len + len(cand.frame)
+                    if cand_len > self.packet_size:
+                        continue
+                    if self._estimate_frame_toa_ms(cand_len) > remaining_window_ms:
+                        continue
+                    batch_slots.append(cand)
+                    batch_len = cand_len
+
+            result: list[tuple[int, bytes, float]] = []
+            for slot in batch_slots:
+                assert slot.frame is not None
+                age_ms = max(0.0, (now - slot.rx_monotonic) * 1000.0)
+                if age_ms > self.mailbox_max_age_ms:
+                    self.mailbox_max_age_ms = age_ms
+                result.append((slot.msg_type, slot.frame, age_ms))
+                slot.frame = None
+                slot.last_tx_monotonic = now
+
+            if len(result) > 1:
+                self.coalesced_batches += 1
+                self.coalesced_frames += len(result)
+
+            return result
 
     def _get_superframe_timing(self) -> tuple[int, int, float]:
-        """Returns (utc_sec, superframe_sec [0..4], ms_in_sec [0..1000)) anchored to NTP/GPS wall-clock."""
+        """Returns (utc_sec, macro_sec [0..macro_cycle_s-1], ms_in_sec [0..1000)) anchored to wall-clock."""
         now_wall = time.time()
         utc_sec = int(now_wall)
-        superframe_sec = utc_sec % 5
+        superframe_sec = utc_sec % self.macro_cycle_s
         ms_in_sec = (now_wall - float(utc_sec)) * 1000.0
         return (utc_sec, superframe_sec, ms_in_sec)
 
     def _get_sec0_downlink_cutoff_ms(self) -> float:
-        """Returns the Second 0 Base Downlink TX cutoff in milliseconds for the active air-rate."""
-        return 700.0 if self.air_rate_kbps <= 9.6 else 740.0
+        """Returns the Second 0 Base Downlink TX cutoff (ms) leaving >=50ms before Rover uplink."""
+        if self.air_rate_kbps <= 5.0:
+            return 450.0
+        if self.air_rate_kbps <= 10.0:
+            return 620.0
+        return 680.0
 
-    def _get_sec1_to_4_downlink_cutoff_ms(self, sf_sec: int = 1) -> float:
-        """Returns the Seconds 1..4 downlink cutoff in ms.
-
-        At >= 9.6 kbps (or after 1 MSM is already sent in the current second),
-        cap at 850.0 ms so 850..1000 ms stays clear for collision-free RSSI.
-        At <= 4.8 kbps, 1 MSM spans 855..1468 ms and must be allowed to spill once
-        into the next second, capped at 1750 ms in Seconds 1..3 and 1680 ms in
-        Second 4 so spillover never reaches the Second 0 720..800 ms uplink slot.
+    def _get_remaining_downlink_ms(self) -> float:
         """
-        if self.air_rate_kbps > 5.0 or self.sec_msm_count > 0:
-            return 850.0
-        return 1680.0 if sf_sec == 4 else 1750.0
+        Compute continuous remaining downlink TX budget (ms) before the consolidated Second 0
+        pause cutoff or an impending synchronous air-rate switch (Second 1 ACK / Second 2 Mode 3).
+        Seconds 1..(macro_cycle_s - 1) stay 100% unbroken downlink with zero end-of-second pauses.
+        """
+        utc_sec, sf_sec, ms_in_sec = self._get_superframe_timing()
+        if self.pending_switch_exec_sec > 0:
+            if utc_sec >= self.pending_switch_ack_sec:
+                return 0.0
+            return max(0.0, float(self.pending_switch_ack_sec - utc_sec) * 1000.0 - ms_in_sec)
+
+        cutoff_ms = self._get_sec0_downlink_cutoff_ms()
+        if sf_sec == 0:
+            return max(0.0, cutoff_ms - ms_in_sec)
+        secs_until_sec0 = self.macro_cycle_s - sf_sec
+        return (float(secs_until_sec0) * 1000.0 - ms_in_sec) + cutoff_ms
 
     def _estimate_frame_toa_ms(self, frame_len: int) -> float:
-        """Estimates total UART + RF Time-on-Air + multi-subpacket handover/guard delay in ms."""
+        """Estimate total UART + Stage-1-calibrated RF Time-on-Air + effective guard delay in ms."""
         if frame_len <= 0:
             return 0.0
-        pkt_sz = max(int(self.packet_size), 32)
-        rem = frame_len
-        air_s = 0.0
-        num_subpkts = 0
-        while rem > 0:
-            chunk = min(rem, pkt_sz)
-            air_s += self.estimate_subpacket_air_s(chunk)
-            rem -= chunk
-            num_subpkts += 1
+        air_s = self.estimate_frame_air_s(frame_len)
         uart_s = (float(frame_len) * 10.0) / max(float(self.baud), 9600.0)
         guard_s = self._get_effective_guard_delay_s()
-        if num_subpkts >= 2:
-            guard_s = max(guard_s, 0.048) + 0.008 * float(num_subpkts - 1)
-        else:
-            guard_s = max(guard_s, 0.052 if self.air_rate_kbps <= 9.6 else 0.040)
         return (air_s + uart_s + guard_s) * 1000.0
 
     @staticmethod
@@ -1039,45 +1066,16 @@ class E220Pacer:
                 )
             else:
                 print(f"[ERROR] Failed to reconfigure Base E220 to {target_rate}k! Staying on {prev_rate}k.", flush=True)
-            if buffer is not None and len(buffer) > 0:
-                self._shed_stale_backlog(buffer)
+            self._clear_pending_mailboxes()
 
         return self.pending_switch_exec_sec > 0 and utc_sec < self.pending_switch_exec_sec
 
     def _service_superframe_events(self, buffer: Optional[bytearray] = None) -> bool:
-        """
-        Enforces GPS-disciplined 5-second superframe TDMA:
-          - Seconds 1..4: 100% Base Downlink (after synchronous Second 1 ACK train & Second 2 switch if scheduled)
-          - Second 0: Downlink cutoff @ 700ms (<=9.6k) or 740ms (>=19.2k), then silent RX window until Second 1.
-        Returns True if RTCM downlink TX must hold (Second 1 pending synchronous Second 2 air-rate switch).
-        """
-        if self._drive_pending_rate_switch(buffer):
-            return True
-
-        _, superframe_sec, ms_in_sec = self._get_superframe_timing()
-        cutoff_ms = self._get_sec0_downlink_cutoff_ms()
-        if superframe_sec == 0 and ms_in_sec >= cutoff_ms:
-            # Enter strict Second 0 half-duplex uplink listening window until Second 1 (zero RTCM TX)
-            while running:
-                cur_sec, cur_sf, _ = self._get_superframe_timing()
-                if cur_sf != 0:
-                    break
-                self.poll_uplink()
-                self._check_watchdog_revert()
-                time.sleep(0.005)
-
-            # Drive queued Second 1 4-ACK train & Second 2 hardware switch if triggered in Second 0
-            if self._drive_pending_rate_switch(buffer):
-                return True
-
-            # Shed stale queued RTCM backlog at lower air rates to keep differential age fresh
-            if buffer is not None and len(buffer) > self._max_single_epoch_bytes() and self.air_rate_kbps <= 9.6:
-                self._shed_stale_backlog(buffer)
-
-        return False
+        """Service pending rate switches during synchronous Second 1/Second 2 windows."""
+        return self._drive_pending_rate_switch(buffer)
 
     def _enforce_quiet_window(self, buffer: bytearray) -> None:
-        """Legacy helper replaced by _service_superframe_events(); retained for backlog shedding."""
+        """Legacy helper retained cleanly for callers expecting rate switch servicing."""
         self._service_superframe_events(buffer)
 
     def _write_atomic_json(self, data: dict) -> None:
@@ -1359,7 +1357,7 @@ class E220Pacer:
         exec_sec = t0_sec + 2
 
         print(
-            f"[LORA SWITCH] Received switch request in T0={t0_sec} (SF={t0_sec % 5}): "
+            f"[LORA SWITCH] Received switch request in T0={t0_sec} (MC={t0_sec % self.macro_cycle_s}): "
             f"{self.air_rate_kbps}k -> {target_rate}k (Req #{req_id}, CH{target_chan}) | "
             f"ACK@T0+1, Switch@T0+2",
             flush=True,
@@ -1432,305 +1430,191 @@ class E220Pacer:
             elif msg_id == MSG_ID_REQ_SWITCH and tot_len == 10:
                 self._handle_rate_switch_request(cand)
 
-    def process_stream(self, read_fn) -> None:
-        """Main loop: consumes RTKBase stream, verifies RTCM3 CRC24Q, and paces intact frames to E220."""
-        buffer = bytearray()
-        last_report = time.monotonic()
-        last_rx_data_time = time.monotonic()
-
-        while running:
-            # Service GPS-disciplined 5-second superframe TDMA, uplink polling, and synchronous switches
-            switch_hold = self._service_superframe_events(buffer)
-            self.poll_uplink()
-            self._check_watchdog_revert()
-
-            data = read_fn()
-            now = time.monotonic()
-            if data:
-                buffer.extend(data)
+    def _ingest_rtcm_bytes(self, buffer: bytearray, data: bytes, last_rx_data_time: float) -> float:
+        """
+        Parse incoming RTCM3 bytes cleanly on the ingress thread, verify CRC24Q, drop empty
+        MSMs, and deposit verified frames directly into latest-value ping-pong mailboxes.
+        """
+        now = time.monotonic()
+        if data:
+            with self._mailbox_lock:
                 self.total_bytes_in += len(data)
-                last_rx_data_time = now
+            buffer.extend(data)
+            last_rx_data_time = now
 
-            if len(buffer) > max(2048, self._max_single_epoch_bytes() * 2):
-                self._shed_stale_backlog(buffer)
-
-            sec0_cutoff_reached = False
-            sec_end_rssi_window_reached = False
-            sec_end_target_utc_sec = 0
-            while not switch_hold and len(buffer) >= 3:
-                if self._service_superframe_events(buffer):
-                    switch_hold = True
-                    break
-
-                # 1. Sync strictly to RTCM3 preamble 0xD3 (never transmit non-RTCM orphan bytes over LoRa)
-                if buffer[0] != 0xD3:
-                    d3_idx = buffer.find(b"\xd3")
-                    if d3_idx == -1:
+        while len(buffer) >= 3:
+            # 1. Sync strictly to RTCM3 preamble 0xD3 (never transmit non-RTCM orphan bytes over LoRa)
+            if buffer[0] != 0xD3:
+                d3_idx = buffer.find(b"\xd3")
+                if d3_idx == -1:
+                    with self._mailbox_lock:
                         self.src_orphan_bytes += len(buffer)
-                        buffer.clear()
-                        break
-                    else:
-                        self.src_orphan_bytes += d3_idx
-                        del buffer[:d3_idx]
-                        if len(buffer) < 3:
-                            break
+                    buffer.clear()
+                    break
+                with self._mailbox_lock:
+                    self.src_orphan_bytes += d3_idx
+                del buffer[:d3_idx]
+                if len(buffer) < 3:
+                    break
 
-                # 2. Validate 6 zero reserved bits and 10-bit payload length [6..1023]
-                if (buffer[1] & 0xFC) != 0x00:
+            # 2. Validate 6 zero reserved bits and 10-bit payload length [6..1023]
+            if (buffer[1] & 0xFC) != 0x00:
+                with self._mailbox_lock:
                     self.src_orphan_bytes += 1
-                    del buffer[:1]
-                    continue
+                del buffer[:1]
+                continue
 
-                payload_len = ((buffer[1] & 0x03) << 8) | buffer[2]
-                if payload_len < 6 or payload_len > 1023:
+            payload_len = ((buffer[1] & 0x03) << 8) | buffer[2]
+            if payload_len < 6 or payload_len > 1023:
+                with self._mailbox_lock:
                     self.src_orphan_bytes += 1
-                    del buffer[:1]
-                    continue
+                del buffer[:1]
+                continue
 
-                total_frame_len = payload_len + 6
+            total_frame_len = payload_len + 6
 
-                # 3. Wait for complete frame; if incomplete for >350ms, step past false 0xD3 without TXing garbage
-                if len(buffer) < total_frame_len:
-                    if (now - last_rx_data_time) >= 0.350:
+            # 3. Wait for complete frame; if incomplete for >350ms, step past false 0xD3
+            if len(buffer) < total_frame_len:
+                if (now - last_rx_data_time) >= 0.350:
+                    with self._mailbox_lock:
                         self.src_orphan_bytes += 1
-                        del buffer[:1]
-                        continue
-                    break
-
-                # 4. Verify 24-bit CRC24Q before spending LoRa airtime
-                frame = bytes(buffer[:total_frame_len])
-                msg_type = (frame[3] << 4) | (frame[4] >> 4)
-                if rtcm_crc24q(frame) != 0:
-                    self.src_crc_errors += 1
-                    print(
-                        f"[WARN] Dropped corrupt source RTCM candidate Type:{msg_type} ({total_frame_len}B, bad CRC24Q)",
-                        flush=True,
-                    )
                     del buffer[:1]
                     continue
+                break
 
-                # 4b. Filter empty MSM frames (<= 28B) before spending LoRa airtime
-                if is_empty_msm_frame(frame, msg_type):
-                    del buffer[:total_frame_len]
-                    self.empty_msm_dropped += 1
-                    if self.verbose:
-                        print(
-                            f"[EMPTY MSM] Dropped empty Type:{msg_type} ({total_frame_len}B <= 28B)",
-                            flush=True,
-                        )
-                    continue
-
-                # 4c. Adaptive Constellation Interleaver (evaluated BEFORE cutoff checks so skipped
-                #     frames are discarded immediately in 0ms without stalling or queuing stale epochs)
-                if msg_type in (1074, 1084, 1094, 1124):
-                    self.msm_last_len[msg_type] = total_frame_len
-
-                if not self.head_frame_approved:
-                    if not self.should_send_rtcm_frame(msg_type):
-                        del buffer[:total_frame_len]
-                        self.interleave_dropped_frames += 1
-                        if self.verbose:
-                            print(
-                                f"[INTERLEAVE] Skipped Type:{msg_type:<4d} in Epoch #{self.epoch_counter} "
-                                f"to conserve {self.air_rate_kbps}k channel bandwidth",
-                                flush=True,
-                            )
-                        if self._is_terminal_burst_msg(msg_type):
-                            self._service_superframe_events(buffer)
-                            if len(buffer) > self._max_single_epoch_bytes() and self.air_rate_kbps <= 9.6:
-                                self._shed_stale_backlog(buffer)
-                            if not buffer:
-                                break
-                        continue
-                    self.head_frame_approved = True
-
-                # 4d. Closed-Loop Airtime Budget, Constellation Reservation & TDD Cutoff Guards:
-                #     - Second 0: hold/skip before 700ms/740ms so Second 0 uplink slot stays clear.
-                #     - Seconds 1..4 (>= 9.6 kbps): enforce 850ms ceiling on follow-on frames and
-                #       late leads >= 180ms so frames never bleed across seconds or build backlogs.
-                #     - Seconds 1..4 (<= 4.8 kbps): permit 1 MSM up to 1750ms (Sec 1..3) or 1680ms
-                #       (Sec 4) while capping follow-on/non-MSM frames at 850ms and admitting a
-                #       smaller secondary MSM when epoch_target_msm cannot fit cutoff_ms.
-                utc_sec, sf_sec, ms_in_sec = self._get_superframe_timing()
-                if utc_sec != self.sec_tx_utc:
-                    self.sec_tx_utc = utc_sec
-                    self.sec_tx_count = 0
-                    self.sec_msm_count = 0
-                est_toa_ms = self._estimate_frame_toa_ms(total_frame_len)
-                cutoff_ms = (
-                    self._get_sec0_downlink_cutoff_ms()
-                    if sf_sec == 0
-                    else self._get_sec1_to_4_downlink_cutoff_ms(sf_sec)
-                )
-
-                if (
-                    self.enable_interleave
-                    and self.air_rate_kbps <= 4.8
-                    and msg_type in (1074, 1084, 1094, 1124)
-                ):
-                    if self.epoch_msm_sent:
-                        del buffer[:total_frame_len]
-                        self.head_frame_approved = False
-                        self.interleave_dropped_frames += 1
-                        continue
-                    if msg_type < self.epoch_target_msm:
-                        target_len = self.msm_last_len.get(self.epoch_target_msm, 320)
-                        target_toa_ms = self._estimate_frame_toa_ms(target_len)
-                        if (ms_in_sec + target_toa_ms) <= cutoff_ms:
-                            del buffer[:total_frame_len]
-                            self.head_frame_approved = False
-                            self.interleave_dropped_frames += 1
-                            if self.verbose:
-                                print(
-                                    f"[INTERLEAVE] Yielded Type:{msg_type:<4d} ({total_frame_len}B, {est_toa_ms:.0f}ms) "
-                                    f"to reserve {self.air_rate_kbps}k slot for Type:{self.epoch_target_msm} ({target_toa_ms:.0f}ms)",
-                                    flush=True,
-                                )
-                            continue
-                elif (
-                    self.enable_interleave
-                    and msg_type in (1074, 1084, 1094, 1124)
-                    and msg_type != self.epoch_target_msm
-                    and self.msm_epochs_since_tx.get(self.epoch_target_msm, 0) >= 1
-                    and msg_type < self.epoch_target_msm
-                ):
-                    target_len = self.msm_last_len.get(self.epoch_target_msm, 320)
-                    target_toa_ms = self._estimate_frame_toa_ms(target_len)
-                    if (ms_in_sec + est_toa_ms + target_toa_ms) > cutoff_ms:
-                        del buffer[:total_frame_len]
-                        self.head_frame_approved = False
-                        self.interleave_dropped_frames += 1
-                        if self.verbose:
-                            print(
-                                f"[INTERLEAVE] Yielded Type:{msg_type:<4d} ({total_frame_len}B, {est_toa_ms:.0f}ms) "
-                                f"to reserve {self.air_rate_kbps}k slot for Type:{self.epoch_target_msm} ({target_toa_ms:.0f}ms)",
-                                flush=True,
-                            )
-                        continue
-
-                if sf_sec == 0 and (ms_in_sec + est_toa_ms) > cutoff_ms:
-                    if msg_type in (1074, 1084, 1094, 1124):
-                        del buffer[:total_frame_len]
-                        self.head_frame_approved = False
-                        self.interleave_dropped_frames += 1
-                        if self.verbose:
-                            print(
-                                f"[SEC0 SKIP] Skipped Type:{msg_type:<4d} ({total_frame_len}B, {est_toa_ms:.0f}ms) "
-                                f"at {ms_in_sec:.0f}ms > {cutoff_ms:.0f}ms",
-                                flush=True,
-                            )
-                        if self._is_terminal_burst_msg(msg_type) and ms_in_sec >= (cutoff_ms - 100.0):
-                            sec0_cutoff_reached = True
-                            break
-                        continue
-                    sec0_cutoff_reached = True
-                    break
-
-                effective_cutoff_ms = (
-                    850.0
-                    if (sf_sec != 0 and msg_type in (1005, 1006, 1033, 1230))
-                    else cutoff_ms
-                )
-                if (
-                    sf_sec != 0
-                    and (ms_in_sec + est_toa_ms) > effective_cutoff_ms
-                    and (self.sec_tx_count > 0 or ms_in_sec >= 180.0 or self.air_rate_kbps <= 5.0)
-                ):
-                    if msg_type in (1074, 1084, 1094, 1124):
-                        del buffer[:total_frame_len]
-                        self.head_frame_approved = False
-                        self.interleave_dropped_frames += 1
-                        if self.verbose:
-                            print(
-                                f"[BUDGET SKIP] Skipped Type:{msg_type:<4d} ({total_frame_len}B, {est_toa_ms:.0f}ms) "
-                                f"at {ms_in_sec:.0f}ms > {effective_cutoff_ms:.0f}ms",
-                                flush=True,
-                            )
-                        if self._is_terminal_burst_msg(msg_type):
-                            sec_end_rssi_window_reached = True
-                            sec_end_target_utc_sec = utc_sec
-                            break
-                        continue
-                    sec_end_rssi_window_reached = True
-                    sec_end_target_utc_sec = utc_sec
-                    break
-
-                del buffer[:total_frame_len]
-                self.head_frame_approved = False
-
-                self.send_rtcm_frame(frame, msg_type)
-                self.sec_tx_count += 1
-                if msg_type in (1074, 1084, 1094, 1124):
-                    self.sec_msm_count += 1
-                    self.epoch_msm_sent = True
-                    self.msm_epochs_since_tx[msg_type] = 0
-
-                # Poll uplink and watchdog immediately after each frame transmission
-                self.poll_uplink()
-                self._check_watchdog_revert()
-                if self._service_superframe_events(buffer):
-                    switch_hold = True
-                    break
-
-                # End of MSM constellation epoch: shed backlog at lower air rates (Seconds 1..4 stay 100% downlink)
-                if self._is_terminal_burst_msg(msg_type):
-                    if len(buffer) > self._max_single_epoch_bytes() and self.air_rate_kbps <= 9.6:
-                        self._shed_stale_backlog(buffer)
-                    break  # Yield to outer loop for heartbeat reporting and fresh socket reads
-
-                # Poll socket opportunistically between frames so TCP buffer stays fresh
-                more = read_fn()
-                if more:
-                    buffer.extend(more)
-                    self.total_bytes_in += len(more)
-                    last_rx_data_time = time.monotonic()
-
-            if sec0_cutoff_reached:
-                # Hold TX cleanly while polling uplink until Second 0 closes and Second 1 begins
-                while running:
-                    _, cur_sf, cur_ms = self._get_superframe_timing()
-                    if cur_sf != 0:
-                        break
-                    if cur_ms >= self._get_sec0_downlink_cutoff_ms():
-                        self._service_superframe_events(buffer)
-                        break
-                    self.poll_uplink()
-                    self._check_watchdog_revert()
-                    time.sleep(0.005)
-            elif sec_end_rssi_window_reached:
-                # Hold TX cleanly through 850..1000ms so Rover can poll Mode 0 RSSI collision-free
-                while running:
-                    cur_sec, _, _ = self._get_superframe_timing()
-                    if cur_sec != sec_end_target_utc_sec:
-                        break
-                    self.poll_uplink()
-                    self._check_watchdog_revert()
-                    time.sleep(0.005)
-
-            now = time.monotonic()
-            if (now - last_report) >= 5.0:
-                dt = now - last_report
-                rate_in = self.total_bytes_in / dt
-                rate_out = self.total_bytes_out / dt
-                duty_pct = min(100.0, (self.total_wait_time_s / dt) * 100.0)
-                t_str = time.strftime("%H:%M:%S", time.gmtime())
-                frames_summary = ", ".join(f"{t}:{c}" for t, c in sorted(self.rtcm_stats.items())) or "None"
-                uplink_str = f"Uplink:[{self.uplink_packets_received} pkts, {self.rate_switch_count} sw]"
-                interleave_str = f"Interleave:[{self.interleave_dropped_frames} skp]" if self.enable_interleave else "Interleave:[OFF]"
+            # 4. Verify 24-bit CRC24Q before depositing into TX mailbox
+            frame = bytes(buffer[:total_frame_len])
+            msg_type = (frame[3] << 4) | (frame[4] >> 4)
+            if rtcm_crc24q(frame) != 0:
+                with self._mailbox_lock:
+                    self.src_crc_errors += 1
                 print(
-                    f"[{t_str}] [PACER HEARTBEAT] In:{self.total_bytes_in}B ({rate_in:.1f}B/s) | "
-                    f"Out:{self.total_bytes_out}B ({rate_out:.1f}B/s) | "
-                    f"Duty:{duty_pct:.1f}% | RTCM:[{frames_summary}] | "
-                    f"{uplink_str} | {interleave_str} | EmptyMSM:{self.empty_msm_dropped} | "
-                    f"Frames:{self.total_packets_sent} (Subpkts:{self.total_subpackets_sent} "
-                    f"Rst:{self.watchdog_resets} SrcErr:{self.src_crc_errors})",
+                    f"[WARN] Dropped corrupt source RTCM candidate Type:{msg_type} ({total_frame_len}B, bad CRC24Q)",
                     flush=True,
                 )
-                self.total_bytes_in = 0
-                self.total_bytes_out = 0
-                self.total_wait_time_s = 0.0
-                self.rtcm_stats.clear()
-                last_report = now
+                del buffer[:1]
+                continue
+
+            del buffer[:total_frame_len]
+
+            # 4b. Filter empty MSM frames (<= 28B) before spending LoRa airtime
+            if is_empty_msm_frame(frame, msg_type):
+                with self._mailbox_lock:
+                    self.empty_msm_dropped += 1
+                if self.verbose:
+                    print(
+                        f"[EMPTY MSM] Dropped empty Type:{msg_type} ({total_frame_len}B <= 28B)",
+                        flush=True,
+                    )
+                continue
+
+            self._deposit_mailbox_frame(msg_type, frame, now)
+
+        return last_rx_data_time
+
+    def process_stream(self, read_fn) -> None:
+        """
+        Main Arch 2B loop: consumes RTKBase stream asynchronously via ping-pong mailboxes,
+        coalesces small <= packet_size frames, and paces TX across the consolidated N-second
+        macro-cycle while keeping Second 0 clear for Rover uplink and Mode 0 RSSI polling.
+        """
+        last_report = time.monotonic()
+        self._ingress_stop = threading.Event()
+        self._ingress_exc: Optional[BaseException] = None
+        self._mailbox_event.clear()
+
+        def _ingress_worker() -> None:
+            ingress_buf = bytearray()
+            last_rx_data_time = time.monotonic()
+            while running and not self._ingress_stop.is_set():
+                t_read0 = time.monotonic()
+                try:
+                    chunk = read_fn()
+                except Exception as exc:
+                    self._ingress_exc = exc
+                    self._mailbox_event.set()
+                    break
+                now_rx = time.monotonic()
+                if chunk:
+                    last_rx_data_time = self._ingest_rtcm_bytes(ingress_buf, chunk, last_rx_data_time)
+                else:
+                    if ingress_buf and (now_rx - last_rx_data_time) >= 0.350:
+                        last_rx_data_time = self._ingest_rtcm_bytes(ingress_buf, b"", last_rx_data_time)
+                    if (now_rx - t_read0) < 0.002:
+                        time.sleep(0.005)
+
+        ingress_thread = threading.Thread(
+            target=_ingress_worker,
+            name="e220_rtcm_ingress",
+            daemon=True,
+        )
+        ingress_thread.start()
+
+        try:
+            while running:
+                if self._ingress_exc is not None:
+                    raise self._ingress_exc
+
+                if self._drive_pending_rate_switch():
+                    continue
+
+                self.poll_uplink()
+                self._check_watchdog_revert()
+
+                rem_ms = self._get_remaining_downlink_ms()
+                if rem_ms <= 0.0:
+                    # Consolidated Second 0 quiet window: zero downlink TX, fast uplink/watchdog polling
+                    time.sleep(0.005)
+                else:
+                    batch = self._pop_next_tx_batch(rem_ms)
+                    if batch:
+                        self.send_rtcm_batch(batch)
+                        self.sec_tx_count += len(batch)
+                        self.poll_uplink()
+                        self._check_watchdog_revert()
+                    else:
+                        self._mailbox_event.wait(timeout=0.015)
+                        self._mailbox_event.clear()
+
+                now = time.monotonic()
+                if (now - last_report) >= 5.0:
+                    dt = now - last_report
+                    with self._mailbox_lock:
+                        bytes_in = self.total_bytes_in
+                        self.total_bytes_in = 0
+                        rtcm_snapshot = dict(self.rtcm_stats)
+                        self.rtcm_stats.clear()
+                        sup_cnt = self.mailbox_superseded
+                        coal_cnt = self.coalesced_frames
+                        stale_cnt = self.mailbox_stale_dropped
+                        max_age_ms = self.mailbox_max_age_ms
+                        self.mailbox_max_age_ms = 0.0
+                        empty_cnt = self.empty_msm_dropped
+                        src_err = self.src_crc_errors
+
+                    rate_in = bytes_in / dt
+                    rate_out = self.total_bytes_out / dt
+                    duty_pct = min(100.0, (self.total_wait_time_s / dt) * 100.0)
+                    t_str = time.strftime("%H:%M:%S", time.gmtime())
+                    frames_summary = ", ".join(f"{t}:{c}" for t, c in sorted(rtcm_snapshot.items())) or "None"
+                    uplink_str = f"Uplink:[{self.uplink_packets_received} pkts, {self.rate_switch_count} sw]"
+                    mbox_str = f"Mbox:[Sup:{sup_cnt} Coal:{coal_cnt} Stale:{stale_cnt} MaxAge:{max_age_ms:.0f}ms]"
+                    print(
+                        f"[{t_str}] [PACER HEARTBEAT] In:{bytes_in}B ({rate_in:.1f}B/s) | "
+                        f"Out:{self.total_bytes_out}B ({rate_out:.1f}B/s) | "
+                        f"Duty:{duty_pct:.1f}% | RTCM:[{frames_summary}] | "
+                        f"{uplink_str} | {mbox_str} | EmptyMSM:{empty_cnt} | "
+                        f"Frames:{self.total_packets_sent} (Subpkts:{self.total_subpackets_sent} "
+                        f"Rst:{self.watchdog_resets} SrcErr:{src_err})",
+                        flush=True,
+                    )
+                    self.total_bytes_out = 0
+                    self.total_wait_time_s = 0.0
+                    last_report = now
+        finally:
+            self._ingress_stop.set()
+            self._mailbox_event.set()
+            ingress_thread.join(timeout=1.0)
 
 
 def _drain_initial_socket_backlog(sock: socket.socket) -> int:
@@ -1914,7 +1798,14 @@ def main() -> int:
     parser.add_argument("--max-log-mb", type=int, default=50, help="Maximum total megabytes for rover log directory")
     parser.add_argument("--no-compress", action="store_true", help="Disable automatic gzip compression of yesterday's CSV")
     parser.add_argument("--no-csv", action="store_true", help="Disable CSV disk logging (RAM JSON only)")
-    parser.add_argument("--no-interleave", action="store_true", help="Disable adaptive constellation interleaving at <=9.6 kbps air rates")
+    parser.add_argument("--no-interleave", action="store_true", help="Disable starvation-fair MSM interleaving")
+    parser.add_argument(
+        "--macro-cycle-s",
+        type=int,
+        choices=[5, 10],
+        default=DEFAULT_MACRO_CYCLE_S,
+        help="Base TX macro-cycle length in seconds (5s default matches Rover firmware superframe)",
+    )
 
     args = parser.parse_args()
     freq_mhz = 850.125 + args.channel
@@ -1922,7 +1813,7 @@ def main() -> int:
     print(
         f"[INIT] {__app_name__} v{__version__} ({__date__}) starting | Port:{args.port} @ {args.baud} bps | "
         f"Air:{args.air_rate}k | CH:{args.channel} ({freq_mhz:.3f}MHz) | Pwr:{args.power}dBm | "
-        f"Subpkt:{args.packet_size}B | Guard:{int(args.guard_delay * 1000)}ms",
+        f"Subpkt:{args.packet_size}B | Guard:{int(args.guard_delay * 1000)}ms | MacroCycle:{args.macro_cycle_s}s",
         flush=True,
     )
 
@@ -1947,6 +1838,7 @@ def main() -> int:
         compress_logs=not args.no_compress,
         no_csv=args.no_csv,
         no_interleave=args.no_interleave,
+        macro_cycle_s=args.macro_cycle_s,
     )
 
     if args.tcp_connect:

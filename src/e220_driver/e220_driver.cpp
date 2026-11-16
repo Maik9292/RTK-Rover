@@ -46,18 +46,23 @@ static float e220_decode_air_rate_from_reg0(uint8_t reg0)
 
 static uint32_t e220_estimate_tx_air_ms(size_t n_bytes, float air_rate_kbps)
 {
-    float eff = 0.72f;
-    if (air_rate_kbps <= 5.0f) {
-        eff = 0.62f;
+    // Stage 1 silicon-calibrated TX air time (test/_045.._047) + 25ms TX->RX turnaround margin
+    float air_ms;
+    if (air_rate_kbps <= 3.0f) {
+        float eff_bps = air_rate_kbps * 1000.0f * 0.60f;
+        if (eff_bps < 1000.0f) eff_bps = 1000.0f;
+        air_ms = 22.0f + ((float)(n_bytes + 16U) * 8000.0f) / eff_bps;
+    } else if (air_rate_kbps <= 5.0f) {
+        air_ms = 70.0f + 1.87f * (float)n_bytes;
     } else if (air_rate_kbps <= 10.0f) {
-        eff = 0.68f;
+        air_ms = 45.0f + 1.19f * (float)n_bytes;
+    } else if (air_rate_kbps <= 20.0f) {
+        air_ms = 29.0f + 0.80f * (float)n_bytes;
+    } else {
+        float eff_bps = air_rate_kbps * 1000.0f * 0.68f;
+        air_ms = 16.0f + ((float)(n_bytes + 16U) * 8000.0f) / eff_bps;
     }
-    float effective_bps = (air_rate_kbps * 1000.0f) * eff;
-    if (effective_bps < 1000.0f) {
-        effective_bps = 1000.0f;
-    }
-    float air_ms = 18.0f + ((float)(n_bytes + 16U) * 8000.0f) / effective_bps;
-    return (uint32_t)(air_ms + 20.0f);
+    return (uint32_t)(air_ms + 25.0f);
 }
 
 // =========================================================================
@@ -104,9 +109,13 @@ static uint32_t last_terminal_msm_rx_ms = 0;
 static bool     rtcm_in_resync          = false;
 
 static inline uint32_t e220_get_trunc_timeout_ms(void) {
-    if (s_active_air_rate <= 4.8f)  return 1200U;
-    if (s_active_air_rate <= 9.6f)  return 650U;
-    return 280U; // 19.2k, 38.4k, 62.5k
+    // Subpacket-2 inter-byte gap ceiling up to 400B frames:
+    //   4.8k: 847.0 - 442.8 = 404.2ms -> 480ms cleanly quarantines broken heads within 0.5s
+    //   9.6k: 527.2 - 282.8 = 244.4ms -> 380ms
+    //  19.2k: 336.7 - 186.7 = 150.0ms -> 280ms
+    if (s_active_air_rate <= 5.0f)  return 480U;
+    if (s_active_air_rate <= 10.0f) return 380U;
+    return 280U;
 }
 
 static bool e220_get_superframe_clock(uint32_t now_ms,
@@ -137,19 +146,21 @@ extern "C" bool e220_is_uplink_slot_active(uint32_t now_ms)
     if (superframe_sec != 0U) {
         return false;
     }
-    if (s_active_air_rate <= 4.8f) {
-        return (ms_in_sec >= 720U && ms_in_sec <= 800U);
+    // Arch 2B consolidated Second 0 uplink quiet slot (aligned to Base DL cutoffs 450/620/680ms):
+    // Leaves >= 160ms+ after uplink air TX inside Second 0 for 1x collision-free Mode 0 RSSI query.
+    if (s_active_air_rate <= 5.0f) {
+        return (ms_in_sec >= 500U && ms_in_sec <= 660U);
     }
-    if (s_active_air_rate <= 9.6f) {
-        return (ms_in_sec >= 745U && ms_in_sec <= 825U);
+    if (s_active_air_rate <= 10.0f) {
+        return (ms_in_sec >= 670U && ms_in_sec <= 760U);
     }
-    return (ms_in_sec >= 775U && ms_in_sec <= 845U);
+    return (ms_in_sec >= 730U && ms_in_sec <= 810U);
 }
 
 // =========================================================================
 // Non-Blocking Mode 0 Live RSSI / Ambient Noise Register Poll State
-// Queries C0 C1 C2 C3 00 02 once per Second 0 post-uplink quiet window and
-// in the GPS-disciplined end-of-second micro-slot (855..895ms in Seconds 1..4).
+// Queries C0 C1 C2 C3 00 02 once per 5-second macro-cycle strictly inside
+// the Second 0 post-uplink quiet window (no Seconds 1..4 downlink polling).
 // Parses both 4-byte (C1 00 <noise> <pkt>) and 5-byte (C1 00 02 <noise> <pkt>)
 // E220-900T30S replies (requires REG1 Bit 5 = 0x20).
 // =========================================================================
@@ -411,6 +422,71 @@ static bool e220_mode3_sync_read(void)
     return false;
 }
 
+static void e220_exit_mode3_to_mode0(uint32_t baud)
+{
+    // Exit Mode 3 -> Mode 0 BEFORE switching UART baud back to operational 115200 bps,
+    // waiting 25 ms before baud change, 55 ms after, and draining stale Mode 3 RX bytes.
+    e220_set_mode(0, 0);
+    vTaskDelay(pdMS_TO_TICKS(25));
+    Serial0.updateBaudRate(baud);
+    vTaskDelay(pdMS_TO_TICKS(55));
+    e220_wait_aux_high(500);
+    while (Serial0.available()) Serial0.read();
+}
+
+static bool e220_probe_mode0_liveness(uint32_t baud)
+{
+    // Verify the E220 responds to Mode 0 commands at operational baud; if wedged in Mode 3, bounce once.
+    if ((e220_stats.cfg_reg1 & 0x20U) == 0U) {
+        return true;
+    }
+    static const uint8_t kRssiCmd[6] = {0xC0, 0xC1, 0xC2, 0xC3, 0x00, 0x02};
+    for (uint8_t probe_try = 0; probe_try < 2U; ++probe_try) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+        while (Serial0.available()) Serial0.read();
+        e220_suppress_aux_isr = true;
+        Serial0.write(kRssiCmd, sizeof(kRssiCmd));
+        Serial0.flush();
+
+        uint8_t raw[16] = {0};
+        size_t idx = 0;
+        uint32_t t0 = millis();
+        bool alive = false;
+        while (millis() - t0 < 80U && idx < sizeof(raw)) {
+            if (Serial0.available()) {
+                raw[idx++] = (uint8_t)Serial0.read();
+                for (size_t k = 0; k + 5U <= idx; ++k) {
+                    if (raw[k] == 0xC1U && raw[k + 1] == 0x00U && raw[k + 2] == 0x02U) {
+                        alive = true;
+                        break;
+                    }
+                }
+                if (alive || raw[0] == 0xD3U) {
+                    alive = true;
+                    break;
+                }
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(2));
+            }
+        }
+        e220_suppress_aux_isr = false;
+        isr_aux_fall_us = 0;
+        if (alive) {
+            return true;
+        }
+        if (probe_try == 0U) {
+            Serial.printf("[E220 MODE0 WARN] Mode 0 liveness probe timed out (%u B); bouncing Mode 3 -> Mode 0...\n",
+                          (unsigned)idx);
+            e220_set_mode(1, 1);
+            Serial0.updateBaudRate(ROVER_E220_CONFIG_BAUD);
+            vTaskDelay(pdMS_TO_TICKS(40));
+            e220_exit_mode3_to_mode0(baud);
+        }
+    }
+    Serial.println("[E220 MODE0 WARN] Mode 0 liveness probe did not answer after bounce");
+    return false;
+}
+
 extern "C" bool e220_write_default_config_registers(void)
 {
     // Cancel any active Mode 0 RSSI intercept and wait for any in-flight RF TX before Mode 3
@@ -544,13 +620,12 @@ extern "C" bool e220_write_default_config_registers(void)
         }
     }
 
-    // Return to Mode 0 (Transparent: M0=0, M1=0) at configured operational UART baud
-    e220_set_mode(0, 0);
-    Serial0.updateBaudRate(baud);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    while (Serial0.available()) Serial0.read();
+    // Return to Mode 0 (Transparent: M0=0, M1=0) BEFORE restoring operational UART baud + liveness check
+    e220_exit_mode3_to_mode0(baud);
 
-    if (!ok) {
+    if (ok) {
+        e220_probe_mode0_liveness(baud);
+    } else {
         Serial.println("[E220 WRITE FAIL] All 4 Mode 3 write attempts failed! Reading actual hardware REG0...");
         if (e220_read_config_registers()) {
             float actual_rate = e220_decode_air_rate_from_reg0(e220_stats.cfg_reg0);
@@ -565,16 +640,25 @@ extern "C" bool e220_write_default_config_registers(void)
 
 extern "C" bool e220_read_config_registers(void)
 {
-    // 1. Switch E220 to Mode 3 (Config/Sleep: M0=1, M1=1), where E220 speaks 9600 8N1
+    rssi_query_active     = false;
+    rssi_reply_len        = 0;
+    e220_suppress_aux_isr = true;
+    isr_aux_fall_us       = 0;
+    e220_wait_aux_high(300);
+    Serial0.flush();
+
+    // 1. Switch E220 to Mode 3 (Config/Sleep: M0=1, M1=1) BEFORE switching UART to 9600 8N1
     e220_set_mode(1, 1);
     Serial0.updateBaudRate(ROVER_E220_CONFIG_BAUD);
     vTaskDelay(pdMS_TO_TICKS(60));
+    e220_mode3_sync_read();
 
-    uint8_t resp[9] = {0};
+    uint8_t resp[24] = {0};
     int idx = 0;
     bool ok = false;
 
     for (int attempt = 0; attempt < 2 && !ok; attempt++) {
+        vTaskDelay(pdMS_TO_TICKS(20));
         while (Serial0.available()) Serial0.read();
 
         // 2. Send Read Register Command: 0xC1 0x00 0x06 (Read 6 registers starting at 0x00)
@@ -583,22 +667,32 @@ extern "C" bool e220_read_config_registers(void)
         Serial0.flush();
 
         idx = 0;
+        int match_off = -1;
         uint32_t start = millis();
-        while (millis() - start < 500 && idx < 9) {
+        while (millis() - start < 500 && idx < (int)sizeof(resp)) {
             if (Serial0.available()) {
                 resp[idx++] = (uint8_t)Serial0.read();
+                for (int k = 0; k + 9 <= idx; k++) {
+                    if (resp[k] == 0xC1 && resp[k + 1] == 0x00 && resp[k + 2] == 0x06) {
+                        match_off = k;
+                        break;
+                    }
+                }
+                if (match_off >= 0) {
+                    break;
+                }
             } else {
                 vTaskDelay(pdMS_TO_TICKS(5));
             }
         }
 
-        if (idx >= 9 && resp[0] == 0xC1 && resp[1] == 0x00 && resp[2] == 0x06) {
-            e220_stats.cfg_addr_high = resp[3];
-            e220_stats.cfg_addr_low  = resp[4];
-            e220_stats.cfg_reg0      = resp[5];
-            e220_stats.cfg_reg1      = resp[6];
-            e220_stats.cfg_channel   = resp[7];
-            e220_stats.cfg_reg3          = resp[8];
+        if (match_off >= 0) {
+            e220_stats.cfg_addr_high = resp[match_off + 3];
+            e220_stats.cfg_addr_low  = resp[match_off + 4];
+            e220_stats.cfg_reg0      = resp[match_off + 5];
+            e220_stats.cfg_reg1      = resp[match_off + 6];
+            e220_stats.cfg_channel   = resp[match_off + 7];
+            e220_stats.cfg_reg3          = resp[match_off + 8];
             e220_stats.config_valid      = true;
             e220_stats.radio_online      = true;
             e220_stats.last_radio_rsp_ms = millis();
@@ -616,10 +710,12 @@ extern "C" bool e220_read_config_registers(void)
                       idx, digitalRead(ROVER_PIN_E220_AUX));
     }
 
-    // 3. Return immediately to Mode 0 (Transparent: M0=0, M1=0) at configured UART baud
+    // 3. Exit Mode 3 -> Mode 0 BEFORE restoring operational UART baud + verify Mode 0 liveness
     uint32_t baud = (current_settings.e220_uart_baud > 0) ? current_settings.e220_uart_baud : ROVER_E220_TRANSPARENT_BAUD;
-    Serial0.updateBaudRate(baud);
-    e220_set_mode(0, 0);
+    e220_exit_mode3_to_mode0(baud);
+    if (ok) {
+        e220_probe_mode0_liveness(baud);
+    }
     return ok;
 }
 
@@ -776,7 +872,8 @@ static void e220_process_rx_stage(void)
             }
             uint8_t noise_raw = is_5b_hdr ? rx_stage[3] : rx_stage[2];
             uint8_t pkt_raw   = is_5b_hdr ? rx_stage[4] : rx_stage[3];
-            if (noise_raw < 0x80U || noise_raw > 0xE4U || pkt_raw < 0x80U || pkt_raw > 0xF6U) {
+            if (noise_raw < 0x80U || noise_raw > 0xE4U ||
+                (pkt_raw != 0x00U && (pkt_raw < 0x80U || pkt_raw > 0xF6U))) {
                 e220_stats.rtcm_orphan_bytes++;
                 e220_shift_stage_one_byte();
                 continue;
@@ -1076,8 +1173,10 @@ extern "C" void e220_poll_and_forward_rtcm(void)
                  (rssi_reply_buf[2] < 0x80U || rssi_reply_buf[2] > 0xE4U)) ||
                 (rssi_reply_len == 4 &&
                  ((rssi_reply_buf[2] == 0x02U && (rssi_reply_buf[3] < 0x80U || rssi_reply_buf[3] > 0xE4U)) ||
-                  (rssi_reply_buf[2] != 0x02U && (rssi_reply_buf[3] < 0x80U || rssi_reply_buf[3] > 0xF6U)))) ||
-                (rssi_reply_len == 5 && (rssi_reply_buf[4] < 0x80U || rssi_reply_buf[4] > 0xF6U));
+                  (rssi_reply_buf[2] != 0x02U && rssi_reply_buf[3] != 0x00U &&
+                   (rssi_reply_buf[3] < 0x80U || rssi_reply_buf[3] > 0xF6U)))) ||
+                (rssi_reply_len == 5 &&
+                 rssi_reply_buf[4] != 0x00U && (rssi_reply_buf[4] < 0x80U || rssi_reply_buf[4] > 0xF6U));
 
             if (prefix_mismatch) {
                 // An incoming LoRa packet arrived simultaneously -> cancel RSSI intercept and feed zero-loss to RTCM stage!
@@ -1209,8 +1308,9 @@ extern "C" void e220_poll_and_forward_rtcm(void)
     uint32_t sf_sec     = 0;
     uint32_t sf_ms      = 0;
     bool     has_sf     = e220_get_superframe_clock(now, &sf_utc_sec, &sf_sec, &sf_ms);
-    bool     in_sec0_tx_block = has_sf && (sf_sec == 0U) && (sf_ms >= 680U) && (sf_ms <= 880U) &&
-                                (s_last_uplink_utc_sec != sf_utc_sec);
+    uint32_t ul_block_start_ms = (s_active_air_rate <= 5.0f) ? 440U : ((s_active_air_rate <= 10.0f) ? 610U : 670U);
+    bool     in_sec0_tx_block  = has_sf && (sf_sec == 0U) && (sf_ms >= ul_block_start_ms) && (sf_ms <= 860U) &&
+                                 (s_last_uplink_utc_sec != sf_utc_sec);
     bool     tx_air_busy     = (s_tx_air_busy_until_ms > 0) && ((int32_t)(now - s_tx_air_busy_until_ms) < 0);
     bool     switch_exec_due = s_rate_switch_ack_received && ((int32_t)(now - s_rate_switch_exec_ms) >= 0);
     bool     watchdog_due    = s_switched_requires_watchdog && (now >= s_rate_switch_done_ms) && ((now - s_rate_switch_done_ms) > 60000U);
@@ -1229,20 +1329,12 @@ extern "C" void e220_poll_and_forward_rtcm(void)
         digitalRead(ROVER_PIN_E220_AUX) == HIGH &&
         Serial0.available() == 0) {
 
+        // Consolidated Architecture 2B RSSI polling: run once per macro-cycle in Second 0
+        // right after uplink TX completes so Seconds 1..4 remain 100% unbroken downlink.
         bool post_uplink_gap = has_sf && (sf_sec == 0U) &&
                                (s_last_uplink_utc_sec == sf_utc_sec) &&
                                (s_last_rssi_poll_utc_sec != sf_utc_sec) &&
-                               (sf_ms >= 810U) && (sf_ms <= 895U);
-
-        bool msm_done_this_sec = (s_last_valid_msm_utc_sec == sf_utc_sec);
-        bool end_of_sec_gap  = has_sf && (sf_sec != 0U) &&
-                               (s_last_rssi_poll_utc_sec != sf_utc_sec) &&
-                               (sf_ms >= 855U) && (sf_ms <= 895U) &&
-                               (e220_stats.last_rx_ms == 0 || (now - e220_stats.last_rx_ms >= 25U)) &&
-                               (msm_done_this_sec ||
-                                (s_active_air_rate > 5.0f &&
-                                 e220_stats.last_rx_ms > 0 &&
-                                 (now - e220_stats.last_rx_ms >= 200U)));
+                               (sf_ms >= 680U) && (sf_ms <= 920U);
 
         bool unsynced_gap    = !has_sf &&
                                (s_active_air_rate > 5.0f) &&
@@ -1252,10 +1344,10 @@ extern "C" void e220_poll_and_forward_rtcm(void)
                                (now - last_rssi_poll_ms >= 1800U);
 
         bool idle_link_probe = (e220_stats.last_rx_ms == 0 || (now - e220_stats.last_rx_ms > 3000U)) &&
-                               (!has_sf || ((sf_sec != 0U || sf_ms < 650U) && sf_ms <= 880U)) &&
+                               (!has_sf || ((sf_sec != 0U || sf_ms < 390U) && sf_ms <= 880U)) &&
                                (now - last_rssi_poll_ms >= 2000U);
 
-        if (post_uplink_gap || end_of_sec_gap || unsynced_gap || idle_link_probe) {
+        if (post_uplink_gap || unsynced_gap || idle_link_probe) {
             static const uint8_t kRssiCmd[6] = {0xC0, 0xC1, 0xC2, 0xC3, 0x00, 0x02};
             last_rssi_poll_ms       = now;
             if (has_sf) {

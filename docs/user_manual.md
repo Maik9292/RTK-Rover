@@ -308,7 +308,7 @@ The bottom deck provides instantaneous touch control over hardware preferences i
 | **Row 1:** `VOL: 20%..100%` / `MUTE` | **Row 1:** `AUD: GEIGER / BEEPS / MUTE` | **Row 1:** `BRI: 20%..100%` |
 | **Row 2:** `SERIAL: ON/OFF` | **Row 2:** `NMEA: ON/OFF` | **Row 2:** `RTCM: ON/OFF` |
 | **Row 3:** `TELEM: ON/OFF` | **Row 3:** `IMU: ON/OFF` | **Row 3:** `TOUCH: ON/OFF` |
-| **Row 4:** `WIFI: ON/OFF` | **Row 4:** `UNITS: IMP/SI` | **Row 4:** `LORA: 19.2k / 9.6k` |
+| **Row 4:** `WIFI: ON/OFF` | **Row 4:** `UNITS: IMP/SI` | **Row 4:** `LORA: 19.2k / 9.6k / 4.8k` |
 
 * **Button Descriptions:**
   * `VOL: xx%` / `VOL: MUTE`: Cycles master speaker output through 20%, 40%, 60%, 80%, 100%, and MUTE.
@@ -326,7 +326,7 @@ The bottom deck provides instantaneous touch control over hardware preferences i
     * `WIFI: AP` (Vivid Violet `#7C3AED`): Standalone SoftAP hotspot active (`http://192.168.4.1/`, SSID `RTK-Rover`).
     * `WIFI: OFF` (Navy Blue `#1B6CA8`): Wi-Fi radio powered off.
   * `UNITS: IMP/SI`: Toggles between Imperial (feet/inches) and Metric (meters/centimeters).
-  * `LORA: 19.2k` / `LORA: 9.6k`: Toggles remote over-the-air LoRa air-rate switching between standard ($19.2\text{ kbps}$) and deep woods canopy mode ($9.6\text{ kbps}$). Shows amber `REQ: 9.6k` while negotiating with the Base Station.
+  * `LORA: 19.2k / 9.6k / 4.8k`: Cycles remote over-the-air LoRa air-rate switching between standard ($19.2\text{ kbps}$), deep-woods canopy ($9.6\text{ kbps}$), and maximum-penetration slow mode ($4.8\text{ kbps}$). Shows amber `REQ: <rate>` while negotiating with the Base Station.
 * **Row 5 (y=332):** Centered Wi-Fi status indicator (`Wi-Fi: Inactive (Tap to start)` / `Portal: http://...`).
 
 ---
@@ -422,8 +422,8 @@ With the logging buttons consolidated into the Tile 1 Quick Settings grid, the s
   * Base Station ECEF Vectors (`X, Y, Z` in meters)
   * RTCM Message Counters (RTCM 1005 Station ARP frames and MSM multi-signal frames).
 * **6-DOF IMU Telemetry:** Pitch, Roll, 3-axis Accelerometer (`Acc(g): X, Y, Z`), 3-axis Gyroscope (`Gyr(d/s): X, Y, Z`), calibrated tare offsets, and kinematic lever-arm compensation status.
-* **UM982 COM1 / COM2 Metrics:** Active baud rates, byte throughput counters, sentence counts, and checksum error counters.
-* **E220 LoRa Configuration & Hardware Wire Self-Test:** RF Channel, frequency (`925.125 MHz`), operating air data rate (`19.2 kbps` / `9.6 kbps`), transmit power (`21 dBm`), UART baud (`115200`), hardware register dump, and boot-time `M0`/`M1` pin continuity self-test (`M0:OK M1:OK`). Alerts in bold red if a jumper wire is loose or floating.
+* **UM982 COM1 Metrics:** Active `COM1` multiplexed baud rate (`115200`), byte throughput counters, sentence counts, and checksum error counters.
+* **E220 LoRa Configuration & Hardware Wire Self-Test:** RF Channel, frequency (`925.125 MHz`), operating air data rate (`19.2 / 9.6 / 4.8 kbps`), transmit power (`30 dBm` field / `21 dBm` close bench), UART baud (`115200`), hardware register dump, and boot-time `M0`/`M1` pin continuity self-test (`M0:OK M1:OK`). Alerts in bold red if a jumper wire is loose or floating.
 
 ---
 
@@ -474,7 +474,7 @@ All operational parameters are stored in `/settings.json` on the MicroSD card an
 | `pole_tilt_tare_roll_deg` | Float | `0.0` | Recorded bracket roll angle tare offset. |
 | `e220_channel` | Integer | `75` | LoRa RF channel (`75` = $925.125\text{ MHz}$, clean US ISM band). |
 | `e220_uart_baud` | Integer | `115200` | Baud rate between ESP32 and E220 transceiver. |
-| `e220_air_rate_kbps` | Float | `19.2` | LoRa over-the-air data transmission rate (`19.2` or `9.6`). |
+| `e220_air_rate_kbps` | Float | `19.2` | LoRa over-the-air data transmission rate (`19.2`, `9.6`, or `4.8` kbps). |
 | `audio_nav_mode` | Integer | `1` | Proximity navigation audio mode (`0` = Beeps, `1` = Geiger Clicks, `2` = Mute). |
 | `survey_avg_seconds` | Integer | `5` | Multi-epoch integration duration (`1`, `5`, `10`, or `30`). |
 | `default_label_prefix` | String | `"PIN"` | Default prefix when not in `<DERIVED>` mode. |
@@ -514,53 +514,42 @@ All operational parameters are stored in `/settings.json` on the MicroSD card an
 
 ## 13. Bi-Directional LoRa Protocol & Base Station Integration
 
-The RTK Rover implements a bi-directional telemetry and remote control protocol operating over the Ebyte E220 900 MHz LoRa link.
+The RTK Rover implements a bi-directional telemetry and remote control protocol operating over the Ebyte E220 900 MHz LoRa link (`e220_pacer.py v3.7.0` + `v0.8.12`).
 
-### 13.1 Half-Duplex Quiet-Window Interleaving
-* The Base Station broadcasts RTCM3 corrections in a burst at the beginning of each 1-second UTC epoch ($t = 0.00\text{ s} \dots 0.45\text{ s}$).
-* The Rover transmits an uplink telemetry frame strictly within the post-epoch quiet window ($t = 0.10\text{ s} \dots 0.45\text{ s}$) every 5 seconds.
-* At $19.2\text{ kbps}$, the 45-byte frame consumes only $\approx 31\text{ ms}$ Time-on-Air ($<1\%$ duty cycle), leaving hundreds of milliseconds of guard margin before the next base epoch.
+### 13.1 Content-Independent Macro-Cycle & Half-Duplex Uplink Slot
+* Base Station (`e220_pacer.py v3.7.0`) streams continuously across `Seconds 1..(N-1)` of the GPS-disciplined macro-cycle (`--macro-cycle-s`, default `5 s`, optional `10 s`) with zero per-second RSSI pauses.
+* During `Second 0` (`UTC_Second % 5 == 0`), Base enforces a rate-aligned TX cutoff (`450 ms` @ `4.8k`, `620 ms` @ `9.6k`, `680 ms` @ `>= 19.2k`) before opening the half-duplex Rover uplink slot (`500..660 ms` @ `4.8k`, `670..760 ms` @ `9.6k`, `730..810 ms` @ `>= 19.2k`), followed by one post-uplink Mode 0 RSSI query (`680..920 ms`).
 
-### 13.2 45-Byte Uplink Telemetry Frame
+### 13.2 48-Byte V3 Uplink Telemetry Frame
 * **Sync Preamble:** `0xAA 0x55` (distinct from RTCM3 `0xD3` to prevent false-framing).
-* **Payload (39 Bytes):**
+* **Payload (42 Bytes):**
   * Sub-millimeter ground-tip coordinates (`tip_lat`, `tip_lon`, `tip_height_m`) and horizontal accuracy (`h_acc_mm`).
   * Master ANT1 fix quality (`RTK_FIX`, `RTK_FLT`, `DGPS`, `SINGLE`, `NONE`).
   * Slave ANT2 fix quality (`SLV_FIX`, `SLV_FLT`, `SLV_DGPS`, `SLV_SGL`, `NONE`).
   * Measured 3D inter-antenna baseline length (`baseline_mm`, nominal $555\text{ mm}$ / $55.4\text{ cm}$).
   * Measured crossbar pitch angle (`baseline_pitch_cdeg`, centidegrees).
-  * Explicit heading source tag (`DUAL_FIX`, `DUAL_FLT`, `WALK`, `GYRO`, `COG`, `HOLD`).
-  * Master & Slave satellite counts, True Heading centidegrees, battery percentage and millivolts, Rover packet RSSI, live ambient noise floor, and sequence counter.
+  * Explicit heading source tag (`DUAL_FIX`, `DUAL_FLT`, `WALK`, `GYRO`, `COG`, `HOLD`, `COMP`).
+  * Master & Slave satellite counts, True Heading centidegrees, battery percentage and millivolts, Rover packet RSSI, live ambient noise floor, sequence counter, and firmware SemVer (`fw_major.fw_minor.fw_patch`).
 * **Integrity:** Protected by a 16-bit CRC16-CCITT checksum.
 
-### 13.3 Touchscreen Remote Air-Rate Switching
-* **Field Problem:** Deep timber or dense foliage can cause fringe RF packet loss at $19.2\text{ kbps}$. Switching down to $9.6\text{ kbps}$ adds $+3.5\text{ dB}$ of link margin.
-* **Procedure:** Tap the `LORA: 19.2k` button on Tile 1. The button displays amber `REQ: 9.6k`.
-* **Zero-Credential Negotiation:** Rover transmits `CMD_REQ_RADIO_SWITCH` (`0x02`), Base replies with `ACK_RADIO_SWITCH` (`0x82`), and both radios reconfigure their registers in Mode 3 simultaneously without restarting the Base systemd service or entering passwords.
-* **Failsafe Rollback:** If communication is silent for 60 seconds after a rate switch, both Rover and Base automatically revert to the $19.2\text{ kbps}$ fallback profile.
+### 13.3 Touchscreen Remote 3-Rate Air-Rate Switching
+* **Field Problem:** Deep timber or dense foliage can cause fringe RF packet loss at $19.2\text{ kbps}$. Switching down to $9.6\text{ kbps}$ (`+3 dB`) or $4.8\text{ kbps}$ (`+5 dB`) extends range cleanly.
+* **Procedure:** Tap Tile 1 `LORA` button to cycle `19.2k / 9.6k / 4.8k` (or tap again before Second 0 TX to cancel).
+* **Zero-Credential 4-ACK Negotiation:** Rover transmits `CMD_REQ_RADIO_SWITCH` (`0x02`) in `Second 0`, Base replies with a 4-slot spaced `ACK_RADIO_SWITCH` train (`80 / 260 / 440 / 620 ms`) in `Second 1`, and both radios reconfigure in Mode 3 at `Second 2` before probing Mode 0 liveness.
+* **Dynamic Pre-Switch Failsafe Rollback:** If no valid traffic is verified within 60 seconds after a rate switch, both Rover and Base automatically revert to the pre-switch verified fallback air rate.
 
-### 13.4 Base Station Pacer (`e220_pacer.py` v3.4.0)
+### 13.4 Base Station Pacer (`e220_pacer.py v3.7.0`)
 * **Real-Time Terminal Output:** Displays live Rover telemetry lines with full ANT1 and ANT2 observables formatted with clean ASCII `deg` units and USB/Battery power state:
   ```text
-  [ROVER TEL #042] ANT1:RTK_FIX (28M) | ANT2:SLV_FIX (26S, BL:55.4cm, P:+0.2deg) | Hdg:142.6deg [DUAL_FIX] | PWR:USB (4.02V) | RSSI:-84dBm | Pos:43.7319105, -70.6237371, 12.45m
+  [ROVER TEL #042] FW:v0.8.12 | ANT1:RTK_FIX (28M) | ANT2:SLV_FIX (26S, BL:55.4cm, P:+0.2deg) | Hdg:142.6deg [DUAL_FIX] | PWR:USB (4.02V) | RSSI:-84dBm | Pos:43.7319105, -70.6237371, 12.45m
   ```
-* **Dual-Format Backward-Compatible Decoder:** Supports both legacy 39-byte and expanded 45-byte frames seamlessly during field rollouts.
-* **Atomic RAM State (`/run/rtk_rover_status.json`):** Writes live JSON on RAM tmpfs including `ant2_fix_name`, `baseline_length_cm`, `baseline_pitch_deg`, and `heading_source`.
+* **Tri-Format Backward-Compatible Decoder:** Supports 48-byte V3, 45-byte V2, and legacy 39-byte uplink frames seamlessly.
+* **Atomic RAM State (`/run/rtk_rover_status.json`):** Writes live JSON on RAM tmpfs including `rover_fw_version`, `ant2_fix_name`, `baseline_length_cm`, `baseline_pitch_deg`, and `heading_source`.
 * **Rolling Daily CSV Log (`~/rover_logs/rover_YYYY-MM-DD.csv`):**
-  * Logs extended columns: `timestamp_utc, seq, fix_type, fix_name, ant2_fix, baseline_mm, pitch_deg, hdg_source, latitude, longitude, height_m, h_acc_mm, sats_master, sats_slave, heading_deg, battery_pct, battery_mv, rover_rssi_dbm, rover_noise_dbm, air_rate_kbps, channel`.
-  * Auto-prunes files older than 30 days (`--log-retention-days 30`).
-  * Caps maximum log directory footprint at $50\text{ MB}$ (`--max-log-mb 50`).
-  * Compresses completed logs with `gzip` at midnight (`rover_YYYY-MM-DD.csv.gz`).
+  * Logs extended columns (`timestamp_utc, seq, rover_fw, fix_type, fix_name, ant2_fix, baseline_mm, pitch_deg, hdg_source, latitude, longitude, height_m, h_acc_mm, sats_master, sats_slave, heading_deg, battery_pct, battery_mv, rover_rssi_dbm, rover_noise_dbm, air_rate_kbps, channel`).
+  * Auto-prunes files older than 30 days (`--log-retention-days 30`), caps total log directory footprint at $50\text{ MB}$ (`--max-log-mb 50`), and compresses yesterday's logs with `gzip` (`rover_YYYY-MM-DD.csv.gz`).
 
-### 13.5 Adaptive Constellation Interleaver (at $\le 9.6\text{ kbps}$)
-* **The Bandwidth Dilemma at 9600 Baud:** RTKBase broadcasts full multi-constellation MSM bursts ($\approx 650\text{ bytes}$ per second for Base ARP 1006 + GPS 1074 + GLONASS 1084 + Galileo 1094). At $9.6\text{ kbps}$, total Time-on-Air is $\approx 1.25\text{ s} + 0.20\text{ s quiet} = 1.45\text{ s}$, which oversubscribes the 1-second cadence by 45%. This causes buffer accumulation, differential age latency, and multi-subpacket truncation drops.
-* **Adaptive Interleaving Architecture:**
-  * **Base ARP (`1005`/`1006`), Antenna (`1033`), and GLONASS Biases (`1230`):** Transmitted with 100% passthrough.
-  * **$\ge 19.2\text{ kbps}$ Air Rates:** 100% passthrough of all constellations every second ($1.0\text{ Hz}$).
-  * **$9.6\text{ kbps}$ Air Rates:**
-    * **GPS (`1074`):** Transmitted every second ($1.0\text{ Hz}$) as the continuous primary positioning anchor.
-    * **Secondary Constellations (`1084` GLONASS, `1094` Galileo, `1124` BeiDou):** Dynamically alternated across epochs ($0.5\text{ Hz}$ each for 2 secondaries, $0.33\text{ Hz}$ for 3).
-    * **Throughput Result:** Epoch payload drops to $\approx 370 - 490\text{ B}$ and Time-on-Air drops to $\approx 630 - 900\text{ ms}$, leaving ample quiet window for uplink telemetry within the 1-second interval.
-  * **$\le 4.8\text{ kbps}$ Air Rates:** Rotates 1 single constellation per second (GPS $\rightarrow$ Galileo $\rightarrow$ GPS $\rightarrow$ GLONASS).
-  * **Guaranteed Half-Duplex Quiet Window:** Pacer tracks the terminal constellation message of each epoch (`_is_terminal_burst_msg()`) and enforces a guaranteed $200\text{ ms}$ listening window (`_enforce_quiet_window()`), even when the terminal message itself is skipped.
-  * **Heartbeat & CLI Controls:** Heartbeat displays `Interleave:[<count> skp]`. Interleaving can be bypassed if desired via the `--no-interleave` CLI flag.
+### 13.5 Asynchronous Ping-Pong Mailboxes & Smart `<= 200 B` Coalescing
+* **Zero Epoch Queue Latency:** A dedicated background ingress thread continuously drains incoming RTCM3 bytes from RTKBase, verifies `CRC24Q`, drops empty MSMs (`<= 28 B`), and overwrites latest-value ping-pong mailboxes keyed by message type (`2.5 s` dynamic MSM / `15.0 s` static TTL). Saturated links never accumulate stale queued seconds.
+* **Starvation-Fair Round Robin & Coalescing:** Prioritizes static base metadata (`1005/1006/1033/1230`), rotates multi-constellation MSM frames (`1074/1084/1094/1124`) cleanly by starvation age (`now - last_tx` with GPS `1074` tie-breaker), and packs compatible small frames into a single `<= 200 B` Regime A burst (e.g., `1006+1230+1084`).
+* **Heartbeat & CLI Controls:** Heartbeat displays `Mbox:[Sup:<n> Coal:<n> Stale:<n> MaxAge:<ms>]`. Supports `--macro-cycle-s {5,10}` (default `5`) and `--no-interleave` CLI flags.

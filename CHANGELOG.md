@@ -5,6 +5,22 @@ All notable changes to the **RTK Rover** project will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.8.12] - 2026-11-16
+
+### Added, Fixed & Architected
+- **Architecture 2B Asynchronous Ping-Pong Mailbox LoRa Transport, Consolidated Macro-Cycle & Mode 0/3 Hardening ([`user_config.h`](user_config.h) `v0.8.12`, [`src/e220_driver/e220_driver.cpp`](src/e220_driver/e220_driver.cpp), [`scripts/e220_pacer.py`](scripts/e220_pacer.py) `v3.7.0`, [`scripts/stage2_bench_verify.py`](scripts/stage2_bench_verify.py) `v1.0.0`):**
+  - **Rover Firmware `v0.8.12` (`e220_driver.cpp`):**
+    - Updated `e220_estimate_tx_air_ms()` to Stage-1-calibrated piecewise airtimes (`<= 5k: 70 + 1.87*N`, `<= 10k: 45 + 1.19*N`, `<= 20k: 29 + 0.80*N`, `+ 25 ms` turnaround) and tightened `e220_get_trunc_timeout_ms()` from `1200 / 650 / 280 ms` to **`480 / 380 / 280 ms`**.
+    - Updated `e220_is_uplink_slot_active()` and Stage 5 RSSI scheduling to the consolidated macro-cycle (`500..660 / 670..760 / 730..810 ms` uplink windows, single post-uplink `Second 0` Mode 0 RSSI query in `680..920 ms`, removing `end_of_sec_gap` so `Seconds 1..4` remain `100%` unbroken downlink, and `< 390 ms` `Second 0` pre-DL cap on `idle_link_probe`).
+    - Fixed `test/_048` cold-boot `5 B` RSSI burst spill (`Orph` + `Noise:--dBm`): accepted `pkt_raw == 0x00U` alongside `0x80..0xF6U` in both `allow_late_rssi` and Stage `0b` `prefix_mismatch` before the first RF packet arrives while keeping `rssi_valid` gated on real packets (`rx_bytes_total > 0 && pkt_raw >= 0x80U`).
+    - Unified Mode 3 exit sequencing via `e220_exit_mode3_to_mode0()` (`M0/M1=0 -> 25 ms -> baud -> 55 ms -> AUX HIGH -> RX drain`) and `e220_probe_mode0_liveness()` (`C0 C1 C2 C3 00 02` liveness probe with clean `(1,1)->(0,0)` bounce recovery) across both `e220_write_default_config_registers()` and `e220_read_config_registers()` (which also adopts `e220_set_mode(1,1)` before `9600` baud, `e220_mode3_sync_read()`, and `20 ms` command settling).
+    - Compiled cleanly via `arduino-cli` (`esp32:esp32:esp32s3`, `--warnings default`): zero compiler warnings (`1,698,358 B` flash / `53%`, `67,152 B` static `DRAM0` / `20%`).
+  - **Base Station Daemon `e220_pacer.py v3.7.0`:**
+    - Replaced synchronous FIFO buffering and open-loop interleaving with a dual-thread `_ingress_worker()` feeding per-`msg_type` latest-value `MailboxSlot` entries (`2.5 s` dynamic MSM / `15.0 s` static `1005/1006/1033/1230` TTL), zero queue buildup, starvation-fair MSM round robin anchored toward `1074`, smart `<= 200 B` (`self.packet_size`) coalescing via `send_rtcm_batch()`, and enhanced `[PACER HEARTBEAT]` `Mbox:[Sup Coal Stale MaxAge]` telemetry.
+    - Enforced Stage-1-calibrated piecewise `ToA` + `30 ms` (`>= 9.6k`) / `35 ms` (`<= 5k`) guard pacing across Regime A & Regime B (`estimate_frame_air_s()`), content-independent consolidated `Second 0` pause across `--macro-cycle-s {5,10}` (default `5`, cutoffs `450 / 620 / 680 ms`), and `80 ms` Mode 3 -> Mode 0 exit settle.
+  - **Stage 2 Split Desk Verifier & Synced Docs ([`scripts/stage2_bench_verify.py`](scripts/stage2_bench_verify.py) `v1.0.0`, [`README.md`](README.md), [`docs/e220-reference.md`](docs/e220-reference.md) `v3.1`, [`docs/project_overview.md`](docs/project_overview.md) `v2.8.0`, [`docs/user_manual.md`](docs/user_manual.md)):**
+    - Added standalone split verifier supporting offline `--self-test` (`5/5` PASS covering Stage-1 `ToA`, macro-cycle windows, mailbox supersede/TTL, `<= 200 B` coalescing, `4.8k/9.6k/19.2k` fairness, live ingress thread, V3 `48 B` uplink decode, and `4-ACK` rate switch), `--mode pi-feeder` (`127.0.0.1:5017`), and `--mode rover-monitor` (ESP32 USB-CDC scorecard).
+
 ## [bench_e220_multirate.py v1.0.3] - 2026-11-16
 
 ### Added & Updated
