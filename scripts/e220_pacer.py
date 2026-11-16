@@ -74,7 +74,7 @@ except ImportError:
 
 __filename__ = "e220_pacer.py"
 __app_name__ = "e220_pacer"
-__version__ = "3.7.0"
+__version__ = "3.7.1"
 __date__ = "2026-11-16"
 
 # Force unbuffered output so systemd journalctl displays entries in real time
@@ -602,14 +602,22 @@ class E220Pacer:
         print(f"[LOG] Daily CSV logging directory: {self.log_dir}", flush=True)
 
         if self.gpio_available:
-            GPIO.setwarnings(False)
-            GPIO.setmode(GPIO.BCM)
-            for pin in (self.pin_m0, self.pin_m1, self.pin_rst):
-                GPIO.setup(pin, GPIO.OUT)
-            GPIO.setup(self.pin_aux, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-            GPIO.output(self.pin_rst, GPIO.HIGH)
-            GPIO.output(self.pin_m0, GPIO.LOW)
-            GPIO.output(self.pin_m1, GPIO.LOW)
+            try:
+                GPIO.setwarnings(False)
+                GPIO.setmode(GPIO.BCM)
+                # Explicit initial= prevents rpi-lgpio from calling lgpio.gpio_read() on unclaimed pins
+                GPIO.setup(self.pin_rst, GPIO.OUT, initial=GPIO.HIGH)
+                GPIO.setup(self.pin_m0, GPIO.OUT, initial=GPIO.LOW)
+                GPIO.setup(self.pin_m1, GPIO.OUT, initial=GPIO.LOW)
+                GPIO.setup(self.pin_aux, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            except Exception as exc:
+                print(
+                    f"[HW ERROR] Failed to configure E220 GPIO pins "
+                    f"(M0={self.pin_m0}, M1={self.pin_m1}, AUX={self.pin_aux}, RST={self.pin_rst}): {exc}. "
+                    f"Verify e220-pacer.service and other GPIO consumers are stopped.",
+                    flush=True,
+                )
+                raise
             time.sleep(0.04)
             if not self.wait_aux(timeout=1.5):
                 self.hardware_reset_e220("AUX stuck LOW at startup")
@@ -629,9 +637,15 @@ class E220Pacer:
 
     def cleanup_hardware(self) -> None:
         if self.ser and self.ser.is_open:
-            self.ser.close()
+            try:
+                self.ser.close()
+            except Exception:
+                pass
         if self.gpio_available:
-            GPIO.cleanup()
+            try:
+                GPIO.cleanup()
+            except Exception:
+                pass
         if self.current_log_file:
             try:
                 self.current_log_file.close()

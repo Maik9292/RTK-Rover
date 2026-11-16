@@ -44,7 +44,7 @@ import e220_pacer  # noqa: E402
 
 __filename__ = os.path.basename(__file__)
 __app_name__ = "stage2_bench_verify"
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 __date__ = "2026-11-16"
 
 # Deterministic RTCM3 synthetic epoch profiles: (msg_type, total_wire_bytes)
@@ -528,6 +528,58 @@ def test_live_thread_uplink_and_switch_flow() -> None:
         e220_pacer.time.monotonic = orig_mono
 
 
+def test_gpio_setup_explicit_initial() -> None:
+    """Verify setup_hardware() claims output pins with explicit initial= levels for rpi-lgpio safety."""
+    calls: list[tuple] = []
+
+    class FakeGPIO:
+        BCM = 11
+        OUT = 0
+        IN = 1
+        HIGH = 1
+        LOW = 0
+        PUD_UP = 22
+
+        @staticmethod
+        def setwarnings(_flag: bool) -> None:
+            pass
+
+        @staticmethod
+        def setmode(mode: int) -> None:
+            calls.append(("setmode", mode))
+
+        @staticmethod
+        def setup(pin: int, direction: int, **kwargs) -> None:
+            calls.append(("setup", pin, direction, kwargs))
+
+        @staticmethod
+        def input(_pin: int) -> int:
+            return 1
+
+        @staticmethod
+        def cleanup() -> None:
+            raise RuntimeError("already_cleaned")
+
+    orig_gpio = e220_pacer.GPIO
+    try:
+        e220_pacer.GPIO = FakeGPIO
+        p = e220_pacer.E220Pacer(air_rate_kbps=19.2, quiet=True, no_csv=True)
+        p.gpio_available = True
+        p.wait_aux = lambda timeout=1.5: True  # type: ignore[method-assign]
+        p.inspect_and_configure_eeprom = lambda: True  # type: ignore[method-assign]
+        p._open_operational_uart = lambda: None  # type: ignore[method-assign]
+        p.probe_ambient_noise = lambda: None  # type: ignore[method-assign]
+        p.setup_hardware()
+
+        out_calls = {c[1]: c[3].get("initial") for c in calls if c[0] == "setup" and c[2] == FakeGPIO.OUT}
+        assert out_calls.get(p.pin_rst) == FakeGPIO.HIGH, f"Expected RST initial HIGH, got {out_calls}"
+        assert out_calls.get(p.pin_m0) == FakeGPIO.LOW, f"Expected M0 initial LOW, got {out_calls}"
+        assert out_calls.get(p.pin_m1) == FakeGPIO.LOW, f"Expected M1 initial LOW, got {out_calls}"
+        p.cleanup_hardware()  # Must not raise if GPIO.cleanup raises
+    finally:
+        e220_pacer.GPIO = orig_gpio
+
+
 def run_self_test() -> int:
     """Execute complete offline Arch 2B unit & integration suite."""
     tests = (
@@ -536,6 +588,7 @@ def run_self_test() -> int:
         ("Smart <=200B & custom packet-size coalescing", test_smart_coalescing_limits),
         ("Starvation fairness across 4.8k/9.6k/19.2k profiles", test_starvation_fairness_and_profiles),
         ("Live ingress thread, V3 uplink & 4-ACK rate switch", test_live_thread_uplink_and_switch_flow),
+        ("Raspberry Pi rpi-lgpio explicit initial GPIO setup", test_gpio_setup_explicit_initial),
     )
     passed = 0
     for idx, (label, fn) in enumerate(tests, start=1):

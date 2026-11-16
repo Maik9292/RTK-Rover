@@ -5,6 +5,13 @@ All notable changes to the **RTK Rover** project will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [e220_pacer.py v3.7.1] - 2026-11-16
+
+### Fixed
+- **Raspberry Pi OS `rpi-lgpio` Explicit Initial GPIO Pin Claiming ([`scripts/e220_pacer.py`](scripts/e220_pacer.py) `v3.7.1`, [`scripts/stage2_bench_verify.py`](scripts/stage2_bench_verify.py) `v1.0.1`):**
+  - Fixed `lgpio.error: 'GPIO not allocated'` on `RPi/GPIO/__init__.py:704` (`lgpio.gpio_read(_chip, gpio)`) inside `setup_hardware()` by passing explicit `initial=GPIO.HIGH` (`pin_rst`) and `initial=GPIO.LOW` (`pin_m0`, `pin_m1`) to `GPIO.setup(..., GPIO.OUT, initial=...)`, preventing `rpi-lgpio` from reading unclaimed kernel GPIO lines before claim and eliminating any claim-time `RST` low pulse, plus guarding `cleanup_hardware()` cleanup errors.
+  - Added offline self-test #6 (`test_gpio_setup_explicit_initial()`) to [`scripts/stage2_bench_verify.py`](scripts/stage2_bench_verify.py) (`v1.0.1`, `6/6` PASS).
+
 ## [v0.8.12] - 2026-11-16
 
 ### Added, Fixed & Architected
