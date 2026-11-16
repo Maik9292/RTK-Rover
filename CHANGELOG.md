@@ -5,6 +5,16 @@ All notable changes to the **RTK Rover** project will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [bench_e220_multirate.py v1.0.0] - 2026-11-16
+
+### Added
+- **Stage 1 Multi-Rate E220 Silicon & Driver Bench Characterization Suite ([`scripts/bench_e220_multirate.py`](scripts/bench_e220_multirate.py) `v1.0.0`):**
+  - Added a standalone hardware-in-the-loop bench harness for `/dev/ttyAMA0` (Pi BCM GPIO `M0=18`, `M1=17`, `AUX=27`, `RST=22`) <-> `/dev/ttyUSB0` (USB-FTDI `DTR=M0`, `RTS=M1`, `CTS#=AUX`, automatic Linux `1 ms` latency timer tuning, and `M0=1, M1=1` before `9600` Mode 3 sequencing).
+  - Enforces a mandatory `e220-pacer.service` pre-flight check (`--stop-service` cleanly stops the daemon and unconditionally restarts it inside `finally:` on exit/`SIGINT`/`SIGTERM`), defaults Mode 3 rate sweeps to `0xC2` temporary RAM writes with automatic `finally:` hardware restoration, and includes an offline `--self-test` simulation mode.
+  - Implements six independent CSV-logged tests across `4.8k`, `9.6k`, and `19.2k`: (1) `ToA` & `AUX` waveform sweep (`18..400 B` + `456 B` split using a concurrent `AsyncRxCollector` thread), (2) inter-frame guard sweep (`60..10 ms`) comparing `aux_only` vs. `toa_floor` vs. `coalesced_189`, (3) PER blast-radius comparison (`1pkt_173B`, `2pkt_253B`, `2pkt_316B`, `coalesced_189B`, `sliced_200B_stream`), (4) consolidated `48 B` uplink + `C0 C1 C2 C3 00 02` Mode 0 RSSI turnaround margin sweep, (5) automated Mode 3 3-rate switching endurance loop, and (6) sustained high-duty thermal XTAL soak.
+- **Asynchronous Mailbox & Content-Independent Transport Trade Study ([`docs/plans/plan_async_mailbox_lora_transport_analysis.md`](docs/plans/plan_async_mailbox_lora_transport_analysis.md)):**
+  - Documented worst-case RTCM3 MSM4 byte budgets through max open-sky satellite counts, simulated `10 s @ 4.8k` + optional `2-signal` booster performance, compared 5 transport architectures, and defined the Stage 1 / Stage 2 verification plan.
+
 ## [v0.8.11] - 2026-11-15
 
 ### Fixed
