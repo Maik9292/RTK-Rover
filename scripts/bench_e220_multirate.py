@@ -65,7 +65,7 @@ except ImportError:
 
 __filename__ = os.path.basename(__file__)
 __app_name__ = "bench_e220_multirate"
-__version__ = "v1.0.0"
+__version__ = "v1.0.1"
 __date__ = "2026-11-16"
 
 
@@ -525,6 +525,8 @@ class BaseE220Radio:
                 self._mode3_read_6()
             elif attempt > 1:
                 self._sleep(0.035)
+            else:
+                self._sleep(0.015)
 
             self.drain_rx()
             self.write_bytes(bytes([cmd_op, 0x00, 0x06]) + target_6)
@@ -906,7 +908,10 @@ class FtdiUsbRadio(BaseE220Radio):
             else:
                 print(f"[FTDI] {lat_path} already 1ms.", flush=True)
         except OSError as e:
-            print(f"[FTDI] Note: Could not tune {lat_path} to 1ms ({e}); RX jitter up to 16ms.", flush=True)
+            print(
+                f"[FTDI] Note: Could not tune {lat_path} to 1ms ({e}); RX jitter up to 16ms (re-run with sudo for 1ms latency).",
+                flush=True,
+            )
 
     def close(self) -> None:
         if self._latency_path and self._orig_latency is not None:
@@ -1174,41 +1179,58 @@ class AsyncRxCollector:
     """
     Concurrent background RX polling thread so Test 1 measures exact write-to-RX-complete
     wall latency while TX sleeps in send_paced_frame(), and Test 2/3/6 never overflow serial RX buffers.
+    Must ONLY be active in Mode 0 at steady baud (stopped before Mode 3 register switches or Mode 0 RSSI queries).
     """
 
     def __init__(self, rx: BaseE220Radio):
         self.rx = rx
+        self._io_lock = threading.Lock()
         self.lock = threading.Lock()
         self.buf = bytearray()
         self.frames: dict[int, tuple[int, int, float]] = {}
         self.crc_errors = 0
         self.orphan_bytes = 0
+        self.last_error: Optional[str] = None
         self._stop = False
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
         self._stop = False
+        self.last_error = None
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         self._stop = True
         if self._thread is not None:
-            self._thread.join(timeout=0.5)
+            self._thread.join(timeout=1.5)
             self._thread = None
 
     def reset_stats(self) -> None:
-        with self.lock:
+        with self._io_lock:
             self.rx.drain_rx()
-            self.buf.clear()
-            self.frames.clear()
-            self.crc_errors = 0
-            self.orphan_bytes = 0
+            with self.lock:
+                self.buf.clear()
+                self.frames.clear()
+                self.crc_errors = 0
+                self.orphan_bytes = 0
 
     def _run(self) -> None:
         poll_s = self.rx._poll_interval(0.001)
         while not self._stop and not g_abort_requested:
-            chunk = self.rx.drain_rx()
+            try:
+                with self._io_lock:
+                    if self._stop or g_abort_requested:
+                        break
+                    chunk = self.rx.drain_rx()
+            except Exception as e:
+                if not self._stop:
+                    with self.lock:
+                        self.last_error = str(e)
+                    print(f"  [ERROR] AsyncRxCollector RX read failure: {e}", file=sys.stderr, flush=True)
+                break
             if chunk:
                 now = time.monotonic()
                 with self.lock:
@@ -1227,7 +1249,7 @@ class AsyncRxCollector:
         poll_s = self.rx._poll_interval(0.002)
         while time.monotonic() < deadline and not g_abort_requested:
             with self.lock:
-                if expected_seqs.issubset(self.frames.keys()):
+                if self.last_error is not None or expected_seqs.issubset(self.frames.keys()):
                     break
             time.sleep(poll_s)
         with self.lock:
@@ -1279,15 +1301,15 @@ def run_test_1_toa_sweep(ctx: BenchContext) -> bool:
     seq_id = 1000
     all_ok = True
     rx_col = AsyncRxCollector(ctx.rx)
-    rx_col.start()
 
-    try:
-        for rate in ctx.rates:
-            if g_abort_requested or not ctx.switch_both_radios(rate):
-                all_ok = False
-                break
-            print(f"\n--- Rate {rate} kbps ---", flush=True)
-            print("  Len | Subs | AUX_Drop | AUX_Low_ms | TX_Pace_ms | Model_ToA | RX_Wall_ms | Pass", flush=True)
+    for rate in ctx.rates:
+        if g_abort_requested or not ctx.switch_both_radios(rate):
+            all_ok = False
+            break
+        print(f"\n--- Rate {rate} kbps ---", flush=True)
+        print("  Len | Subs | AUX_Drop | AUX_Low_ms | TX_Pace_ms | Model_ToA | RX_Wall_ms | Pass", flush=True)
+        rx_col.start()
+        try:
             for length in lengths:
                 aux_lows: list[float] = []
                 tx_paces: list[float] = []
@@ -1295,7 +1317,7 @@ def run_test_1_toa_sweep(ctx: BenchContext) -> bool:
                 passes = 0
                 any_drop = False
                 for _ in range(repeats):
-                    if g_abort_requested:
+                    if g_abort_requested or rx_col.last_error is not None:
                         break
                     seq_id += 1
                     frame = build_synthetic_rtcm(1074 if length > 200 else 1084, length, seq_id)
@@ -1304,7 +1326,7 @@ def run_test_1_toa_sweep(ctx: BenchContext) -> bool:
                     tx_res = ctx.tx.send_paced_frame(frame, mode="toa_calibrated")
                     found, c_err, orph = rx_col.wait_for({seq_id}, 0.8)
                     wall_ms = ((found[seq_id][2] - t_send) * 1000.0) / ctx.time_scale() if seq_id in found else -1.0
-                    ok = (seq_id in found) and (c_err == 0)
+                    ok = (seq_id in found) and (c_err == 0) and (rx_col.last_error is None)
                     if ok:
                         passes += 1
                         rx_walls.append(wall_ms)
@@ -1323,10 +1345,10 @@ def run_test_1_toa_sweep(ctx: BenchContext) -> bool:
                     f"  {length:3d} |  {(length+199)//200:2d}  |   {'YES' if any_drop else ' NO'}    | {avg_aux:9.1f}  |  {avg_tx:9.1f} | {model_ms:9.1f} |  {avg_rx:9.1f} | {passes}/{repeats}",
                     flush=True,
                 )
-                if passes < repeats:
+                if passes < repeats or rx_col.last_error is not None:
                     all_ok = False
-    finally:
-        rx_col.stop()
+        finally:
+            rx_col.stop()
 
     with open(ctx.csv_path("test1_toa"), "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -1350,15 +1372,14 @@ def run_test_2_guard_sweep(ctx: BenchContext) -> bool:
     seq_id = 10000
     all_ok = True
     rx_col = AsyncRxCollector(ctx.rx)
-    rx_col.start()
 
-    try:
-        for rate in ctx.rates:
-            if g_abort_requested or not ctx.switch_both_radios(rate):
-                all_ok = False
-                break
-            print(f"\n--- Rate {rate} kbps ---", flush=True)
-
+    for rate in ctx.rates:
+        if g_abort_requested or not ctx.switch_both_radios(rate):
+            all_ok = False
+            break
+        print(f"\n--- Rate {rate} kbps ---", flush=True)
+        rx_col.start()
+        try:
             # 2a. Negative control: AUX-only pacing at 35ms (expected to fail/truncate <=9.6k or <=200B!)
             aux_fail = 0
             for p1, p2 in pairs[:2]:
@@ -1386,7 +1407,7 @@ def run_test_2_guard_sweep(ctx: BenchContext) -> bool:
                 ok_runs = 0
                 for p1, p2 in pairs:
                     for _ in range(repeats):
-                        if g_abort_requested:
+                        if g_abort_requested or rx_col.last_error is not None:
                             break
                         seq_id += 1
                         s1 = seq_id
@@ -1398,7 +1419,7 @@ def run_test_2_guard_sweep(ctx: BenchContext) -> bool:
                         ctx.tx.send_paced_frame(f1, mode="toa_calibrated", guard_s=gms / 1000.0)
                         ctx.tx.send_paced_frame(f2, mode="toa_calibrated", guard_s=gms / 1000.0)
                         found, c_err, _ = rx_col.wait_for({s1, s2}, 0.6)
-                        ok = (s1 in found and s2 in found and c_err == 0)
+                        ok = (s1 in found and s2 in found and c_err == 0 and rx_col.last_error is None)
                         tot_runs += 1
                         if ok:
                             ok_runs += 1
@@ -1414,6 +1435,8 @@ def run_test_2_guard_sweep(ctx: BenchContext) -> bool:
                 ok_c = 0
                 dur_list: list[float] = []
                 for _ in range(repeats):
+                    if g_abort_requested or rx_col.last_error is not None:
+                        break
                     seq_id += 1
                     s_a = seq_id
                     seq_id += 1
@@ -1433,7 +1456,7 @@ def run_test_2_guard_sweep(ctx: BenchContext) -> bool:
                         ctx.tx.send_paced_frame(fc, mode="toa_calibrated")
                     found, c_err, _ = rx_col.wait_for({s_a, s_b, s_c}, 0.6)
                     dur_list.append(((time.monotonic() - t_a) * 1000.0) / ctx.time_scale())
-                    ok = len(found) == 3 and c_err == 0
+                    ok = len(found) == 3 and c_err == 0 and rx_col.last_error is None
                     if ok:
                         ok_c += 1
                     rows.append([rate, mode_lbl, 52 if rate <= 9.6 else 40, "27+18+144", int(ok), c_err, len(found)])
@@ -1441,8 +1464,8 @@ def run_test_2_guard_sweep(ctx: BenchContext) -> bool:
                 print(f"  [{mode_lbl:13s}]: {ok_c}/{repeats} intact | avg_dur={avg_d:6.1f}ms", flush=True)
                 if ok_c < repeats:
                     all_ok = False
-    finally:
-        rx_col.stop()
+        finally:
+            rx_col.stop()
 
     with open(ctx.csv_path("test2_guard"), "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -1464,21 +1487,20 @@ def run_test_3_per_comparison(ctx: BenchContext) -> bool:
     seq_id = 30000
     all_ok = True
     rx_col = AsyncRxCollector(ctx.rx)
-    rx_col.start()
 
-    try:
-        for rate in ctx.rates:
-            if g_abort_requested or not ctx.switch_both_radios(rate):
-                all_ok = False
-                break
-            print(f"\n--- Rate {rate} kbps (N={burst_n} epochs/mode) ---", flush=True)
-
+    for rate in ctx.rates:
+        if g_abort_requested or not ctx.switch_both_radios(rate):
+            all_ok = False
+            break
+        print(f"\n--- Rate {rate} kbps (N={burst_n} epochs/mode) ---", flush=True)
+        rx_col.start()
+        try:
             # Mode A: Whole-Frame isolated (1-pkt 173B, 2-pkt 253B, Max-Sat 316B)
             for label, sz in [("1pkt_173B", 173), ("2pkt_253B", 253), ("2pkt_316B", 316)]:
                 expected: set[int] = set()
                 rx_col.reset_stats()
                 for _ in range(burst_n):
-                    if g_abort_requested:
+                    if g_abort_requested or rx_col.last_error is not None:
                         break
                     seq_id += 1
                     expected.add(seq_id)
@@ -1496,7 +1518,7 @@ def run_test_3_per_comparison(ctx: BenchContext) -> bool:
                 rx_col.reset_stats()
 
                 for _ in range(burst_n):
-                    if g_abort_requested:
+                    if g_abort_requested or rx_col.last_error is not None:
                         break
                     seq_id += 1
                     s1 = seq_id
@@ -1529,8 +1551,10 @@ def run_test_3_per_comparison(ctx: BenchContext) -> bool:
                 pct = 100.0 * ok_cnt / max(1, len(expected_s))
                 print(f"  [{stream_mode:18s}] OK={ok_cnt:3d}/{len(expected_s):3d} ({pct:5.1f}%) CRC_err={crc_errs} Orph={orphans}B", flush=True)
                 rows.append([rate, stream_mode, len(expected_s), ok_cnt, round(pct, 2), crc_errs, orphans])
-    finally:
-        rx_col.stop()
+                if rx_col.last_error is not None:
+                    all_ok = False
+        finally:
+            rx_col.stop()
 
     with open(ctx.csv_path("test3_per"), "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -1680,21 +1704,20 @@ def run_test_6_thermal_soak(ctx: BenchContext, soak_minutes: float) -> bool:
     seq_id = 90000
     all_ok = True
     rx_col = AsyncRxCollector(ctx.rx)
-    rx_col.start()
 
-    try:
-        for rate in soak_rates:
-            if g_abort_requested or not ctx.switch_both_radios(rate):
-                all_ok = False
-                break
-            print(f"\n--- Thermal Soak @ {rate} kbps ({ctx.power_dbm} dBm, {soak_minutes:.2f} min) ---", flush=True)
-            end_time = time.monotonic() + (soak_minutes * 60.0 * ctx.time_scale())
-            win_start = time.monotonic()
-            win_sent: set[int] = set()
-            minute_idx = 0
+    for rate in soak_rates:
+        if g_abort_requested or not ctx.switch_both_radios(rate):
+            all_ok = False
+            break
+        print(f"\n--- Thermal Soak @ {rate} kbps ({ctx.power_dbm} dBm, {soak_minutes:.2f} min) ---", flush=True)
+        end_time = time.monotonic() + (soak_minutes * 60.0 * ctx.time_scale())
+        win_start = time.monotonic()
+        win_sent: set[int] = set()
+        minute_idx = 0
+        rx_col.start()
+        try:
             rx_col.reset_stats()
-
-            while time.monotonic() < end_time and not g_abort_requested:
+            while time.monotonic() < end_time and not g_abort_requested and rx_col.last_error is None:
                 seq_id += 1
                 win_sent.add(seq_id)
                 sz = 253 if (seq_id % 2 == 0) else 173
@@ -1705,22 +1728,24 @@ def run_test_6_thermal_soak(ctx: BenchContext, soak_minutes: float) -> bool:
                     found, win_crc_err, _ = rx_col.wait_for(win_sent, 1.0)
                     ok_n = len(found)
                     pct = 100.0 * ok_n / max(1, len(win_sent))
+                    had_err = rx_col.last_error is not None
                     rx_col.stop()
                     r_ok, n_dbm, p_dbm, _, _ = ctx.rx.query_mode0_rssi(timeout_s=0.25)
-                    rx_col.start()
-                    rx_col.reset_stats()
+                    if time.monotonic() < end_time and not g_abort_requested and not had_err:
+                        rx_col.start()
+                        rx_col.reset_stats()
                     print(
                         f"  Min {minute_idx:2d}: OK={ok_n}/{len(win_sent)} ({pct:5.1f}%) CRC_err={win_crc_err} "
                         f"Noise={n_dbm if r_ok else '--'}dBm Pkt={p_dbm if r_ok else '--'}dBm AUX_Rst={ctx.tx.aux_resets}",
                         flush=True,
                     )
                     rows.append([rate, minute_idx, len(win_sent), ok_n, round(pct, 2), win_crc_err, n_dbm if r_ok else None, p_dbm if r_ok else None, ctx.tx.aux_resets])
-                    if pct < 95.0:
+                    if pct < 95.0 or had_err:
                         all_ok = False
                     win_sent.clear()
                     win_start = time.monotonic()
-    finally:
-        rx_col.stop()
+        finally:
+            rx_col.stop()
 
     with open(ctx.csv_path("test6_thermal"), "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)

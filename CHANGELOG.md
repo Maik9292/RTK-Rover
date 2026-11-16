@@ -5,6 +5,14 @@ All notable changes to the **RTK Rover** project will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [bench_e220_multirate.py v1.0.1] - 2026-11-16
+
+### Fixed
+- **Mode 3 / Background RX Thread Contention (`scripts/bench_e220_multirate.py` `v1.0.1`):**
+  - Diagnosed the `test/_044` Pi hardware failure across Tests `1`, `2`, `3`, and `6`: `run_test_1_toa_sweep()`, `run_test_2_guard_sweep()`, `run_test_3_per_comparison()`, and `run_test_6_thermal_soak()` started `AsyncRxCollector(ctx.rx)` *before* `ctx.switch_both_radios(rate)`, allowing the `1 ms` background `drain_rx()` poller to steal `C1 00 06` Mode 3 reply bytes (`raw=00 00 E3 23 4B 00`, `raw=none`, `raw=06`) and trigger Linux PySerial `SerialException: device reports readiness to read but returned no data (device disconnected or multiple access on port?)` while main-thread `configure_registers()` switched `/dev/ttyUSB0` to `9600` baud (Tests `4` and `5` did not use `AsyncRxCollector` and passed `9/9` RSSI sweep points with `0` spills and `20/20` Mode 3 air-rate switches).
+  - Moved `AsyncRxCollector.start()` strictly inside each `for rate in ...` loop *after* `ctx.switch_both_radios(rate)` returns, wrapped each rate iteration in `try ... finally: rx_col.stop()` (`join(timeout=1.5)`), added `AsyncRxCollector._io_lock` serializing `reset_stats()` vs. `_run()` calls to `rx.drain_rx()`, and added graceful `last_error` reporting in `_run()`/`wait_for()`.
+  - Added a `15 ms` settling pause before the first Mode 3 `0xC0`/`0xC2` write inside `configure_registers()` and updated `_tune_ftdi_latency_timer()`'s permission-denied notice to remind running with `sudo` for `1 ms` USB polling precision.
+
 ## [bench_e220_multirate.py v1.0.0] - 2026-11-16
 
 ### Added
