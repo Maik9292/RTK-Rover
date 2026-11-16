@@ -5,6 +5,18 @@ All notable changes to the **RTK Rover** project will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.8.11] - 2026-11-15
+
+### Fixed
+- **4-ACK Spaced Second 1 Air-Rate Switch Train & Superframe-Aware `Second 2` Alignment (`scripts/e220_pacer.py v3.6.5`, `src/e220_driver/e220_driver.cpp`):**
+  - Fixed the `9.6 kbps -> 4.8 kbps` air-rate switch failure exposed in `test/_042` (`Req #1` received cleanly by Base, `ACK #1 @ 0 ms` failed `3/3` times across `test/_040`, `_041`, and `_042`, and single backup `ACK #2 @ 223 ms` also dropped): replaced the `0 ms + 220 ms` two-shot ACK with a dedicated **`4-ACK` spaced train across Second 1 at `80 ms`, `260 ms`, `440 ms`, and `620 ms`** (`SWITCH_ACK_SLOTS_MS`, each carrying dynamic remaining `delay_ms` to `Second 2`) driven by a tight loop inside `_drive_pending_rate_switch()` so TCP socket `read_fn()` timeouts never delay `Second 1` ACK spacing or `Second 2` register switching, and flush stale `Second 1` RTCM backlog on switch completion.
+  - Eliminated the `0 ms` ACK transmission that collided with the offset between the Base Pi's `1PPS` wall clock and the Rover's NMEA-burst-synced superframe clock during `Second 0` post-uplink/RSSI turnaround.
+  - Updated `e220_process_rx_stage()` on the Rover (`ACK_RADIO_SWITCH` handler) to align `s_rate_switch_exec_ms` cleanly by superframe second (`ack_sf_sec == 0` -> `rem_ms + 1000`, `ack_sf_sec == 1` -> `rem_ms`, `>= 2` -> immediate) instead of the `rem_ms >= 200U` heuristic.
+- **Single-Subpacket (`Regime A`) Post-TX Guard at `<= 9.6 kbps` (`scripts/e220_pacer.py v3.6.5`):**
+  - Increased the minimum `Regime A` (`<= 200 B`, `AUX` remains `HIGH`) inter-frame guard in `send_packet()` and `_estimate_frame_toa_ms()` from `35 ms` to **`52 ms` at `<= 9.6 kbps`** (and **`40 ms` at `>= 19.2 kbps`**) so short single-subpacket frames (`1006`, `1230`, `ACK_SWITCH`) absorb the E220's UART framing delay and `LLCC68` TX->RX turnaround before any following `1074`/`1094` preamble.
+- **Rover Mode 0 RSSI Reply Timeout (`95 ms`) & Earlier End-of-Second Launch Window (`src/e220_driver/e220_driver.cpp`):**
+  - Eliminated the spurious `[E220 RX BURST] 5 B (AUX edges:+1 low:7.04ms)` RSSI reply bleed across `.000 s` observed in `test/_042` (`E220-900T30S` `70-85 ms` command turnaround outlasting the `65 ms` timeout): increased `E220_RSSI_REPLY_TIMEOUT_MS` to **`95 ms`**, tightened `post_uplink_gap` (`810..895 ms`), `end_of_sec_gap` (`855..895 ms`), and `idle_link_probe` (`<= 880 ms`) with `q_sf_ms >= 990U` hard cutoff, and cleared `isr_aux_fall_us = 0` before unmasking `e220_suppress_aux_isr` after uplink TX.
+
 ## [v0.8.10] - 2026-11-15
 
 ### Fixed

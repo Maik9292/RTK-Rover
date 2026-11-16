@@ -1,9 +1,9 @@
 # Ebyte E220-900T30S Practical Engineering Reference
 
-**Document Version:** 2.8  
+**Document Version:** 2.9  
 **Last Updated:** November 15, 2026  
-**Firmware Target:** `v0.8.10`  
-**Companion Software:** `e220_pacer.py v3.6.4`  
+**Firmware Target:** `v0.8.11`  
+**Companion Software:** `e220_pacer.py v3.6.5`  
 **Target Hardware:** Ebyte `E220-900T30S` (`850.125 - 930.125 MHz`, `1 W` / `+30 dBm` SMD UART LoRa Module)  
 **Applicability:** Directly applies to `E220-900T30S` / `E220-900T30D` (`1 W`) and `E220-900T22S` / `E220-900T22D` (`160 mW`, noting TX power bit differences in Section 4.4).  
 
@@ -167,13 +167,13 @@ Rover UART RX:                                                                  
                                       |<----------- Must Wait: ToA + 35ms Guard ---------->|
 ```
 
-* **Pacing Rule (`1..200 B`):**
+* **Pacing Rule (`1..200 B`, `e220_pacer.py v3.6.5`):**
   1. Verify `AUX == HIGH` before writing.
   2. Write complete frame atomically and `flush()`.
-  3. Sleep deterministically for **`ToA(N) + Guard_Delay`** (`Guard_Delay = 35 ms` @ `115200`). Never wait for an `AUX` falling edge.
+  3. Sleep deterministically for **`ToA(N) + Guard_Delay`** (`Guard_Delay = max(guard_delay_s, 52 ms)` @ `<= 9.6 kbps`, `max(guard_delay_s, 40 ms)` @ `>= 19.2 kbps` to absorb the E220 UART idle frame timeout and `LLCC68` TX->RX turnaround before a following `1074`/`1094` preamble). Never wait for an `AUX` falling edge.
 * **Mode 0 `C0 C1 C2 C3` Command Interaction During Active `<= 200 B` TX (`test/_038` Finding):**
   * Because `AUX` remains `HIGH` while a single-subpacket (`<= 200 B`, e.g., `48 B` Rover telemetry @ `4.8 kbps`, `~166 ms` on air) is actively transmitting on the `LLCC68`, writing `C0 C1 C2 C3 00 02` to `RXD` immediately after `Serial.flush()` causes the E220 MCU to hold the command in its UART RAM buffer and **pull `AUX` `LOW` for the remaining RF TX duration (`100-130 ms` at `4.8 kbps`)**, only outputting the 5-byte `0xC1 0x00 0x02 <noise> <pkt>` reply (`AUX` low `~7.0 ms`) once RF TX completes (`~166 ms` total latency).
-  * **Guard Rule (`v0.8.7`):** After transmitting any Mode 0 uplink packet (`<= 200 B`), hold Mode 0 RSSI queries and Mode 3 transitions until `s_tx_air_busy_until_ms` expires (and set `E220_RSSI_REPLY_TIMEOUT_MS = 180 ms`).
+  * **Guard Rule (`v0.8.11`):** After transmitting any Mode 0 uplink packet (`<= 200 B`), clear `isr_aux_fall_us = 0` when restoring `e220_suppress_aux_isr`, hold Mode 0 RSSI queries and Mode 3 transitions until `s_tx_air_busy_until_ms` expires, and allow `E220_RSSI_REPLY_TIMEOUT_MS = 95 ms` (bounded by `sf_ms >= 990 ms`).
 
 ### 5.3 Regime 2: Two-Subpacket Writes (`201 .. 400 Bytes`)
 ```text
@@ -270,11 +270,11 @@ Raw bytes lie in `0x80 .. 0xF5` (`>= 128`, representing `-128 dBm .. -11 dBm`).
 * If `len == 4` and `buf[0..1] == C1 00` and `buf[2] >= 0x80`: 4-byte reply (`noise = buf[2] - 256`, `pkt = buf[3] - 256`).
 * If `len == 5` and `buf[0..2] == C1 00 02`: 5-byte reply (`noise = buf[3] - 256`, `pkt = buf[4] - 256`).
 
-### 7.3 Quiet-Window Synchronization (`v0.8.10` Superframe TDMA)
+### 7.3 Quiet-Window Synchronization (`v0.8.11` Superframe TDMA)
 Never issue `C0 C1 C2 C3 00 02` blindly during active reception, during single-subpacket RF TX (`< s_tx_air_busy_until_ms`), or when a Mode 3 rate-switch / rollback is due:
-1. **Second 0 Post-Uplink Gap (`sf_sec == 0`):** Poll strictly *after* the Rover's uplink TX finishes RF airing (`now >= s_tx_air_busy_until_ms` and `sf_ms` in `810..935 ms`), accommodating `48 B` uplink air time at all rates (`~60 ms` @ `19.2k`, `~105 ms` @ `9.6k`, `~168 ms` @ `4.8k`) with zero `.000 s` spillover.
-2. **Seconds 1..4 End-of-Second Micro-Slot (`sf_sec != 0`):** The Base (`e220_pacer.py v3.6.4`) enforces an `850.0 ms` downlink ceiling at `>= 9.6 kbps` (and `1` MSM up to `1,750 ms` in Sec 1..3 / `1,680 ms` in Sec 4 at `4.8 kbps`, with `850.0 ms` caps on follow-on/non-MSM frames). The Rover polls inside **`sf_ms = 885..935 ms`** (`E220_RSSI_POLL_INTERVAL_MS = 750 ms`, `last_rx_ms` idle `>= 25 ms`), requiring either `s_last_valid_msm_utc_sec == sf_utc_sec` (essential at `<= 5.0 kbps` where a single lead `1094` may span past `885 ms`) or `last_rx_ms` idle `>= 200 ms` at `> 5.0 kbps`. Also caps `idle_link_probe` at `sf_ms <= 900 ms`.
-3. **Bounded Intercept, `65 ms` / `.985 s` Hard Expiry & Carrier-Contamination Filter:** Set `E220_RSSI_REPLY_TIMEOUT_MS = 65 ms` and expire any active query at `sf_ms >= 985 ms` so queries never spill past `.000 s`. Gate Stage `0b` `0xC1 0x00` interception within `250 ms` of `last_rssi_poll_ms`, reject both `0x80` (`-128 dBm`) sentinel glitches and carrier-contaminated noise samples (`cand_noise_dbm > -65` within `8 dB` of `cand_pkt_dbm`), and bound `noise_raw` (`0x81..0xE4`) and `pkt_raw` (`0x80..0xF6`). Clear `isr_aux_fall_us = 0` when unmasking `e220_suppress_aux_isr`. Never mark `radio_online = false` or `rssi_valid = false` on poll timeout streak if RTCM bytes arrived within `10 s`.
+1. **Second 0 Post-Uplink Gap (`sf_sec == 0`):** Poll strictly *after* the Rover's uplink TX finishes RF airing (`now >= s_tx_air_busy_until_ms` and `sf_ms` in `810..895 ms`), accommodating `48 B` uplink air time at all rates (`~60 ms` @ `19.2k`, `~105 ms` @ `9.6k`, `~168 ms` @ `4.8k`) and leaving a full `95 ms` reply margin before `.000 s`.
+2. **Seconds 1..4 End-of-Second Micro-Slot (`sf_sec != 0`):** The Base (`e220_pacer.py v3.6.5`) enforces an `850.0 ms` downlink ceiling at `>= 9.6 kbps` (and `1` MSM up to `1,750 ms` in Sec 1..3 / `1,680 ms` in Sec 4 at `4.8 kbps`, with `850.0 ms` caps on follow-on/non-MSM frames). The Rover polls inside **`sf_ms = 855..895 ms`** (`E220_RSSI_POLL_INTERVAL_MS = 750 ms`, `last_rx_ms` idle `>= 25 ms`), requiring either `s_last_valid_msm_utc_sec == sf_utc_sec` (essential at `<= 5.0 kbps` where a single lead `1094` may span past `855 ms`) or `last_rx_ms` idle `>= 200 ms` at `> 5.0 kbps`. Also caps `idle_link_probe` at `sf_ms <= 880 ms`.
+3. **Bounded Intercept, `95 ms` / `.990 s` Hard Expiry & Carrier-Contamination Filter:** Set `E220_RSSI_REPLY_TIMEOUT_MS = 95 ms` (accommodating the E220-900T30S's measured `70-85 ms` response latency observed in `test/_042`) and expire any active query at `sf_ms >= 990 ms` so queries never spill past `.000 s`. Gate Stage `0b` `0xC1 0x00` interception within `250 ms` of `last_rssi_poll_ms`, reject both `0x80` (`-128 dBm`) sentinel glitches and carrier-contaminated noise samples (`cand_noise_dbm > -65` within `8 dB` of `cand_pkt_dbm`), and bound `noise_raw` (`0x81..0xE4`) and `pkt_raw` (`0x80..0xF6`). Clear `isr_aux_fall_us = 0` when unmasking `e220_suppress_aux_isr`. Never mark `radio_online = false` or `rssi_valid = false` on poll timeout streak if RTCM bytes arrived within `10 s`.
 
 ---
 
@@ -301,7 +301,7 @@ Because both Base and Rover operate on the same frequency (`925.125 MHz`), downl
                                                           720..845ms (rate-adaptive)
 ```
 
-* **Base Station (`e220_pacer.py v3.6.4`):** Enforces a closed-loop `850.0 ms` Seconds `1..4` ceiling at `>= 9.6 kbps` (and `1,750 ms` Sec 1..3 / `1,680 ms` Sec 4 caps for `1` MSM at `<= 4.8 kbps` with opportunistic smaller-MSM admission and `850 ms` follow-on caps), starvation-age constellation reservation + Fit-or-Skip MSM admission (`>= 48 ms` multi-subpacket guard), drops empty MSM frames (`<= 28 B`), and enforces Second 0 downlink cutoffs (`700 ms` @ `<= 9.6k`, `740 ms` @ `>= 19.2k`) before listening strictly for Rover uplink frames (`48 B` V3 telemetry with firmware version, or legacy `45 B` / `39 B`).
+* **Base Station (`e220_pacer.py v3.6.5`):** Enforces a closed-loop `850.0 ms` Seconds `1..4` ceiling at `>= 9.6 kbps` (and `1,750 ms` Sec 1..3 / `1,680 ms` Sec 4 caps for `1` MSM at `<= 4.8 kbps` with opportunistic smaller-MSM admission and `850 ms` follow-on caps), starvation-age constellation reservation + Fit-or-Skip MSM admission (`>= 52 ms` `<= 9.6 kbps` / `>= 40 ms` `>= 19.2 kbps` single-subpacket guards and `>= 48 ms` multi-subpacket guard), drops empty MSM frames (`<= 28 B`), and enforces Second 0 downlink cutoffs (`700 ms` @ `<= 9.6k`, `740 ms` @ `>= 19.2k`) before listening strictly for Rover uplink frames (`48 B` V3 telemetry with firmware version, or legacy `45 B` / `39 B`).
 * **Rover (`e220_driver.cpp`):** Transmits its 48-byte binary telemetry frame (or 10-byte rate switch request) exclusively inside the GPS-disciplined Second 0 uplink window (`775..845 ms` @ `>= 19.2k`, `745..825 ms` @ `9.6k`, `720..800 ms` @ `4.8k`), waiting for E220 TX completion via `e220_wait_tx_complete(25, 300)`.
 
 ### 9.2 48-Byte Uplink Frame Specification (`RoverUplinkTelemetry_t`)
@@ -361,10 +361,9 @@ sequenceDiagram
 
     Note over Rover: User taps [LORA] to cycle 19.2k / 9.6k / 4.8k<br/>Pre-TX queue allows rapid cycling or cancel
     Rover->>Base: CMD_REQ_RADIO_SWITCH (10B, Second 0 Uplink, req_id)
-    Note over Base: Schedules ACK@T0+1, Switch@T0+2<br/>Holds RTCM downlink during Second 1
-    Base->>Rover: ACK_RADIO_SWITCH #1 @ T0+1 0ms (11B via send_packet)
-    Base->>Rover: ACK_RADIO_SWITCH #2 @ T0+1 >=220ms (backup)
-    Note over Rover: Aligns hardware switch to top of Second 2 (T0+2)
+    Note over Base: Schedules 4-ACK train@T0+1, Switch@T0+2<br/>Holds RTCM downlink during Second 1
+    Base->>Rover: ACK_RADIO_SWITCH #1..#4 @ T0+1 80/260/440/620ms
+    Note over Rover: Superframe-aligned switch at Second 2 (T0+2)
     Note over Base: At T0+2 0ms: Reconfigures E220 Mode 3 registers
     Note over Rover: At T0+2 0ms: Reconfigures E220 Mode 3 registers
     Note over Rover,Base: Both arm 60s rollback watchdog until first valid post-switch traffic
@@ -421,6 +420,7 @@ Never pass raw E220 UART output directly to a downstream GNSS receiver or parser
 | **Mode 0 RSSI query at `4.8k` pulls `AUX` `LOW` for `100-130 ms` and replies after `166 ms` (`[E220 RX BURST] 5 B`).** | `C0 C1 C2 C3 00 02` was written right after `48 B` uplink `flush()` while the single-subpacket TX was still airing on `LLCC68`. | Track `s_tx_air_busy_until_ms` after uplink TX and use `180 ms` RSSI timeout in `v0.8.7` (Section 5.2 & 7.3). |
 | **`[E220 WRITE FAIL] got 3 bytes` (`FF FF FF`) or `got 4 bytes` on rate switch, followed immediately by `E220 READ OK`.** | UART switched to `9600` baud *before* raising `M0/M1` (or `M0/M1` bounced at `9600`), injecting a framing glitch into Mode 3 parser. | Upgrade to `v0.8.9+` + `e220_pacer.py v3.6.2+` (asserts `M0/M1=1` before `9600` baud switch, runs `0xC1` sync read, avoids bounce on retries `1..3`). |
 | **`[WARN] Shed X stale queued MSM frames` at `9.6k`/`19.2k`, or `Noise:-33 dBm` / `Subpacket 2` orphan tails at `4.8k`.** | Open-loop `1074+1094` epoch exceeds `850 ms` cutoff or `4.8k` `end_of_sec_gap` polls mid-packet without checking `s_last_valid_msm_utc_sec`. | Upgrade to `v0.8.10` + `e220_pacer.py v3.6.4` (closed-loop Fit-or-Skip + constellation reservation, `4.8k` `1,750 ms`/`1,680 ms` Sec 1..4 caps & opportunistic Sec 0 fallback, `>= 48 ms` guard, `s_last_valid_msm_utc_sec` & `885..935 ms` / `65 ms` / `.985 s` RSSI gate). |
+| **`9.6k -> 4.8k` switch fails (`ACK #1 @ 0 ms` missed, single backup drops) or `[E220 RX BURST] 5 B` spills across `.000 s`.** | Base `0 ms` ACK hits NMEA-lagged Rover `Second 0` turnaround; `65 ms` RSSI timeout is shorter than `70-85 ms` E220 reply; `35 ms` `Regime A` guard under-paces at `<= 9.6k`. | Upgrade to `v0.8.11` + `e220_pacer.py v3.6.5` (`80/260/440/620 ms` 4-ACK `Second 1` train, `52 ms` `Regime A` guard @ `<= 9.6k`, `855..895 ms` / `95 ms` / `.990 s` RSSI window). |
 | **At 9.6 kbps, Rover loses RTK Fix and Telemetry Heartbeats stop.** | Channel saturated by 4-constellation 650 B/s stream without interleaving. | Enable Adaptive Constellation Interleaving in `e220_pacer.py v3.3.1+` (Section 6.3). |
 | **Subpacket 2 of 340B RTCM frames dropped at 9.6 kbps.** | Receiver truncation timeout too short (`260 ms`). | Scale gatekeeper timeout to `650 ms` at 9.6 kbps (Section 6.4). |
 | **Telemetry shows `Bat:0% (0.00V)` and `Hdg: 0.0deg [NONE]` while Rover screen is valid.** | Telemetry state fed from Core 0 before Core 1 attaches PMIC battery and woods fallback heading. | Move `e220_feed_telemetry_state(&ui_state)` to Core 1 post-sensor-fusion (Section 9.4). |

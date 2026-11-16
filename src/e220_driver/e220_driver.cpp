@@ -149,13 +149,13 @@ extern "C" bool e220_is_uplink_slot_active(uint32_t now_ms)
 // =========================================================================
 // Non-Blocking Mode 0 Live RSSI / Ambient Noise Register Poll State
 // Queries C0 C1 C2 C3 00 02 once per Second 0 post-uplink quiet window and
-// in the GPS-disciplined end-of-second micro-slot (885..935ms in Seconds 1..4).
+// in the GPS-disciplined end-of-second micro-slot (855..895ms in Seconds 1..4).
 // Parses both 4-byte (C1 00 <noise> <pkt>) and 5-byte (C1 00 02 <noise> <pkt>)
 // E220-900T30S replies (requires REG1 Bit 5 = 0x20).
 // =========================================================================
 #define E220_RSSI_POLL_INTERVAL_MS  750U
 #define E220_RSSI_IDLE_POLL_MS      2000U
-#define E220_RSSI_REPLY_TIMEOUT_MS  65U
+#define E220_RSSI_REPLY_TIMEOUT_MS  95U
 
 static bool     rssi_query_active       = false;
 static uint32_t last_rssi_poll_ms       = 0;
@@ -719,12 +719,19 @@ static void e220_process_rx_stage(void)
                     if (ack.status == 0 && ack.req_id == s_rate_switch_req_id) {
                         if (!s_rate_switch_ack_received) {
                             s_rate_switch_ack_received = true;
-                            uint32_t rx_now_ms = millis();
-                            if (gps_time_sync.time_synced) {
+                            uint32_t rx_now_ms  = millis();
+                            uint32_t ack_sf_sec = 0;
+                            uint32_t ack_sf_ms  = 0;
+                            if (e220_get_superframe_clock(rx_now_ms, NULL, &ack_sf_sec, &ack_sf_ms)) {
                                 // Align hardware register reconfiguration precisely to top of Second 2 (T0 + 2 @ 0 ms)
-                                uint32_t elapsed = rx_now_ms - gps_time_sync.last_sync_millis;
-                                uint32_t rem_ms  = 1000U - (elapsed % 1000U);
-                                s_rate_switch_exec_ms = (rem_ms >= 200U) ? (rx_now_ms + rem_ms) : (rx_now_ms + ack.switch_delay_ms);
+                                uint32_t rem_ms = 1000U - ack_sf_ms;
+                                if (ack_sf_sec == 0U) {
+                                    s_rate_switch_exec_ms = rx_now_ms + rem_ms + 1000U;
+                                } else if (ack_sf_sec == 1U) {
+                                    s_rate_switch_exec_ms = rx_now_ms + rem_ms;
+                                } else {
+                                    s_rate_switch_exec_ms = rx_now_ms;
+                                }
                             } else {
                                 s_rate_switch_exec_ms = rx_now_ms + ack.switch_delay_ms;
                             }
@@ -1101,7 +1108,7 @@ extern "C" void e220_poll_and_forward_rtcm(void)
             uint32_t q_sf_ms  = 0;
             bool     has_q_sf = e220_get_superframe_clock(q_now_ms, NULL, NULL, &q_sf_ms);
             if ((q_now_ms - rssi_query_start_ms > E220_RSSI_REPLY_TIMEOUT_MS) ||
-                (has_q_sf && q_sf_ms >= 985U)) {
+                (has_q_sf && q_sf_ms >= 990U)) {
                 rssi_query_active     = false;
                 isr_aux_fall_us       = 0;
                 e220_suppress_aux_isr = false;
@@ -1195,8 +1202,8 @@ extern "C" void e220_poll_and_forward_rtcm(void)
     // 5. Synchronized Mode 0 Ambient Noise & Last Packet RSSI query:
     //    - Suppressed while an air-rate switch request/ACK handshake, pending Mode 3 switch/rollback,
     //      or single-subpacket RF TX is actively in flight on the LLCC68.
-    //    - In Second 0: poll strictly after uplink RF transmission finishes (810..935ms).
-    //    - In Seconds 1..4: poll inside the GPS-disciplined end-of-second quiet micro-slot (885..935ms)
+    //    - In Second 0: poll strictly after uplink RF transmission finishes (810..895ms).
+    //    - In Seconds 1..4: poll inside the GPS-disciplined end-of-second quiet micro-slot (855..895ms)
     //      while Base enforces an 850ms downlink TX cutoff, giving 1.0 Hz updates with zero collisions.
     uint32_t sf_utc_sec = 0;
     uint32_t sf_sec     = 0;
@@ -1225,12 +1232,12 @@ extern "C" void e220_poll_and_forward_rtcm(void)
         bool post_uplink_gap = has_sf && (sf_sec == 0U) &&
                                (s_last_uplink_utc_sec == sf_utc_sec) &&
                                (s_last_rssi_poll_utc_sec != sf_utc_sec) &&
-                               (sf_ms >= 810U) && (sf_ms <= 935U);
+                               (sf_ms >= 810U) && (sf_ms <= 895U);
 
         bool msm_done_this_sec = (s_last_valid_msm_utc_sec == sf_utc_sec);
         bool end_of_sec_gap  = has_sf && (sf_sec != 0U) &&
                                (s_last_rssi_poll_utc_sec != sf_utc_sec) &&
-                               (sf_ms >= 885U) && (sf_ms <= 935U) &&
+                               (sf_ms >= 855U) && (sf_ms <= 895U) &&
                                (e220_stats.last_rx_ms == 0 || (now - e220_stats.last_rx_ms >= 25U)) &&
                                (msm_done_this_sec ||
                                 (s_active_air_rate > 5.0f &&
@@ -1245,7 +1252,7 @@ extern "C" void e220_poll_and_forward_rtcm(void)
                                (now - last_rssi_poll_ms >= 1800U);
 
         bool idle_link_probe = (e220_stats.last_rx_ms == 0 || (now - e220_stats.last_rx_ms > 3000U)) &&
-                               (!has_sf || ((sf_sec != 0U || sf_ms < 650U) && sf_ms <= 900U)) &&
+                               (!has_sf || ((sf_sec != 0U || sf_ms < 650U) && sf_ms <= 880U)) &&
                                (now - last_rssi_poll_ms >= 2000U);
 
         if (post_uplink_gap || end_of_sec_gap || unsynced_gap || idle_link_probe) {
@@ -1304,6 +1311,7 @@ extern "C" void e220_poll_and_forward_rtcm(void)
                     s_tx_air_busy_until_ms = tx_start_ms + e220_estimate_tx_air_ms(n, s_active_air_rate);
                     e220_wait_tx_complete(25, 300);
                     now = millis();
+                    isr_aux_fall_us = 0;
                     e220_suppress_aux_isr = false;
                     s_rate_switch_req_tx_ms = now;
                     s_last_uplink_tx_ms     = now;
@@ -1333,6 +1341,7 @@ extern "C" void e220_poll_and_forward_rtcm(void)
                 s_tx_air_busy_until_ms = tx_start_ms + e220_estimate_tx_air_ms(n, s_active_air_rate);
                 e220_wait_tx_complete(25, 300);
                 now = millis();
+                isr_aux_fall_us = 0;
                 e220_suppress_aux_isr = false;
                 s_last_uplink_tx_ms   = now;
                 s_last_uplink_utc_sec = sf_utc_sec;

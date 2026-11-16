@@ -69,7 +69,7 @@ except ImportError:
 
 __filename__ = "e220_pacer.py"
 __app_name__ = "e220_pacer"
-__version__ = "3.6.4"
+__version__ = "3.6.5"
 __date__ = "2026-11-15"
 
 # Force unbuffered output so systemd journalctl displays entries in real time
@@ -167,6 +167,9 @@ FMT_REQ_SWITCH = "<2sBBBBHH"
 # 11-Byte Remote Air-Rate Switch Acknowledge Format:
 # sync(2s), mid(B), plen(B), req_id(H), status(B), delay_ms(H), crc(H)
 FMT_ACK_SWITCH = "<2sBBHBHH"
+
+# Spaced Second 1 ACK train offsets (ms) avoiding 0ms Base-1PPS/Rover-NMEA clock edge collision
+SWITCH_ACK_SLOTS_MS: tuple[float, ...] = (80.0, 260.0, 440.0, 620.0)
 
 
 def crc16_ccitt(data: bytes) -> int:
@@ -314,6 +317,7 @@ class E220Pacer:
         self.pending_switch_ack_frame: Optional[bytes] = None
         self.pending_switch_ack_sent: bool = False
         self.pending_switch_ack_repeat_sent: bool = False
+        self.pending_switch_acks_sent: int = 0
         self.pending_switch_req_id: int = 0
         self.pending_switch_target_rate: float = 19.2
         self.pending_switch_ack_sec: int = 0
@@ -666,7 +670,7 @@ class E220Pacer:
             if rem_air_s > 0.0:
                 time.sleep(rem_air_s)
 
-            eff_guard_s = self._get_effective_guard_delay_s()
+            eff_guard_s = max(self._get_effective_guard_delay_s(), 0.052 if self.air_rate_kbps <= 9.6 else 0.040)
             time.sleep(eff_guard_s)
             detail = (
                 f"1 pkt | EstAir={est_air_s*1000:.1f}ms"
@@ -958,45 +962,60 @@ class E220Pacer:
         guard_s = self._get_effective_guard_delay_s()
         if num_subpkts >= 2:
             guard_s = max(guard_s, 0.048) + 0.008 * float(num_subpkts - 1)
+        else:
+            guard_s = max(guard_s, 0.052 if self.air_rate_kbps <= 9.6 else 0.040)
         return (air_s + uart_s + guard_s) * 1000.0
+
+    @staticmethod
+    def _build_switch_ack_frame(req_id: int, delay_ms: int) -> bytes:
+        """Builds a CRC16-protected 11-byte ACK_RADIO_SWITCH frame with remaining delay to Second 2."""
+        clamped_delay = max(100, min(1500, int(delay_ms)))
+        ack_body = struct.pack(FMT_ACK_SWITCH, ROVER_SYNC, MSG_ID_ACK_SWITCH, 5, req_id, 0, clamped_delay, 0)
+        ack_crc = crc16_ccitt(ack_body[:-2])
+        return ack_body[:-2] + struct.pack("<H", ack_crc)
 
     def _transmit_pending_switch_ack_if_due(self, utc_sec: int, ms_in_sec: float) -> None:
         if self.pending_switch_ack_frame is None or self.ser is None or not self.ser.is_open:
             return
-        ack_frame = self.pending_switch_ack_frame
+        if utc_sec != self.pending_switch_ack_sec:
+            return
+        total_slots = len(SWITCH_ACK_SLOTS_MS)
+        if self.pending_switch_acks_sent >= total_slots:
+            return
+        if ms_in_sec < SWITCH_ACK_SLOTS_MS[self.pending_switch_acks_sent]:
+            return
+
         req_id = self.pending_switch_req_id
-        if not self.pending_switch_ack_sent and utc_sec >= self.pending_switch_ack_sec:
-            self.pending_switch_ack_sent = True
-            _, detail, total_dt = self.send_packet(ack_frame)
-            print(
-                f"[LORA SWITCH] Sent synchronous ACK #1 at Second 1 boundary "
-                f"(Req #{req_id}, delay 1000ms | {detail}, {total_dt*1000:.1f}ms)",
-                flush=True,
-            )
-        elif (
-            self.pending_switch_ack_sent
-            and not self.pending_switch_ack_repeat_sent
-            and utc_sec == self.pending_switch_ack_sec
-            and ms_in_sec >= 220.0
-        ):
-            self.pending_switch_ack_repeat_sent = True
-            _, detail, total_dt = self.send_packet(ack_frame)
-            print(
-                f"[LORA SWITCH] Sent backup ACK #2 in Second 1 "
-                f"(Req #{req_id} @ {ms_in_sec:.0f}ms | {detail}, {total_dt*1000:.1f}ms)",
-                flush=True,
-            )
+        slot_idx = self.pending_switch_acks_sent + 1
+        rem_ms = max(100, int(round(1000.0 - ms_in_sec)))
+        ack_frame = self._build_switch_ack_frame(req_id, rem_ms)
+        self.pending_switch_acks_sent = slot_idx
+        self.pending_switch_ack_sent = True
+        self.pending_switch_ack_repeat_sent = (slot_idx >= total_slots)
 
-    def _service_superframe_events(self, buffer: Optional[bytearray] = None) -> bool:
-        """
-        Enforces GPS-disciplined 5-second superframe TDMA:
-          - Seconds 1..4: 100% Base Downlink (after synchronous Second 1 ACK or Second 2 switch if scheduled)
-          - Second 0: Downlink cutoff @ 700ms (<=9.6k) or 740ms (>=19.2k), then silent RX window until Second 1.
-        Returns True if RTCM downlink TX must hold (Second 1 pending synchronous Second 2 air-rate switch).
-        """
-        utc_sec, superframe_sec, ms_in_sec = self._get_superframe_timing()
+        _, detail, total_dt = self.send_packet(ack_frame)
+        print(
+            f"[LORA SWITCH] Sent synchronous ACK #{slot_idx}/{total_slots} in Second 1 "
+            f"(Req #{req_id} @ {ms_in_sec:.0f}ms, delay {rem_ms}ms | {detail}, {total_dt*1000:.1f}ms)",
+            flush=True,
+        )
 
-        self._transmit_pending_switch_ack_if_due(utc_sec, ms_in_sec)
+    def _drive_pending_rate_switch(self, buffer: Optional[bytearray] = None) -> bool:
+        """Drives the pending Second 1 4-ACK spaced train and executes Second 2 E220 reconfiguration."""
+        if self.pending_switch_exec_sec <= 0:
+            return False
+
+        utc_sec, _, _ = self._get_superframe_timing()
+        if utc_sec < self.pending_switch_exec_sec:
+            while running:
+                utc_sec, _, cur_ms = self._get_superframe_timing()
+                if utc_sec >= self.pending_switch_exec_sec:
+                    break
+                if utc_sec < self.pending_switch_ack_sec:
+                    self.poll_uplink()
+                else:
+                    self._transmit_pending_switch_ack_if_due(utc_sec, cur_ms)
+                time.sleep(0.005)
 
         if self.pending_switch_exec_sec > 0 and utc_sec >= self.pending_switch_exec_sec:
             target_rate = self.pending_switch_target_rate
@@ -1005,6 +1024,7 @@ class E220Pacer:
             self.pending_switch_ack_frame = None
             self.pending_switch_ack_sent = False
             self.pending_switch_ack_repeat_sent = False
+            self.pending_switch_acks_sent = 0
             ok = self.reconfigure_air_rate(target_rate)
             if ok:
                 self.fallback_air_rate = prev_rate
@@ -1019,12 +1039,22 @@ class E220Pacer:
                 )
             else:
                 print(f"[ERROR] Failed to reconfigure Base E220 to {target_rate}k! Staying on {prev_rate}k.", flush=True)
-            if buffer is not None and len(buffer) > 1024:
+            if buffer is not None and len(buffer) > 0:
                 self._shed_stale_backlog(buffer)
 
-        if self.pending_switch_exec_sec > 0 and utc_sec < self.pending_switch_exec_sec:
+        return self.pending_switch_exec_sec > 0 and utc_sec < self.pending_switch_exec_sec
+
+    def _service_superframe_events(self, buffer: Optional[bytearray] = None) -> bool:
+        """
+        Enforces GPS-disciplined 5-second superframe TDMA:
+          - Seconds 1..4: 100% Base Downlink (after synchronous Second 1 ACK train & Second 2 switch if scheduled)
+          - Second 0: Downlink cutoff @ 700ms (<=9.6k) or 740ms (>=19.2k), then silent RX window until Second 1.
+        Returns True if RTCM downlink TX must hold (Second 1 pending synchronous Second 2 air-rate switch).
+        """
+        if self._drive_pending_rate_switch(buffer):
             return True
 
+        _, superframe_sec, ms_in_sec = self._get_superframe_timing()
         cutoff_ms = self._get_sec0_downlink_cutoff_ms()
         if superframe_sec == 0 and ms_in_sec >= cutoff_ms:
             # Enter strict Second 0 half-duplex uplink listening window until Second 1 (zero RTCM TX)
@@ -1036,16 +1066,13 @@ class E220Pacer:
                 self._check_watchdog_revert()
                 time.sleep(0.005)
 
-            # Immediately transmit queued Rate Switch ACK at top of Second 1 before any RTCM frame
-            utc_sec_after, _, ms_after = self._get_superframe_timing()
-            self._transmit_pending_switch_ack_if_due(utc_sec_after, ms_after)
+            # Drive queued Second 1 4-ACK train & Second 2 hardware switch if triggered in Second 0
+            if self._drive_pending_rate_switch(buffer):
+                return True
 
             # Shed stale queued RTCM backlog at lower air rates to keep differential age fresh
             if buffer is not None and len(buffer) > self._max_single_epoch_bytes() and self.air_rate_kbps <= 9.6:
                 self._shed_stale_backlog(buffer)
-
-            if self.pending_switch_exec_sec > 0 and utc_sec_after < self.pending_switch_exec_sec:
-                return True
 
         return False
 
@@ -1338,15 +1365,14 @@ class E220Pacer:
             flush=True,
         )
 
-        # Build ACK frame: sync(2), msg_id=0x82(1), plen=5(1), req_id(2), status=0(1), delay=1000ms(2), crc(2) = 11B
-        ack_body = struct.pack(FMT_ACK_SWITCH, ROVER_SYNC, MSG_ID_ACK_SWITCH, 5, req_id, 0, 1000, 0)
-        ack_crc = crc16_ccitt(ack_body[:-2])
-        ack_frame = ack_body[:-2] + struct.pack("<H", ack_crc)
+        # Build default ACK frame: sync(2), msg_id=0x82(1), plen=5(1), req_id(2), status=0(1), delay=1000ms(2), crc(2) = 11B
+        ack_frame = self._build_switch_ack_frame(req_id, 1000)
 
-        # Schedule synchronous ACK at top of Second 1 (T0 + 1) and hardware switch at top of Second 2 (T0 + 2)
+        # Schedule synchronous 4-ACK train in Second 1 (T0 + 1) and hardware switch at top of Second 2 (T0 + 2)
         self.pending_switch_ack_frame = ack_frame
         self.pending_switch_ack_sent = False
         self.pending_switch_ack_repeat_sent = False
+        self.pending_switch_acks_sent = 0
         self.pending_switch_req_id = req_id
         self.pending_switch_target_rate = target_rate
         self.pending_switch_ack_sec = ack_sec
