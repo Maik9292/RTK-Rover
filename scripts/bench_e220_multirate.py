@@ -65,7 +65,7 @@ except ImportError:
 
 __filename__ = os.path.basename(__file__)
 __app_name__ = "bench_e220_multirate"
-__version__ = "v1.0.1"
+__version__ = "v1.0.2"
 __date__ = "2026-11-16"
 
 
@@ -131,36 +131,67 @@ def crc16_ccitt(data: bytes) -> int:
 
 
 def estimate_subpacket_air_s(n_bytes: int, air_rate_kbps: float) -> float:
-    """Return empirically calibrated LLCC68 single-subpacket Time-on-Air (seconds)."""
+    """
+    Return silicon-calibrated single-subpacket Time-on-Air (1..200 B, seconds)
+    fitted to Pi FTDI-1ms empirical E220-900T30S measurements (test/_045, max err <= 1.9 ms).
+    """
     if n_bytes <= 0:
         return 0.0
-    rate_bps = max(air_rate_kbps, 2.4) * 1000.0
+    n = float(min(n_bytes, 200))
     if air_rate_kbps <= 5.0:
-        return 0.022 + ((float(n_bytes) + 16.0) * 8.0) / (rate_bps * 0.60)
-    return 0.016 + ((float(n_bytes) + 16.0) * 8.0) / (rate_bps * 0.68)
+        return 0.070 + (0.00187 * n)
+    if air_rate_kbps <= 10.0:
+        return 0.045 + (0.00119 * n)
+    if air_rate_kbps <= 20.0:
+        return 0.029 + (0.00080 * n)
+    return 0.016 + ((n + 16.0) * 8.0) / (max(air_rate_kbps, 2.4) * 1000.0 * 0.68)
+
+
+def estimate_frame_air_s(frame_len: int, air_rate_kbps: float) -> float:
+    """
+    Return silicon-calibrated end-to-end RF air + E220 framing duration (seconds)
+    for 1..400 B single-burst frames (test/_045 fit, max err <= 1.9 ms), or
+    summed <=200 B chunk durations for >400 B frames.
+    """
+    if frame_len <= 0:
+        return 0.0
+    if frame_len <= 200:
+        return estimate_subpacket_air_s(frame_len, air_rate_kbps)
+    if frame_len <= 400:
+        n = float(frame_len)
+        if air_rate_kbps <= 5.0:
+            return 0.128 + (0.00180 * n)
+        if air_rate_kbps <= 10.0:
+            return 0.080 + (0.00112 * n)
+        if air_rate_kbps <= 20.0:
+            return 0.055 + (0.00070 * n)
+    rem = frame_len
+    tot = 0.0
+    while rem > 0:
+        chunk = min(rem, 200)
+        tot += estimate_subpacket_air_s(chunk, air_rate_kbps)
+        rem -= chunk
+    return tot
 
 
 def estimate_frame_toa_ms(frame_len: int, air_rate_kbps: float, guard_s: Optional[float] = None, baud: int = DEFAULT_BAUD) -> float:
     """Estimate complete UART + RF air time + guard delay for an arbitrary frame length (ms)."""
     if frame_len <= 0:
         return 0.0
-    rem = frame_len
-    air_s = 0.0
-    subpkts = 0
-    while rem > 0:
-        chunk = min(rem, 200)
-        air_s += estimate_subpacket_air_s(chunk, air_rate_kbps)
-        rem -= chunk
-        subpkts += 1
+    subpkts = (frame_len + 199) // 200
+    air_s = estimate_frame_air_s(frame_len, air_rate_kbps)
     uart_s = (float(frame_len) * 10.0) / max(float(baud), 9600.0)
     if guard_s is None:
-        if subpkts >= 2:
+        if frame_len > 400:
+            per_chunk_g = 0.052 if air_rate_kbps <= 9.6 else 0.040
+            eff_guard = per_chunk_g * float(subpkts)
+        elif subpkts >= 2:
             eff_guard = 0.050 if air_rate_kbps <= 5.0 else 0.048
             eff_guard += 0.008 * float(subpkts - 1)
         else:
             eff_guard = 0.052 if air_rate_kbps <= 9.6 else 0.040
     else:
-        eff_guard = guard_s
+        eff_guard = guard_s * float(subpkts if frame_len > 400 else 1)
     return (air_s + uart_s + eff_guard) * 1000.0
 
 
@@ -543,15 +574,21 @@ class BaseE220Radio:
                 break
 
         if ok and verify_read:
+            # Guard >=20ms between Mode 3 C2 write echo and follow-up C1 readback
+            self._sleep(0.020)
             rb = self._mode3_read_6()
+            if rb is None:
+                self._sleep(0.025)
+                rb = self._mode3_read_6()
             if rb != target_6:
                 ok = False
                 last_hex = f"verify_mismatch:{rb.hex() if rb else 'none'}"
 
-        # Restore Mode 0 (M0=0, M1=0) -> wait -> restore operational baud
+        # Restore Mode 0 (M0=0, M1=0) -> Mode 3 exit settle -> restore baud -> RF synth settle (>= 80ms)
         self.set_mode_pins(0, 0)
+        self._sleep(0.025)
         self.set_baudrate(self.baud)
-        self._sleep(0.045)
+        self._sleep(0.055)
         self.wait_aux_high(1.0, 5.0)
         self.drain_rx()
 
@@ -715,7 +752,7 @@ class BaseE220Radio:
         else:
             full_heads = subpkts - 1
             tail_len = n - (full_heads * 200)
-            head_air_scaled = float(full_heads) * estimate_subpacket_air_s(200, self.air_rate_kbps) * ts
+            total_air_scaled = estimate_frame_air_s(n, self.air_rate_kbps) * ts
             tail_air_scaled = estimate_subpacket_air_s(tail_len, self.air_rate_kbps) * ts
             probe_s = 0.050 * ts
             while (time.monotonic() - t_flush) < probe_s:
@@ -731,12 +768,12 @@ class BaseE220Radio:
                     self.aux_resets += 1
                 aux_low_ms = ((time.monotonic() - t_low) * 1000.0) / ts
                 elapsed_scaled = time.monotonic() - t_flush
-                rem_scaled = max(tail_air_scaled, (head_air_scaled + tail_air_scaled) - elapsed_scaled)
+                rem_scaled = max(tail_air_scaled, total_air_scaled - elapsed_scaled)
                 if rem_scaled > 0:
                     time.sleep(rem_scaled)
             else:
                 elapsed_scaled = time.monotonic() - t_flush
-                rem_scaled = max(0.0, (head_air_scaled + tail_air_scaled) - elapsed_scaled)
+                rem_scaled = max(0.0, total_air_scaled - elapsed_scaled)
                 if rem_scaled > 0:
                     time.sleep(rem_scaled)
             default_g = (0.050 if self.air_rate_kbps <= 5.0 else 0.048) + 0.008 * float(full_heads)
@@ -1669,12 +1706,15 @@ def run_test_5_switch_endurance(ctx: BenchContext) -> bool:
             ok_rx, att_rx, det_rx = ctx.rx.configure_registers(rate, ctx.power_dbm, ctx.channel, permanent=ctx.permanent_cfg, verify_read=True)
             link_ok = False
             if ok_tx and ok_rx:
+                ctx.sleep_scaled(0.040)
                 ctx.tx.reset_buffers()
                 ctx.rx.reset_buffers()
                 seq_id += 1
                 ctx.tx.send_paced_frame(build_synthetic_rtcm(1084, 144, seq_id), mode="toa_calibrated")
-                found, c_err, _ = _receive_expected_frames(ctx.rx, {seq_id}, 1.4, ctx.time_scale())
+                found, c_err, orph = _receive_expected_frames(ctx.rx, {seq_id}, 1.4, ctx.time_scale())
                 link_ok = (seq_id in found and c_err == 0)
+                if not link_ok:
+                    det_rx = f"{det_rx} rf_fail(found={len(found)} crc={c_err} orph={orph})"
             if ok_tx and ok_rx and link_ok:
                 ok_legs += 1
             dt_ms = ((time.monotonic() - t0) * 1000.0) / ctx.time_scale()

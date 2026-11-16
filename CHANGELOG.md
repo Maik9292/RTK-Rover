@@ -5,6 +5,13 @@ All notable changes to the **RTK Rover** project will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [bench_e220_multirate.py v1.0.2] - 2026-11-16
+
+### Fixed & Calibrated
+- **Silicon-Calibrated `test/_045` `ToA` Model & True Minimum Guard Sweep ([`scripts/bench_e220_multirate.py`](scripts/bench_e220_multirate.py) `v1.0.2`, [`docs/e220-reference.md`](docs/e220-reference.md)):**
+  - Updated `estimate_subpacket_air_s()`, added `estimate_frame_air_s()`, and updated `send_paced_frame()` (`201..400 B`) to match the Stage 1 `test/_045` hardware curves measured at `1 ms` FTDI latency (`<= 1.9 ms` max fit error across all `18..400 B` bins at `4.8k`, `9.6k`, and `19.2k` — e.g., `200 B = 443.2 ms`, `316 B = 696.6 ms`, `400 B = 847.2 ms` at `4.8 kbps`, removing `+250–490 ms` of hidden phantom cushion during `Test 2` guard sweeps).
+  - Fixed the two Test 5 failure modes exposed in `test/_045` (`17/20`): added a `20 ms` settling pause (plus 1 `25 ms` retry) between `0xC2` confirmation and `verify_read` (`_mode3_read_6()`) inside `configure_registers()` to eliminate `verify_mismatch:none` (Cycle 4 rows `15`/`17`), extended Mode 3 -> Mode 0 exit settle from `45 ms` to `80 ms` (`25 ms` pre-baud + `55 ms` post-baud) plus `40 ms` pre-ping settle in `run_test_5_switch_endurance()` (Cycle 3 row `12` `9.6k -> 4.8k` `rf_ok=0`), and logged `rx_found`/`crc`/`orph` diagnostics on any RF ping miss.
+
 ## [bench_e220_multirate.py v1.0.1] - 2026-11-16
 
 ### Fixed

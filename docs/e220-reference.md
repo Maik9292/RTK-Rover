@@ -122,8 +122,8 @@ When switching between any two modes, the E220 pulls `AUX` **`LOW` for `9..11 ms
 ### 4.1 Mode 3 Serial Rules
 * **Mode 3 (`M1=1, M0=1`) ALWAYS uses `9600 bps, 8N1`**, regardless of the operational baud rate in `REG0`.
 * Flush Mode 0 UART TX, assert **`M0=1, M1=1` BEFORE switching host UART to `9600 bps`**, and wait `>= 60 ms` settle time. Switching the ESP32 UART to `9600` while the E220 is still listening at `115200` in Mode 0 injects a baud-mismatch framing glitch into the transceiver RX shift register (`test/_040`).
-* Issue a pre-write Mode 3 read probe (`C1 00 06`) to verify UART alignment before sending `C0 00 06`, and keep `M0=1, M1=1` steady between initial retries instead of toggling `Mode 0 -> Mode 3` at `9600` baud.
-* Wait `AUX == HIGH` + `>= 60 ms` (or flush Mode 3 reply) after returning to `M0=0, M1=0` when restoring operational baud (`115200`).
+* Issue a pre-write Mode 3 read probe (`C1 00 06`) to verify UART alignment before sending `C0 00 06`, insert **`>= 15–20 ms` settling delay between consecutive Mode 3 commands** (`C1 <-> C2` in either direction, preventing `verify_mismatch:none` or retry frames seen in `test/_044` and `test/_045`), and keep `M0=1, M1=1` steady between initial retries instead of toggling `Mode 0 -> Mode 3` at `9600` baud.
+* Wait **`25 ms` after `M0=0, M1=0`** before restoring operational baud (`115200`), then wait **`>= 60–80 ms` + `AUX == HIGH`** + flush Mode 3 reply (`test/_045` Cycle 3 `9.6k -> 4.8k` showed `45 ms` was marginal before transmitting a slower-SF `4.8k` RF frame).
 
 ### 4.2 Binary Command Frame Formats
 
@@ -198,6 +198,14 @@ LLCC68 RF PA:          |=== Subpkt 1: 200B (up to 545ms @4.8k) ===|=== Subpkt 2:
   5. **Mandatory Tail + Full-ToA Floor Wait:** Sleep for **`max(ToA(N - 200), ToA(200) + ToA(N - 200) - elapsed_since_flush) + Guard_Delay`** so early `AUX` release at `<= 9.6 kbps` never allows the next frame to collide with Subpacket 2.
 
 ### 5.4 Hardware-Calibrated Time-on-Air (`ToA`) Formula
+
+> **Stage 1 Bench Empirical Correction (`test/_045`, `1 ms` USB-FTDI polling, `18..400 B`):**
+> Direct Pi-to-FTDI bench characterization (`bench_e220_multirate.py v1.0.1`) revealed that E220-900T30S (`REG0 = 0xE3/0xE4/0xE5`, `Pkt = 200 B`) transfers frames **35–37% faster at `4.8 kbps`** (`316 B` = **`696.6 ms`**, `400 B` = **`847.2 ms`**) and **19% faster at `9.6 kbps`** (`200 B` = **`282.1 ms`**, `400 B` = **`527.5 ms`**) than the earlier `0.60`/`0.68` efficiency extrapolation below:
+> * **`4.8 kbps`:** `70 + 1.87 * N ms` (`1..200 B`, `200 B = 443.2 ms`), `128 + 1.80 * N ms` (`201..400 B`, `253 B = 582.3 ms`, `316 B = 696.6 ms`, `400 B = 847.2 ms`; `AUX_low = 383.3..403.0 ms`; `max |err| <= 1.9 ms`).
+> * **`9.6 kbps`:** `45 + 1.19 * N ms` (`1..200 B`, `200 B = 282.1 ms`), `80 + 1.12 * N ms` (`201..400 B`, `253 B = 362.2 ms`, `400 B = 527.5 ms`; `AUX_low = 226.1..243.4 ms`; `max |err| <= 1.8 ms`).
+> * **`19.2 kbps`:** `29 + 0.80 * N ms` (`1..200 B`, `200 B = 187.7 ms`), `55 + 0.70 * N ms` (`201..400 B`, `253 B = 232.9 ms`, `400 B = 336.1 ms`; `AUX_low = 131.5..146.1 ms`; `max |err| <= 1.7 ms`).
+>
+> *Production `e220_pacer.py` (`v3.6.5`) and firmware currently retain the conservative formulas below pending `v1.0.2` Stage 1 guard-floor validation (`bench_e220_multirate.py` `Test 2`):*
 
 * **`>= 9.6 kbps` (`Guard_Delay = 35 ms`):**
 $$\text{ToA}(N) = 0.016 + \frac{(N + 16) \times 8}{\text{AirRate}_{\text{bps}} \times 0.68}\ \text{seconds} \quad (1 \le N \le 200)$$
