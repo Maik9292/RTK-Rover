@@ -141,7 +141,7 @@ When switching between any two modes, the E220 pulls `AUX` **`LOW` for `9..11 ms
 | :--- | :---: | :---: | :---: |
 | **`ADDH` / `ADDL`** | `0x00` / `0x00` | `0x00` / `0x00` | `0x00` / `0x00` |
 | **`REG0` (UART + Air Rate)** | **`0xE5`** (`115200 8N1`, `19.2k`) | **`0xE4`** (`115200 8N1`, `9.6k`) | **`0xE6`** (`115200 8N1`, `38.4k`) |
-| **`REG1` (Pkt + RSSI + Power)**| **`0x23`** (`200B`, `RSSI=1`, `21dBm`) | **`0x23`** (`200B`, `RSSI=1`, `21dBm`) | **`0x23`** (`200B`, `RSSI=1`, `21dBm`) |
+| **`REG1` (Pkt + RSSI + Power)**| **`0x20`** (`200B`, `RSSI=1`, `30dBm`; `0x23` for `21dBm`) | **`0x20`** (`200B`, `RSSI=1`, `30dBm`; `0x23` for `21dBm`) | **`0x23`** (`200B`, `RSSI=1`, `21dBm` bench) |
 | **`CHAN` (Frequency)** | **`0x4B`** (`CH 75` = `925.125 MHz`) | **`0x4B`** (`CH 75` = `925.125 MHz`) | **`0x4B`** (`CH 75` = `925.125 MHz`) |
 | **`REG3` (Transparent Mode)** | **`0x00`** (Transparent, LBT Off) | **`0x00`** (Transparent, LBT Off) | **`0x00`** (Transparent, LBT Off) |
 | **`CRYPT_H` / `CRYPT_L`** | `0x00` / `0x00` | `0x00` / `0x00` | `0x00` / `0x00` |

@@ -5,6 +5,14 @@ All notable changes to the **RTK Rover** project will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [set_e220_power.py v1.1.0] - 2026-11-16
+
+### Fixed
+- **Persistent Base TX Power Synchronization ([`scripts/e220-pacer.service`](scripts/e220-pacer.service), [`scripts/set_e220_power.py`](scripts/set_e220_power.py) `v1.1.0`, [`docs/e220-reference.md`](docs/e220-reference.md)):**
+  - Fixed a silent reversion where [`scripts/e220-pacer.service`](scripts/e220-pacer.service) hardcoded `--auto-config ... --power 21`, causing [`scripts/e220_pacer.py`](scripts/e220_pacer.py) to overwrite Base EEPROM (`0xC0`) back to `21 dBm` (`REG1=0x23`) whenever `e220-pacer` restarted after `set_e220_power.py 30`.
+  - Updated [`scripts/e220-pacer.service`](scripts/e220-pacer.service) to default `E220_POWER=30`, load optional overrides from `/etc/default/e220-pacer`, and pass `--power $E220_POWER` so [`scripts/update_e220_pacer.sh`](scripts/update_e220_pacer.sh) redeploys preserve runtime power settings.
+  - Upgraded [`scripts/set_e220_power.py`](scripts/set_e220_power.py) to `v1.1.0`: persists `E220_POWER` in `/etc/default/e220-pacer` (plus syncs legacy hardcoded `--power` flags in `/etc/systemd/system/e220-pacer.service` and runs `systemctl daemon-reload`), applies verified Mode 3 sequencing (`M0=1, M1=1` before `9600` baud, `20 ms` `C1 <-> C0` inter-command guards, EEPROM readback verification, and `>= 80 ms` Mode 0 exit settle), and ensures `e220-pacer` always restarts inside `finally:`.
+
 ## [bench_e220_multirate.py v1.0.2] - 2026-11-16
 
 ### Fixed & Calibrated
