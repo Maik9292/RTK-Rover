@@ -166,7 +166,7 @@ extern "C" bool e220_is_uplink_slot_active(uint32_t now_ms)
 // =========================================================================
 #define E220_RSSI_POLL_INTERVAL_MS  750U
 #define E220_RSSI_IDLE_POLL_MS      2000U
-#define E220_RSSI_REPLY_TIMEOUT_MS  95U
+#define E220_RSSI_REPLY_TIMEOUT_MS  180U
 
 static bool     rssi_query_active       = false;
 static uint32_t last_rssi_poll_ms       = 0;
@@ -1334,7 +1334,7 @@ extern "C" void e220_poll_and_forward_rtcm(void)
         bool post_uplink_gap = has_sf && (sf_sec == 0U) &&
                                (s_last_uplink_utc_sec == sf_utc_sec) &&
                                (s_last_rssi_poll_utc_sec != sf_utc_sec) &&
-                               (sf_ms >= 680U) && (sf_ms <= 920U);
+                               (sf_ms >= 680U) && (sf_ms <= 850U);
 
         bool unsynced_gap    = !has_sf &&
                                (s_active_air_rate > 5.0f) &&
@@ -1344,7 +1344,7 @@ extern "C" void e220_poll_and_forward_rtcm(void)
                                (now - last_rssi_poll_ms >= 1800U);
 
         bool idle_link_probe = (e220_stats.last_rx_ms == 0 || (now - e220_stats.last_rx_ms > 3000U)) &&
-                               (!has_sf || ((sf_sec != 0U || sf_ms < 390U) && sf_ms <= 880U)) &&
+                               (!has_sf || ((sf_sec != 0U || sf_ms < 390U) && sf_ms <= 810U)) &&
                                (now - last_rssi_poll_ms >= 2000U);
 
         if (post_uplink_gap || unsynced_gap || idle_link_probe) {

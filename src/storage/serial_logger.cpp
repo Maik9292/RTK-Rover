@@ -43,6 +43,19 @@ SerialLoggerClass SerialLogger;
 
 SerialLoggerClass::SerialLoggerClass() {}
 
+static int serial_logger_esp_vprintf(const char *fmt, va_list args) {
+    if (xPortInIsrContext()) {
+        return 0;
+    }
+    char buf[256];
+    int len = vsnprintf(buf, sizeof(buf), fmt, args);
+    if (len > 0) {
+        size_t write_len = ((size_t)len < sizeof(buf)) ? (size_t)len : (sizeof(buf) - 1);
+        SerialLogger.write((const uint8_t *)buf, write_len);
+    }
+    return len;
+}
+
 void SerialLoggerClass::begin(unsigned long baud) {
     ::Serial.begin(baud);
     if (!s_serial_mux) {
@@ -52,6 +65,8 @@ void SerialLoggerClass::begin(unsigned long baud) {
         s_serial_file_mux = xSemaphoreCreateMutex();
     }
     ensure_serial_ring_buf();
+    // Route all ESP-IDF ESP_LOG* output to USB-CDC + SD log rather than UART0 (dedicated to E220 IO41/42).
+    esp_log_set_vprintf(serial_logger_esp_vprintf);
 }
 
 void SerialLoggerClass::end() {
@@ -397,7 +412,8 @@ extern "C" int rover_printf(const char *format, ...) {
     int len = vsnprintf(buf, sizeof(buf), format, args);
     va_end(args);
     if (len > 0) {
-        SerialLogger.write((const uint8_t*)buf, len);
+        size_t write_len = ((size_t)len < sizeof(buf)) ? (size_t)len : (sizeof(buf) - 1);
+        SerialLogger.write((const uint8_t*)buf, write_len);
     }
     return len;
 }

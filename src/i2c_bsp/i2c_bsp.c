@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include "i2c_bsp.h"
+#include "../storage/serial_logger.h"
 #include "../../user_config.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -51,11 +52,11 @@ static void i2c_bus_recover_locked(const char *action, i2c_master_dev_handle_t d
     if (now - last_warn_ms >= 1000) {
         last_warn_ms = now;
         if (reg >= 0) {
-            printf("[I2C WARN] %s failed on %s (reg=0x%02X, err=0x%X) -> recovering bus\n",
-                   action, i2c_dev_name(dev_handle), (uint8_t)reg, (unsigned int)err);
+            rover_printf("[I2C WARN] %s failed on %s (reg=0x%02X, err=0x%X) -> recovering bus\n",
+                         action, i2c_dev_name(dev_handle), (uint8_t)reg, (unsigned int)err);
         } else {
-            printf("[I2C WARN] %s failed on %s (err=0x%X) -> recovering bus\n",
-                   action, i2c_dev_name(dev_handle), (unsigned int)err);
+            rover_printf("[I2C WARN] %s failed on %s (err=0x%X) -> recovering bus\n",
+                         action, i2c_dev_name(dev_handle), (unsigned int)err);
         }
     }
     if (user_i2c_port0_handle != NULL) {

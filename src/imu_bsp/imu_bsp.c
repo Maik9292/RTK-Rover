@@ -2,6 +2,7 @@
 #include "imu_bsp.h"
 #include "../i2c_bsp/i2c_bsp.h"
 #include "../settings_manager/settings_manager.h"
+#include "../storage/serial_logger.h"
 #include <stdint.h>
 #include <math.h>
 #include <esp_err.h>
@@ -64,9 +65,9 @@ void imu_init(void)
     vTaskDelay(pdMS_TO_TICKS(15));
 
     if (err == 0 && who_am_i == 0x05) {
-        printf("[IMU] QMI8658 (0x6B) ONLINE — WHO_AM_I: 0x%02X (4g/512dps @ 250Hz)\n", who_am_i);
+        rover_printf("[IMU] QMI8658 (0x6B) ONLINE -- WHO_AM_I: 0x%02X (4g/512dps @ 250Hz)\n", who_am_i);
     } else {
-        printf("[IMU] QMI8658 (0x6B) WARN — WHO_AM_I: 0x%02X (err=%d)\n", who_am_i, (int)err);
+        rover_printf("[IMU] QMI8658 (0x6B) WARN -- WHO_AM_I: 0x%02X (err=%d)\n", who_am_i, (int)err);
     }
 }
 
@@ -110,16 +111,16 @@ void imu_read(float *acc, float *gyr, int16_t *temp)
     uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
     if (current_settings.enable_imu_logging && (now_ms - last_log_ms >= 1000)) {
         last_log_ms = now_ms;
-        printf("[IMU] err=%d | Acc(g): %+.2f %+.2f %+.2f | Gyr(dps): %+.1f %+.1f %+.1f | fails=%u\n",
-               (int)err,
-               last_acc[0], last_acc[1], last_acc[2],
-               last_gyr[0], last_gyr[1], last_gyr[2],
-               (unsigned int)fail_count);
+        rover_printf("[IMU] err=%d | Acc(g): %+.2f %+.2f %+.2f | Gyr(dps): %+.1f %+.1f %+.1f | fails=%u\n",
+                     (int)err,
+                     last_acc[0], last_acc[1], last_acc[2],
+                     last_gyr[0], last_gyr[1], last_gyr[2],
+                     (unsigned int)fail_count);
     }
 
     // Auto-recovery: only reinitialize if 50 consecutive polls fail (5 continuous seconds of silence)
     if (fail_count >= 50) {
-        printf("[IMU] 50 consecutive failed reads -> attempting auto-recovery\n");
+        rover_printf("[IMU] 50 consecutive failed reads -> attempting auto-recovery\n");
         fail_count = 0;
         imu_init();
     }

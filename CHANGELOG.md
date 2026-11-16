@@ -5,6 +5,21 @@ All notable changes to the **RTK Rover** project will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.8.14] - 2026-11-16
+
+### Fixed
+- **Eliminated Periodic `UART0` (`IO42`) Bare `printf()` & `ESP_LOG*` LoRa TX Collisions ([`src/imu_bsp/imu_bsp.c`](src/imu_bsp/imu_bsp.c), [`src/axp2101_bsp/axp2101_bsp.c`](src/axp2101_bsp/axp2101_bsp.c), [`src/i2c_bsp/i2c_bsp.c`](src/i2c_bsp/i2c_bsp.c), [`src/storage/serial_logger.cpp`](src/storage/serial_logger.cpp)):**
+  - Root-caused the `test/_049` periodic ~1 Hz LoRa reception blackout (and `4.8k` `200 B` subpacket drops) to C library `printf()` calls inside `.c` BSP drivers writing to `stdout` (`UART0`, remapped to `IO41`/`IO42` for the E220-900T30S by `e220_driver_init()` under `USBMode=hwcdc,CDCOnBoot=cdc`), causing `imu_read()` (`~75 B` `[IMU]` diagnostic every ~1 s) to trigger unintended half-duplex 30 dBm LoRa TX bursts on `CH 75`.
+  - Replaced bare `printf()` calls in [`src/imu_bsp/imu_bsp.c`](src/imu_bsp/imu_bsp.c), [`src/axp2101_bsp/axp2101_bsp.c`](src/axp2101_bsp/axp2101_bsp.c), and [`src/i2c_bsp/i2c_bsp.c`](src/i2c_bsp/i2c_bsp.c) with `rover_printf()` (routing cleanly to USB-CDC + SD log via `SerialLogger` using pure 7-bit ASCII).
+  - Registered `serial_logger_esp_vprintf()` via `esp_log_set_vprintf()` in `SerialLoggerClass::begin()` (guarded by `xPortInIsrContext()`) so `ESP_LOG*` output is routed to `SerialLogger` rather than `UART0`, and clamped truncated `vsnprintf` length in `rover_printf()`.
+- **`E220` Mode 0 RSSI Reply Timeout & `Second 0` Window Margin ([`src/e220_driver/e220_driver.cpp`](src/e220_driver/e220_driver.cpp)):**
+  - Increased `E220_RSSI_REPLY_TIMEOUT_MS` from `95U` to `180U` and tightened `post_uplink_gap` (`sf_ms` `680..850 ms`) and `idle_link_probe` (`sf_ms <= 810 ms`) upper bounds so `C0 C1 C2 C3 00 02` Mode 0 RSSI replies complete within Second 0 without leaking `5 B` replies into the RTCM gatekeeper or `rtcm-base_*.txt` at `4.8k`/`9.6k`.
+- **Decoupled `rtcm_logger` Ring Buffer & SD Card Flush Locks ([`src/storage/rtcm_logger.cpp`](src/storage/rtcm_logger.cpp)):**
+  - Split `s_rtcm_mux` into `s_rtcm_buf_mux` (in-RAM ring buffer only) and `s_rtcm_file_mux` (coordinated with `fs_mux`), draining `1024 B` stack chunks via `rtcm_logger_drain_to_file()` and batching `s_rtcm_file.flush()` to `500 ms` intervals matching `serial_logger` so Core 0 `rtcm_logger_feed()` never times out on slow SD flushes.
+- **`stage2_bench_verify.py` Firmware v2 Log Scorecard Parser (`v1.0.3`, [`scripts/stage2_bench_verify.py`](scripts/stage2_bench_verify.py)):**
+  - Updated `score_rover_lines()` to match `[RTCM OK -> COM1] Type:... Frame:... | OK:... Err:...(Trunc:...) Orph:...B`, `[RTCM DROP CRC]`, `[RTCM DROP TRUNC]`, `[TELEM]` noise/RSSI/counters, and `[E220 LORA SWITCH]` alongside legacy lines (`7/7` `--self-test` PASS; verified against `test/_049/serial-log_2026-11-16_15-02-19-300.txt`).
+- Compiled cleanly via `arduino-cli` (`esp32:esp32:esp32s3`, `--warnings default`): zero compiler warnings (`1,698,966 B` flash / `54%`, `67,160 B` static `DRAM0` / `20%`).
+
 ## [v0.8.13] - 2026-11-16
 
 ### Changed

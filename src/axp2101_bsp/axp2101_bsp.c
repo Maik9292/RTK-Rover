@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include "axp2101_bsp.h"
 #include "../i2c_bsp/i2c_bsp.h"
+#include "../storage/serial_logger.h"
 #include <esp_err.h>
 
 // AXP2101 Core Telemetry & LDO Registers (per X-Powers AXP2101 Datasheet V1.0 & Waveshare 3.5B BSP)
@@ -76,11 +77,11 @@ void axp2101_bsp_init(void)
 
         Axp2101Status_t st = {};
         axp2101_bsp_read(&st);
-        printf("[PMIC] AXP2101 (0x34) ONLINE — ChipID: 0x%02X | LDO0:0x%02X DC:0x%02X | VBAT: %.2fV (%u%%) | VBUS: %.2fV (%s) | Charging: %s\n",
-               chip_id, ldo0, dc_en, st.battery_voltage_v, st.battery_percent,
-               st.vbus_voltage_v, st.vbus_good ? "YES" : "NO", st.is_charging ? "YES" : "NO");
+        rover_printf("[PMIC] AXP2101 (0x34) ONLINE -- ChipID: 0x%02X | LDO0:0x%02X DC:0x%02X | VBAT: %.2fV (%u%%) | VBUS: %.2fV (%s) | Charging: %s\n",
+                     chip_id, ldo0, dc_en, st.battery_voltage_v, st.battery_percent,
+                     st.vbus_voltage_v, st.vbus_good ? "YES" : "NO", st.is_charging ? "YES" : "NO");
     } else {
-        printf("[PMIC] AXP2101 (0x34) FAIL — Not responding on I2C0\n");
+        rover_printf("[PMIC] AXP2101 (0x34) FAIL -- Not responding on I2C0\n");
     }
 }
 
@@ -166,7 +167,7 @@ void axp2101_bsp_read(Axp2101Status_t *status)
 void axp2101_bsp_power_off(void)
 {
     if (axp2101_dev_handle == NULL || !axp_online) return;
-    printf("[PMIC] Initiating AXP2101 Soft PWROFF...\n");
+    rover_printf("[PMIC] Initiating AXP2101 Soft PWROFF...\n");
     uint8_t reg_val = 0;
     if (i2c_read_buff(axp2101_dev_handle, AXP2101_REG_COMM_CFG, &reg_val, 1) == ESP_OK) {
         reg_val |= 0x01; // Bit 0 = Soft PWROFF

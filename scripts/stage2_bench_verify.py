@@ -47,7 +47,7 @@ import e220_pacer  # noqa: E402
 
 __filename__ = os.path.basename(__file__)
 __app_name__ = "stage2_bench_verify"
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 __date__ = "2026-11-16"
 
 # Deterministic RTCM3 synthetic epoch profiles: (msg_type, total_wire_bytes)
@@ -617,19 +617,39 @@ def _read_active_pacer_defaults(
     return (air_rate, power_dbm)
 
 
+def _counter_delta(vals: list[int]) -> int:
+    """Compute net delta for cumulative firmware counters across a partial or full capture."""
+    if len(vals) >= 2:
+        return max(0, vals[-1] - vals[0])
+    return vals[0] if vals else 0
+
+
 def score_rover_lines(lines: Iterable[str], echo: bool = True, out_log: str = "") -> int:
     """Parse live or saved Rover serial lines and print Arch 2B scorecard (0 = PASS)."""
-    re_rtcm = re.compile(r"\[RTCM OK\].*Type:(\d+).*Trunc:(\d+)\s+CRC:(\d+)\s+Orph:(\d+)")
+    re_rtcm_v2 = re.compile(
+        r"\[RTCM OK -> COM1\]\s+Type:(\d+).*?OK:\d+\s+Err:(\d+)\(Trunc:(\d+)\)\s+Orph:(\d+)B"
+    )
+    re_rtcm_v1 = re.compile(r"\[RTCM OK\].*Type:(\d+).*Trunc:(\d+)\s+CRC:(\d+)\s+Orph:(\d+)")
+    re_drop_crc = re.compile(r"\[RTCM DROP CRC\]")
+    re_drop_trunc = re.compile(r"\[RTCM DROP TRUNC\]")
+    re_telem = re.compile(
+        r"\[TELEM\].*?Noise:(-?\d+)dBm\s+Pkt:(-?\d+|--)dBm.*?Err:(\d+)\s+\(Trunc:(\d+)\)\s+Orph:(\d+)B"
+    )
     re_rssi = re.compile(r"\[E220 RSSI\].*Noise:(-?\d+)dBm.*LastPkt:(-?\d+|--)dBm")
-    re_burst_5b = re.compile(r"\[E220 RX BURST\]\s+5 B")
+    re_burst_5b = re.compile(r"\[E220 RX BURST\]\s+5 B\b")
     re_mode0_warn = re.compile(r"\[E220 MODE0 WARN\]")
-    re_switch = re.compile(r"\[LORA SWITCH\]")
+    re_switch = re.compile(r"\[(?:E220 )?LORA SWITCH\]")
 
     rtcm_ok = 0
     per_type: dict[int, int] = {}
     trunc_vals: list[int] = []
     crc_vals: list[int] = []
     orph_vals: list[int] = []
+    telem_trunc_vals: list[int] = []
+    telem_crc_vals: list[int] = []
+    telem_orph_vals: list[int] = []
+    drop_crc_events = 0
+    drop_trunc_events = 0
     spurious_5b_bursts = 0
     mode0_warns = 0
     switch_events = 0
@@ -645,14 +665,39 @@ def score_rover_lines(lines: Iterable[str], echo: bool = True, out_log: str = ""
             if log_fp is not None:
                 log_fp.write(line + "\n")
 
-            m = re_rtcm.search(line)
-            if m:
+            m_v2 = re_rtcm_v2.search(line)
+            if m_v2:
                 rtcm_ok += 1
-                mtype = int(m.group(1))
+                mtype = int(m_v2.group(1))
+                err_total = int(m_v2.group(2))
+                trunc_val = int(m_v2.group(3))
+                orph_val = int(m_v2.group(4))
                 per_type[mtype] = per_type.get(mtype, 0) + 1
-                trunc_vals.append(int(m.group(2)))
-                crc_vals.append(int(m.group(3)))
-                orph_vals.append(int(m.group(4)))
+                trunc_vals.append(trunc_val)
+                crc_vals.append(max(0, err_total - trunc_val))
+                orph_vals.append(orph_val)
+                continue
+
+            m_v1 = re_rtcm_v1.search(line)
+            if m_v1:
+                rtcm_ok += 1
+                mtype = int(m_v1.group(1))
+                per_type[mtype] = per_type.get(mtype, 0) + 1
+                trunc_vals.append(int(m_v1.group(2)))
+                crc_vals.append(int(m_v1.group(3)))
+                orph_vals.append(int(m_v1.group(4)))
+                continue
+
+            m_t = re_telem.search(line)
+            if m_t:
+                noise_samples.append(int(m_t.group(1)))
+                if m_t.group(2) != "--":
+                    pkt_rssi_samples.append(int(m_t.group(2)))
+                t_err = int(m_t.group(3))
+                t_trunc = int(m_t.group(4))
+                telem_trunc_vals.append(t_trunc)
+                telem_crc_vals.append(max(0, t_err - t_trunc))
+                telem_orph_vals.append(int(m_t.group(5)))
                 continue
 
             m_r = re_rssi.search(line)
@@ -662,7 +707,11 @@ def score_rover_lines(lines: Iterable[str], echo: bool = True, out_log: str = ""
                     pkt_rssi_samples.append(int(m_r.group(2)))
                 continue
 
-            if re_burst_5b.search(line):
+            if re_drop_crc.search(line):
+                drop_crc_events += 1
+            elif re_drop_trunc.search(line):
+                drop_trunc_events += 1
+            elif re_burst_5b.search(line):
                 spurious_5b_bursts += 1
             elif re_mode0_warn.search(line):
                 mode0_warns += 1
@@ -672,9 +721,9 @@ def score_rover_lines(lines: Iterable[str], echo: bool = True, out_log: str = ""
         if log_fp is not None:
             log_fp.close()
 
-    trunc_delta = (trunc_vals[-1] - trunc_vals[0]) if len(trunc_vals) >= 2 else (trunc_vals[0] if trunc_vals else 0)
-    crc_delta = (crc_vals[-1] - crc_vals[0]) if len(crc_vals) >= 2 else (crc_vals[0] if crc_vals else 0)
-    orph_delta = (orph_vals[-1] - orph_vals[0]) if len(orph_vals) >= 2 else (orph_vals[0] if orph_vals else 0)
+    trunc_delta = max(_counter_delta(trunc_vals or telem_trunc_vals), drop_trunc_events)
+    crc_delta = max(_counter_delta(crc_vals or telem_crc_vals), drop_crc_events)
+    orph_delta = _counter_delta(orph_vals or telem_orph_vals)
     avg_noise = (sum(noise_samples) / len(noise_samples)) if noise_samples else 0.0
     avg_rssi = (sum(pkt_rssi_samples) / len(pkt_rssi_samples)) if pkt_rssi_samples else 0.0
 
@@ -713,6 +762,24 @@ def test_pi_config_autodetect_and_log_scorer() -> None:
         "[RTCM OK] Type:1084 (142B) -> COM1 | Trunc:0 CRC:0 Orph:0",
     ]
     assert score_rover_lines(clean_lines, echo=False) == 0
+
+    clean_v2_lines = [
+        "[RTCM OK -> COM1] Type:1074 Frame:232B | OK:10 Err:0(Trunc:0) Orph:0B",
+        "[TELEM] Fix:2 SVs:20/8 Hdg:--(127.0) BL:266.0cm Spd:0.0m/s Base:1 Diff:2.0s | USB:4.73V+ | COM1 RX:100B NMEA:10 RTCM_TX:100B | E220 AUX:1 (Edges:10) Noise:-96dBm Pkt:-28dBm RX:100B Fwd:100B OK:10 (1006:1 1074:3 1084:3 1094:2 1230:1) Err:0 (Trunc:0) Orph:0B",
+        "[RTCM OK -> COM1] Type:1084 Frame:146B | OK:11 Err:0(Trunc:0) Orph:0B",
+        "[E220 LORA SWITCH] Reconfiguring E220 registers 4.8 -> 9.6 kbps...",
+    ]
+    assert score_rover_lines(clean_v2_lines, echo=False) == 0
+
+    trunc_lines = clean_v2_lines + [
+        "[RTCM DROP TRUNC] Type:1074 Got:200/232B after 480ms (NOT sent to COM1) | OK:11 Err:1(Trunc:1)",
+    ]
+    assert score_rover_lines(trunc_lines, echo=False) == 1
+
+    crc_lines = clean_v2_lines + [
+        "[RTCM DROP CRC] Type:1074 Expected:232B CRC:0x123456 (NOT sent to COM1) | OK:11 Err:1",
+    ]
+    assert score_rover_lines(crc_lines, echo=False) == 1
 
     spill_lines = clean_lines + ["[E220 RX BURST] 5 B (gap: 3007 ms | AUX edges:+3 low:7.04ms)"]
     assert score_rover_lines(spill_lines, echo=False) == 1
