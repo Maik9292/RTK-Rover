@@ -10,7 +10,7 @@
 **Reference Implementations in This Repository:**
 * **ESP32-S3 Rover Driver & RTCM3 Gatekeeper:** [`src/e220_driver/e220_driver.cpp`](../src/e220_driver/e220_driver.cpp), [`src/e220_driver/rover_telemetry.h`](../src/e220_driver/rover_telemetry.h), [`user_config.h`](../user_config.h)
 * **Raspberry Pi Hardware-Paced Transmitter Daemon:** [`scripts/e220_pacer.py`](../scripts/e220_pacer.py) (`v3.7.1`), [`scripts/e220-pacer.service`](../scripts/e220-pacer.service), [`scripts/update_e220_pacer.sh`](../scripts/update_e220_pacer.sh)
-* **Spectrum Scanner, Bench & Split Desk Verifiers, Benchmarks & Utilities:** [`scripts/scan_e220_channels.py`](../scripts/scan_e220_channels.py), [`scripts/bench_e220_multirate.py`](../scripts/bench_e220_multirate.py) (`v1.0.3`), [`scripts/stage2_bench_verify.py`](../scripts/stage2_bench_verify.py) (`v1.0.1`), [`docs/benchmarks/e220_stage1_20261116/`](benchmarks/e220_stage1_20261116/README.md), [`scripts/setup_e220.py`](../scripts/setup_e220.py), [`scripts/set_e220_power.py`](../scripts/set_e220_power.py) (`v1.1.0`)
+* **Spectrum Scanner, Bench & Split Desk Verifiers, Benchmarks & Utilities:** [`scripts/scan_e220_channels.py`](../scripts/scan_e220_channels.py), [`scripts/bench_e220_multirate.py`](../scripts/bench_e220_multirate.py) (`v1.0.3`), [`scripts/stage2_bench_verify.py`](../scripts/stage2_bench_verify.py) (`v1.0.2`), [`docs/benchmarks/e220_stage1_20261116/`](benchmarks/e220_stage1_20261116/README.md), [`scripts/setup_e220.py`](../scripts/setup_e220.py), [`scripts/set_e220_power.py`](../scripts/set_e220_power.py) (`v1.1.0`)
 
 ---
 

@@ -2,16 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 Module: stage2_bench_verify.py
-Description: Architecture 2B Split Desk Verification Suite for Base Pi (e220_pacer.py v3.7.0+)
-             and Rover ESP32-S3 (RTK_Rover v0.8.12+). Supports three execution modes:
+Description: Architecture 2B Split Desk Verification Suite for Base Pi (e220_pacer.py v3.7.1+)
+             and Rover ESP32-S3 (RTK_Rover v0.8.12+). Supports one-command Pi & offline workflows:
                1. --self-test: Pure offline deterministic simulation & real-thread harness testing
                   calibrated ToA, Ping-Pong Mailboxes, TTL expiration, <=200B coalescing,
                   starvation-fair round robin (avg/maxsat/extreme 400B @ 4.8k/9.6k/19.2k),
-                  Second 0 pause gating, V3 telemetry uplink, and 4-ACK rate switch execution.
-               2. --mode pi-feeder: Deterministic TCP RTCM3 stream generator (127.0.0.1:5017)
-                  simulating RTKBase avg/maxsat/extreme constellations for live Pi Base testing.
-               3. --mode rover-monitor: Live ESP32 USB-CDC serial monitor & scorecard for
-                  [RTCM OK], Trunc, CRC, Orph, 5B RSSI-spill regression, Noise/Pkt RSSI, and switches.
+                  Second 0 pause gating, V3 telemetry uplink, 4-ACK switch, GPIO initial=, & log scorer.
+               2. --mode pi-bench: One-command Pi verification (stops e220-pacer.service cleanly,
+                  runs deterministic 1 Hz synthetic feeder + e220_pacer.py together in one terminal,
+                  and unconditionally restores e220-pacer.service on exit).
+               3. --mode pi-feeder: Standalone TCP RTCM3 stream generator (127.0.0.1:5017).
+               4. --mode rover-monitor / --from-log: Live ESP32 USB-CDC serial monitor or saved-log
+                  scorecard for [RTCM OK], Trunc, CRC, Orph, 5B RSSI-spill regression, and switches.
 
 Author: Roland L. Guilmet & Antigravity
 License: MIT
@@ -25,10 +27,11 @@ import os
 import re
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Iterable, Optional
 
 try:
     import serial
@@ -44,7 +47,7 @@ import e220_pacer  # noqa: E402
 
 __filename__ = os.path.basename(__file__)
 __app_name__ = "stage2_bench_verify"
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 __date__ = "2026-11-16"
 
 # Deterministic RTCM3 synthetic epoch profiles: (msg_type, total_wire_bytes)
@@ -580,6 +583,141 @@ def test_gpio_setup_explicit_initial() -> None:
         e220_pacer.GPIO = orig_gpio
 
 
+def _read_active_pacer_defaults(
+    service_path: str = "/etc/systemd/system/e220-pacer.service",
+    env_path: str = "/etc/default/e220-pacer",
+) -> tuple[float, int]:
+    """Read active air-rate and TX power defaults from systemd config if present."""
+    air_rate = 19.2
+    power_dbm = 30
+    svc_text = ""
+    if service_path and os.path.isfile(service_path):
+        try:
+            with open(service_path, "r", encoding="utf-8") as f:
+                svc_text = f.read()
+            m_air = re.search(r"--air-rate\s+([0-9]+(?:\.[0-9]+)?)", svc_text)
+            if m_air:
+                cand_air = float(m_air.group(1))
+                if cand_air in (2.4, 4.8, 9.6, 19.2, 38.4, 62.5):
+                    air_rate = cand_air
+            m_pwr = re.search(r"--power\s+(21|24|27|30)\b", svc_text)
+            if m_pwr:
+                power_dbm = int(m_pwr.group(1))
+        except OSError:
+            pass
+    if env_path and os.path.isfile(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                env_text = f.read()
+            m_env = re.search(r"^\s*E220_POWER\s*=\s*['\"]?(21|24|27|30)['\"]?", env_text, re.MULTILINE)
+            if m_env:
+                power_dbm = int(m_env.group(1))
+        except OSError:
+            pass
+    return (air_rate, power_dbm)
+
+
+def score_rover_lines(lines: Iterable[str], echo: bool = True, out_log: str = "") -> int:
+    """Parse live or saved Rover serial lines and print Arch 2B scorecard (0 = PASS)."""
+    re_rtcm = re.compile(r"\[RTCM OK\].*Type:(\d+).*Trunc:(\d+)\s+CRC:(\d+)\s+Orph:(\d+)")
+    re_rssi = re.compile(r"\[E220 RSSI\].*Noise:(-?\d+)dBm.*LastPkt:(-?\d+|--)dBm")
+    re_burst_5b = re.compile(r"\[E220 RX BURST\]\s+5 B")
+    re_mode0_warn = re.compile(r"\[E220 MODE0 WARN\]")
+    re_switch = re.compile(r"\[LORA SWITCH\]")
+
+    rtcm_ok = 0
+    per_type: dict[int, int] = {}
+    trunc_vals: list[int] = []
+    crc_vals: list[int] = []
+    orph_vals: list[int] = []
+    spurious_5b_bursts = 0
+    mode0_warns = 0
+    switch_events = 0
+    noise_samples: list[int] = []
+    pkt_rssi_samples: list[int] = []
+
+    log_fp = open(out_log, "w", encoding="utf-8") if out_log else None
+    try:
+        for raw_line in lines:
+            line = raw_line.rstrip("\r\n")
+            if echo:
+                print(line, flush=True)
+            if log_fp is not None:
+                log_fp.write(line + "\n")
+
+            m = re_rtcm.search(line)
+            if m:
+                rtcm_ok += 1
+                mtype = int(m.group(1))
+                per_type[mtype] = per_type.get(mtype, 0) + 1
+                trunc_vals.append(int(m.group(2)))
+                crc_vals.append(int(m.group(3)))
+                orph_vals.append(int(m.group(4)))
+                continue
+
+            m_r = re_rssi.search(line)
+            if m_r:
+                noise_samples.append(int(m_r.group(1)))
+                if m_r.group(2) != "--":
+                    pkt_rssi_samples.append(int(m_r.group(2)))
+                continue
+
+            if re_burst_5b.search(line):
+                spurious_5b_bursts += 1
+            elif re_mode0_warn.search(line):
+                mode0_warns += 1
+            elif re_switch.search(line):
+                switch_events += 1
+    finally:
+        if log_fp is not None:
+            log_fp.close()
+
+    trunc_delta = (trunc_vals[-1] - trunc_vals[0]) if len(trunc_vals) >= 2 else (trunc_vals[0] if trunc_vals else 0)
+    crc_delta = (crc_vals[-1] - crc_vals[0]) if len(crc_vals) >= 2 else (crc_vals[0] if crc_vals else 0)
+    orph_delta = (orph_vals[-1] - orph_vals[0]) if len(orph_vals) >= 2 else (orph_vals[0] if orph_vals else 0)
+    avg_noise = (sum(noise_samples) / len(noise_samples)) if noise_samples else 0.0
+    avg_rssi = (sum(pkt_rssi_samples) / len(pkt_rssi_samples)) if pkt_rssi_samples else 0.0
+
+    print("\n=== STAGE 2 ROVER SCORECARD ===", flush=True)
+    print(f"Valid RTCM Frames : {rtcm_ok} | Types: {dict(sorted(per_type.items()))}", flush=True)
+    print(f"Trunc / CRC / Orph: {trunc_delta} / {crc_delta} / {orph_delta}", flush=True)
+    print(f"5B RSSI Spills    : {spurious_5b_bursts} (expected 0)", flush=True)
+    print(f"Mode0 Warn / Sw   : {mode0_warns} / {switch_events}", flush=True)
+    if noise_samples:
+        print(f"Ambient Noise Avg : {avg_noise:.1f} dBm ({len(noise_samples)} samples)", flush=True)
+    if pkt_rssi_samples:
+        print(f"Last Pkt RSSI Avg : {avg_rssi:.1f} dBm ({len(pkt_rssi_samples)} samples)", flush=True)
+
+    clean = (rtcm_ok > 0) and (trunc_delta == 0) and (crc_delta == 0) and (spurious_5b_bursts == 0)
+    print(f"[RESULT] {'PASS' if clean else 'CHECK_METRICS'}", flush=True)
+    return 0 if clean else 1
+
+
+def test_pi_config_autodetect_and_log_scorer() -> None:
+    """Verify systemd service config autodetection and shared Rover log scorecard parsing."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        svc = os.path.join(tmpdir, "e220-pacer.service")
+        env = os.path.join(tmpdir, "e220-pacer.env")
+        with open(svc, "w", encoding="utf-8") as f:
+            f.write("ExecStart=/usr/bin/python3 /usr/local/bin/e220_pacer.py --air-rate 4.8 --power 24\n")
+        with open(env, "w", encoding="utf-8") as f:
+            f.write("E220_POWER=30\n")
+        rate, pwr = _read_active_pacer_defaults(svc, env)
+        assert rate == 4.8 and pwr == 30, f"Unexpected defaults: {(rate, pwr)}"
+
+    clean_lines = [
+        "[RTCM OK] Type:1074 (220B) -> COM1 | Trunc:0 CRC:0 Orph:0",
+        "[E220 RSSI] Noise:-98dBm | LastPkt:-42dBm",
+        "[RTCM OK] Type:1084 (142B) -> COM1 | Trunc:0 CRC:0 Orph:0",
+    ]
+    assert score_rover_lines(clean_lines, echo=False) == 0
+
+    spill_lines = clean_lines + ["[E220 RX BURST] 5 B (gap: 3007 ms | AUX edges:+3 low:7.04ms)"]
+    assert score_rover_lines(spill_lines, echo=False) == 1
+
+
 def run_self_test() -> int:
     """Execute complete offline Arch 2B unit & integration suite."""
     tests = (
@@ -589,6 +727,7 @@ def run_self_test() -> int:
         ("Starvation fairness across 4.8k/9.6k/19.2k profiles", test_starvation_fairness_and_profiles),
         ("Live ingress thread, V3 uplink & 4-ACK rate switch", test_live_thread_uplink_and_switch_flow),
         ("Raspberry Pi rpi-lgpio explicit initial GPIO setup", test_gpio_setup_explicit_initial),
+        ("Systemd defaults autodetect & Rover log scorecard", test_pi_config_autodetect_and_log_scorer),
     )
     passed = 0
     for idx, (label, fn) in enumerate(tests, start=1):
@@ -599,23 +738,26 @@ def run_self_test() -> int:
     return 0
 
 
-def run_pi_feeder(
+def serve_rtcm_feeder(
     host: str,
     port: int,
     profile: str,
     step_seconds: int,
     duration_seconds: int,
     status_json: str,
+    stop_event: Optional[threading.Event] = None,
+    ready_event: Optional[threading.Event] = None,
 ) -> int:
     """Serve deterministic 1 Hz RTCM3 stress epochs over TCP for live Pi Base verification."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
     srv.listen(1)
-    srv.settimeout(1.0)
+    srv.settimeout(0.5)
+    if ready_event is not None:
+        ready_event.set()
     print(
-        f"[FEEDER] Listening on {host}:{port} | Profile:{profile} | Step:{step_seconds}s | "
-        f"Start e220_pacer.py with --tcp-connect {host}:{port}",
+        f"[FEEDER] Listening on {host}:{port} | Profile:{profile} | Step:{step_seconds}s",
         flush=True,
     )
 
@@ -626,8 +768,15 @@ def run_pi_feeder(
     total_bytes = 0
     client: Optional[socket.socket] = None
 
+    def should_stop() -> bool:
+        if stop_event is not None and stop_event.is_set():
+            return True
+        if duration_seconds > 0 and (time.monotonic() - t_start) >= float(duration_seconds):
+            return True
+        return False
+
     try:
-        while duration_seconds <= 0 or (time.monotonic() - t_start) < float(duration_seconds):
+        while not should_stop():
             if client is None:
                 try:
                     client, addr = srv.accept()
@@ -641,7 +790,13 @@ def run_pi_feeder(
             next_sec = int(now_wall) + 1
             sleep_s = (float(next_sec) + 0.025) - now_wall
             if sleep_s > 0.0:
-                time.sleep(sleep_s)
+                if stop_event is not None:
+                    if stop_event.wait(timeout=sleep_s):
+                        break
+                else:
+                    time.sleep(sleep_s)
+            if should_stop():
+                break
 
             elapsed = time.monotonic() - t_start
             active_profile = (
@@ -692,93 +847,159 @@ def run_pi_feeder(
     return 0
 
 
+def run_pi_bench(
+    host: str,
+    port: int,
+    profile: str,
+    step_seconds: int,
+    duration_seconds: int,
+    status_json: str,
+    pacer_port: str,
+    pacer_baud: int,
+    air_rate: Optional[float],
+    power_dbm: Optional[int],
+    channel: int,
+    macro_cycle_s: int,
+) -> int:
+    """
+    One-command Pi orchestrator: cleanly stops e220-pacer.service, starts the local
+    RTCM3 synthetic feeder thread, launches e220_pacer.py against it, and unconditionally
+    restarts e220-pacer.service when finished or interrupted.
+    """
+    pacer_candidates = (
+        os.path.join(SCRIPT_DIR, "e220_pacer.py"),
+        "/usr/local/bin/e220_pacer.py",
+    )
+    pacer_script = next((p for p in pacer_candidates if os.path.isfile(p)), "")
+    if not pacer_script:
+        print(f"[ERROR] e220_pacer.py not found in {pacer_candidates}", flush=True)
+        return 2
+
+    svc_rate, svc_power = _read_active_pacer_defaults()
+    target_rate = air_rate if air_rate is not None else svc_rate
+    target_power = power_dbm if power_dbm is not None else svc_power
+
+    is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+    sudo_prefix = [] if is_root else ["sudo"]
+
+    print("[PI-BENCH] Reloading/stopping e220-pacer.service cleanly...", flush=True)
+    subprocess.run(sudo_prefix + ["systemctl", "daemon-reload"], check=False)
+    subprocess.run(sudo_prefix + ["systemctl", "stop", "e220-pacer"], check=False)
+    time.sleep(0.5)
+
+    stop_event = threading.Event()
+    ready_event = threading.Event()
+    feeder_thread = threading.Thread(
+        target=serve_rtcm_feeder,
+        args=(host, port, profile, step_seconds, 0, status_json, stop_event, ready_event),
+        name="stage2_feeder",
+        daemon=True,
+    )
+    feeder_thread.start()
+    if not ready_event.wait(timeout=3.0):
+        print("[ERROR] Feeder failed to bind TCP port cleanly.", flush=True)
+        stop_event.set()
+        feeder_thread.join(timeout=1.0)
+        subprocess.run(sudo_prefix + ["systemctl", "start", "e220-pacer"], check=False)
+        return 1
+
+    cmd = sudo_prefix + [
+        sys.executable,
+        "-u",
+        pacer_script,
+        "--tcp-connect",
+        f"{host}:{port}",
+        "--port",
+        pacer_port,
+        "--baud",
+        str(pacer_baud),
+        "--air-rate",
+        str(target_rate),
+        "--power",
+        str(target_power),
+        "--channel",
+        str(channel),
+        "--macro-cycle-s",
+        str(macro_cycle_s),
+        "--auto-config",
+    ]
+    print(
+        f"[PI-BENCH] Launching {os.path.basename(pacer_script)} | Air:{target_rate}k | "
+        f"Pwr:{target_power}dBm | CH:{channel} | Profile:{profile} "
+        f"({'unlimited - Ctrl+C to stop' if duration_seconds <= 0 else f'{duration_seconds}s'})",
+        flush=True,
+    )
+
+    proc: Optional[subprocess.Popen] = None
+    t_start = time.monotonic()
+    rc = 0
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        assert proc.stdout is not None
+        while True:
+            if duration_seconds > 0 and (time.monotonic() - t_start) >= float(duration_seconds):
+                print(f"\n[PI-BENCH] Reached --duration {duration_seconds}s; stopping cleanly...", flush=True)
+                break
+            line = proc.stdout.readline()
+            if line:
+                print(line.rstrip("\r\n"), flush=True)
+            elif proc.poll() is not None:
+                rc = proc.returncode or 0
+                break
+    except KeyboardInterrupt:
+        print("\n[PI-BENCH] Interrupted by user; shutting down cleanly...", flush=True)
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2.0)
+        stop_event.set()
+        feeder_thread.join(timeout=2.0)
+        time.sleep(0.3)
+        print("[PI-BENCH] Restoring production e220-pacer.service...", flush=True)
+        subprocess.run(sudo_prefix + ["systemctl", "start", "e220-pacer"], check=False)
+        status = subprocess.run(["systemctl", "is-active", "e220-pacer"], capture_output=True, text=True, check=False)
+        print(f"[PI-BENCH] Production e220-pacer state: {status.stdout.strip().upper()}", flush=True)
+
+    return rc
+
+
 def run_rover_monitor(serial_port: str, baud: int, duration_seconds: int, out_log: str) -> int:
     """Monitor live ESP32 USB-CDC serial output and score Arch 2B reception quality."""
     if serial is None:
         print("[ERROR] pyserial is required for --mode rover-monitor (install via: pip install pyserial)", flush=True)
         return 2
 
-    log_fp = open(out_log, "w", encoding="utf-8") if out_log else None
     ser = serial.Serial(serial_port, baud, timeout=0.25)
     print(f"[ROVER MON] Connected to {serial_port} @ {baud} bps...", flush=True)
-
-    re_rtcm = re.compile(r"\[RTCM OK\].*Type:(\d+).*Trunc:(\d+)\s+CRC:(\d+)\s+Orph:(\d+)")
-    re_rssi = re.compile(r"\[E220 RSSI\].*Noise:(-?\d+)dBm.*LastPkt:(-?\d+|--)dBm")
-    re_burst_5b = re.compile(r"\[E220 RX BURST\]\s+5 B")
-    re_mode0_warn = re.compile(r"\[E220 MODE0 WARN\]")
-    re_switch = re.compile(r"\[LORA SWITCH\]")
-
     t0 = time.monotonic()
-    rtcm_ok = 0
-    per_type: dict[int, int] = {}
-    trunc_vals: list[int] = []
-    crc_vals: list[int] = []
-    orph_vals: list[int] = []
-    spurious_5b_bursts = 0
-    mode0_warns = 0
-    switch_events = 0
-    noise_samples: list[int] = []
-    pkt_rssi_samples: list[int] = []
+
+    def iter_serial_lines() -> Iterable[str]:
+        try:
+            while duration_seconds <= 0 or (time.monotonic() - t0) < float(duration_seconds):
+                raw = ser.readline()
+                if not raw:
+                    continue
+                yield raw.decode("ascii", errors="replace")
+        except KeyboardInterrupt:
+            print("\n[ROVER MON] Stopped by user.", flush=True)
 
     try:
-        while duration_seconds <= 0 or (time.monotonic() - t0) < float(duration_seconds):
-            raw = ser.readline()
-            if not raw:
-                continue
-            line = raw.decode("ascii", errors="replace").rstrip("\r\n")
-            print(line, flush=True)
-            if log_fp is not None:
-                log_fp.write(line + "\n")
-
-            m = re_rtcm.search(line)
-            if m:
-                rtcm_ok += 1
-                mtype = int(m.group(1))
-                per_type[mtype] = per_type.get(mtype, 0) + 1
-                trunc_vals.append(int(m.group(2)))
-                crc_vals.append(int(m.group(3)))
-                orph_vals.append(int(m.group(4)))
-                continue
-
-            m_r = re_rssi.search(line)
-            if m_r:
-                noise_samples.append(int(m_r.group(1)))
-                if m_r.group(2) != "--":
-                    pkt_rssi_samples.append(int(m_r.group(2)))
-                continue
-
-            if re_burst_5b.search(line):
-                spurious_5b_bursts += 1
-            elif re_mode0_warn.search(line):
-                mode0_warns += 1
-            elif re_switch.search(line):
-                switch_events += 1
-    except KeyboardInterrupt:
-        print("\n[ROVER MON] Stopped by user.", flush=True)
+        return score_rover_lines(iter_serial_lines(), echo=True, out_log=out_log)
     finally:
         ser.close()
-        if log_fp is not None:
-            log_fp.close()
 
-    trunc_delta = (trunc_vals[-1] - trunc_vals[0]) if len(trunc_vals) >= 2 else (trunc_vals[0] if trunc_vals else 0)
-    crc_delta = (crc_vals[-1] - crc_vals[0]) if len(crc_vals) >= 2 else (crc_vals[0] if crc_vals else 0)
-    orph_delta = (orph_vals[-1] - orph_vals[0]) if len(orph_vals) >= 2 else (orph_vals[0] if orph_vals else 0)
-    avg_noise = (sum(noise_samples) / len(noise_samples)) if noise_samples else 0.0
-    avg_rssi = (sum(pkt_rssi_samples) / len(pkt_rssi_samples)) if pkt_rssi_samples else 0.0
 
-    print("\n=== STAGE 2 ROVER SCORECARD ===", flush=True)
-    print(f"Valid RTCM Frames : {rtcm_ok} | Types: {dict(sorted(per_type.items()))}", flush=True)
-    print(f"Trunc / CRC / Orph: {trunc_delta} / {crc_delta} / {orph_delta}", flush=True)
-    print(f"5B RSSI Spills    : {spurious_5b_bursts} (expected 0)", flush=True)
-    print(f"Mode0 Warn / Sw   : {mode0_warns} / {switch_events}", flush=True)
-    if noise_samples:
-        print(f"Ambient Noise Avg : {avg_noise:.1f} dBm ({len(noise_samples)} samples)", flush=True)
-    if pkt_rssi_samples:
-        print(f"Last Pkt RSSI Avg : {avg_rssi:.1f} dBm ({len(pkt_rssi_samples)} samples)", flush=True)
-
-    clean = (rtcm_ok > 0) and (trunc_delta == 0) and (crc_delta == 0) and (spurious_5b_bursts == 0)
-    print(f"[RESULT] {'PASS' if clean else 'CHECK_METRICS'}", flush=True)
-    return 0 if clean else 1
+def run_from_log(log_path: str) -> int:
+    """Score a previously captured Rover serial log file offline (zero COM-port conflict)."""
+    if not os.path.isfile(log_path):
+        print(f"[ERROR] Log file not found: {log_path}", flush=True)
+        return 2
+    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+        return score_rover_lines(f, echo=False)
 
 
 def parse_args() -> argparse.Namespace:
@@ -793,26 +1014,48 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=["pi-feeder", "rover-monitor"],
-        help="Live split desk mode (Pi RTCM3 TCP feeder or Rover USB-CDC monitor)",
+        choices=["pi-bench", "pi-feeder", "rover-monitor"],
+        help="Execution mode: one-command Pi stress bench, standalone TCP feeder, or live Rover monitor",
     )
-    parser.add_argument("--tcp-host", default="127.0.0.1", help="TCP bind host for --mode pi-feeder")
-    parser.add_argument("--tcp-port", type=int, default=5017, help="TCP bind port for --mode pi-feeder")
+    parser.add_argument(
+        "--from-log",
+        default="",
+        help="Score a saved Rover serial log file offline without closing Arduino Serial Monitor",
+    )
+    parser.add_argument("--tcp-host", default="127.0.0.1", help="TCP bind host for feeder / pi-bench")
+    parser.add_argument("--tcp-port", type=int, default=5017, help="TCP bind port for feeder / pi-bench")
     parser.add_argument(
         "--profile",
         choices=["avg", "maxsat", "extreme", "cycle"],
         default="cycle",
-        help="Synthetic RTCM3 profile for --mode pi-feeder",
+        help="Synthetic RTCM3 profile for feeder / pi-bench",
     )
     parser.add_argument("--step-seconds", type=int, default=25, help="Seconds per profile step when --profile cycle")
     parser.add_argument("--duration", type=int, default=0, help="Duration in seconds (0 = run until Ctrl+C)")
+    parser.add_argument("--port", default="/dev/ttyAMA0", help="Base E220 serial port for --mode pi-bench")
+    parser.add_argument("--baud", type=int, default=115200, help="Serial baud rate for --mode pi-bench / rover-monitor")
+    parser.add_argument(
+        "--air-rate",
+        type=float,
+        choices=[2.4, 4.8, 9.6, 19.2, 38.4, 62.5],
+        default=None,
+        help="Override Base air-rate for --mode pi-bench (default: read from e220-pacer.service)",
+    )
+    parser.add_argument(
+        "--power",
+        type=int,
+        choices=[21, 24, 27, 30],
+        default=None,
+        help="Override Base TX power for --mode pi-bench (default: read from /etc/default/e220-pacer)",
+    )
+    parser.add_argument("--channel", type=int, default=75, help="RF channel for --mode pi-bench")
+    parser.add_argument("--macro-cycle-s", type=int, choices=[5, 10], default=5, help="Macro-cycle length for --mode pi-bench")
     parser.add_argument(
         "--status-json",
         default="/run/rtk_rover_status.json",
-        help="Optional status JSON path tailed by --mode pi-feeder",
+        help="Optional status JSON path tailed by feeder",
     )
     parser.add_argument("--serial", help="ESP32 USB-CDC COM port or /dev/ttyACM0 for --mode rover-monitor")
-    parser.add_argument("--baud", type=int, default=115200, help="ESP32 monitor baud rate")
     parser.add_argument("--out-log", default="", help="Optional output file path for --mode rover-monitor")
     return parser.parse_args()
 
@@ -822,8 +1065,25 @@ def main() -> int:
     args = parse_args()
     if args.self_test:
         return run_self_test()
+    if args.from_log:
+        return run_from_log(args.from_log)
+    if args.mode == "pi-bench":
+        return run_pi_bench(
+            host=args.tcp_host,
+            port=args.tcp_port,
+            profile=args.profile,
+            step_seconds=args.step_seconds,
+            duration_seconds=args.duration,
+            status_json=args.status_json,
+            pacer_port=args.port,
+            pacer_baud=args.baud,
+            air_rate=args.air_rate,
+            power_dbm=args.power,
+            channel=args.channel,
+            macro_cycle_s=args.macro_cycle_s,
+        )
     if args.mode == "pi-feeder":
-        return run_pi_feeder(
+        return serve_rtcm_feeder(
             host=args.tcp_host,
             port=args.tcp_port,
             profile=args.profile,
@@ -841,7 +1101,7 @@ def main() -> int:
             duration_seconds=args.duration,
             out_log=args.out_log,
         )
-    print("[ERROR] Specify --self-test or --mode {pi-feeder,rover-monitor}.", flush=True)
+    print("[ERROR] Specify --self-test, --from-log <file>, or --mode {pi-bench,pi-feeder,rover-monitor}.", flush=True)
     return 2
 
 

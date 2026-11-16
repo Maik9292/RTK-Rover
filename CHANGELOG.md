@@ -5,6 +5,15 @@ All notable changes to the **RTK Rover** project will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [stage2_bench_verify.py v1.0.2] - 2026-11-16
+
+### Added & Improved
+- **One-Command Pi Bench Orchestrator, CRLF-Safe Deploy & Offline Log Scorer ([`scripts/stage2_bench_verify.py`](scripts/stage2_bench_verify.py) `v1.0.2`, [`scripts/update_e220_pacer.sh`](scripts/update_e220_pacer.sh)):**
+  - Added **`--mode pi-bench`** to [`scripts/stage2_bench_verify.py`](scripts/stage2_bench_verify.py) (`v1.0.2`): automatically detects active air-rate and power defaults from `/etc/systemd/system/e220-pacer.service` and `/etc/default/e220-pacer`, stops `e220-pacer.service` cleanly, runs the local RTCM3 synthetic feeder (`127.0.0.1:5017`) and `e220_pacer.py` together in a single terminal, and unconditionally restores `e220-pacer.service` on exit/`Ctrl+C`.
+  - Added **`--from-log <path>`** using shared `score_rover_lines()` so saved Arduino IDE Serial Monitor captures can be scored without closing `Serial Monitor` / freeing `COMx`.
+  - Updated [`scripts/update_e220_pacer.sh`](scripts/update_e220_pacer.sh) with `install_lf_file()` (`tr -d '\r'` CRLF stripping during install) and automatic deployment of `stage2_bench_verify.py` and `bench_e220_multirate.py` alongside `e220_pacer.py`, `set_e220_power.py`, `scan_e220_channels.py`, and `e220-pacer.service`.
+  - Verified `7/7` `--self-test` pass and validated `--from-log` against `test/_048/serial-log_2026-11-16_12-03-36-300.txt`.
+
 ## [e220_pacer.py v3.7.1] - 2026-11-16
 
 ### Fixed
