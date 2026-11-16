@@ -29,12 +29,12 @@ struct SystemSettings current_settings = {
     true,             // apply_lever_arm
     0.0f,             // pole_tilt_tare_pitch_deg
     0.0f,             // pole_tilt_tare_roll_deg
-    ROVER_E220_PROFILE_REV, // e220_profile_rev (Rev 2 = 115200 / CH 75 / 19.2k / 200B / 21dBm)
-    115200,           // e220_uart_baud (115200 8N1 matching Base Station e220_pacer and UM982 COM2)
-    75,               // e220_channel (CH 75 = 925.125 MHz, Rank #1 cleanest US ISM channel)
-    19.2f,            // e220_air_rate_kbps (2.4, 4.8, 9.6, 19.2, 38.4, 62.5)
-    21,               // e220_tx_power_dbm (30, 27, 24, 21)
-    200,              // e220_subpacket_bytes (200, 128, 64, 32)
+    ROVER_E220_PROFILE_REV,          // e220_profile_rev (Rev 3 = 115200 / CH 75 / 4.8k / 200B / 30dBm)
+    ROVER_E220_TRANSPARENT_BAUD,     // e220_uart_baud (115200 8N1 matching Base Station e220_pacer)
+    ROVER_E220_TARGET_CHAN,          // e220_channel (CH 75 = 925.125 MHz, Rank #1 cleanest US ISM channel)
+    ROVER_E220_DEFAULT_AIR_RATE_KBPS,// e220_air_rate_kbps (2.4, 4.8, 9.6, 19.2, 38.4, 62.5)
+    ROVER_E220_DEFAULT_TX_POWER_DBM, // e220_tx_power_dbm (30, 27, 24, 21)
+    ROVER_E220_DEFAULT_SUBPACKET_BYTES, // e220_subpacket_bytes (200, 128, 64, 32)
     false,            // e220_lbt_enable
     5,                // survey_avg_seconds (1, 5, or 10s)
     "PIN_",           // default_label_prefix

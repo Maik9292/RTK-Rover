@@ -2,10 +2,10 @@
 
 High-precision handheld and pole-mounted RTK GNSS Waypoint Guidance, Property Pin Seeker, Field Survey Logger, and Dual-Antenna Moving-Baseline Compass built on the **Waveshare ESP32-S3-Touch-LCD-3.5B**, **Holybro H-RTK Unicore UM982**, and **Ebyte E220-900T30S** 900MHz LoRa transceiver.
 
-**Firmware Version:** `v0.8.12`  
+**Firmware Version:** `v0.8.13`  
 **License:** GNU General Public License v3.0 ([GPLv3](LICENSE))  
 **User Documentation:** [Field User Manual](docs/user_manual.md)  
-**Engineering Review:** [Critical Design Review (CDR)](docs/critical_design_review.md) | [Project Retrospective](docs/project_retrospective.md) | [E220-900T30S Reference (v3.1)](docs/e220-reference.md) | [E220 Stage 1 Benchmarks (21 & 30 dBm)](docs/benchmarks/e220_stage1_20261116/README.md)  
+**Engineering Review:** [Critical Design Review (CDR)](docs/critical_design_review.md) | [Project Retrospective](docs/project_retrospective.md) | [E220-900T30S Reference (v3.2)](docs/e220-reference.md) | [E220 Stage 1 Benchmarks (21 & 30 dBm)](docs/benchmarks/e220_stage1_20261116/README.md)  
 **Architecture & Plans:** [Async Mailbox LoRa Transport Plan](docs/plans/plan_async_mailbox_lora_transport_analysis.md) | [Project Structure & Token Optimization Plan](docs/plans/plan_project_structure_and_token_optimization.md) | [Plan Smart Pole and Android App](docs/plans/plan_smart_pole_and_android_app.md) | [Phase 8 Single-UART UM982 & MMC5983MA Plan](docs/plans/plan_phase8_single_uart_um982_and_mmc5983ma_compass.md) | [Phase 7 Cellular NTRIP Bridge Plan](docs/plans/plan_phase7_cellular_ntrip_bridge.md)
 
 ---

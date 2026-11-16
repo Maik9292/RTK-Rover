@@ -1,8 +1,8 @@
 # Ebyte E220-900T30S Practical Engineering Reference
 
-**Document Version:** 3.1  
+**Document Version:** 3.2  
 **Last Updated:** November 16, 2026  
-**Firmware Target:** `v0.8.12`  
+**Firmware Target:** `v0.8.13`  
 **Companion Software:** `e220_pacer.py v3.7.1`  
 **Target Hardware:** Ebyte `E220-900T30S` (`850.125 - 930.125 MHz`, `1 W` / `+30 dBm` SMD UART LoRa Module)  
 **Applicability:** Directly applies to `E220-900T30S` / `E220-900T30D` (`1 W`) and `E220-900T22S` / `E220-900T22D` (`160 mW`, noting TX power bit differences in Section 4.4).  
@@ -135,13 +135,13 @@ When switching between any two modes, the E220 pulls `AUX` **`LOW` for `9..11 ms
 
 > **`0xC0` vs `0xC1` Acknowledgment & Mode 3 Retry Protocol (`v0.8.7` / `v0.8.9`):** Certain E220 firmware builds echo `0xC0` instead of `0xC1` upon successful EEPROM write. Always accept `reply[0] in (0xC0, 0xC1)`. Field testing (`test/_038`, `test/_040`) showed that entering Mode 3 while a Mode 0 RSSI command or RF transmission is still active — or switching ESP32 UART to `9600` baud *before* raising `M0/M1` / bouncing `M0/M1` while locked at `9600` baud — injects a framing glitch and provokes repeated `FF FF FF` format-error replies (`got 3 bytes` / `got 4 bytes`) even while a subsequent `e220_read_config_registers()` (`set_mode(1,1)` *then* `9600`) succeeds immediately. Firmware `v0.8.9` cancels active Mode 0 RSSI queries, waits for `s_tx_air_busy_until_ms` + `AUX == HIGH` + `Serial0.flush()`, asserts **`e220_set_mode(1, 1)` BEFORE `Serial0.updateBaudRate(9600)`**, runs `e220_mode3_sync_read()` (`0xC1 0x00 0x06`), retries Attempts `1..3` in Mode 3 without bouncing `M0/M1` (`280 ms` timeout with `35 ms` frame-end exit for `>= 3 B` error frames), reserves a clean baud-matched `Mode 0 (115200) -> Mode 3 (9600)` bounce + sync read for Attempt `4`, and falls back to `e220_read_config_registers()` to resync `s_active_air_rate` if all attempts fail.
 
-### 4.3 Production Register Profiles (Profile Rev 2)
+### 4.3 Production Register Profiles (Profile Rev 3 Default)
 
-| Parameter | Standard Link (`19.2 kbps`) | Deep-Canopy / Foliage (`9.6 kbps`) | High-Speed Bench (`38.4 kbps`) |
+| Parameter | Default Forest / Field (`4.8 kbps`) | Canopy (`9.6 kbps`) | Open-Sky / Bench (`19.2 kbps`) |
 | :--- | :---: | :---: | :---: |
 | **`ADDH` / `ADDL`** | `0x00` / `0x00` | `0x00` / `0x00` | `0x00` / `0x00` |
-| **`REG0` (UART + Air Rate)** | **`0xE5`** (`115200 8N1`, `19.2k`) | **`0xE4`** (`115200 8N1`, `9.6k`) | **`0xE6`** (`115200 8N1`, `38.4k`) |
-| **`REG1` (Pkt + RSSI + Power)**| **`0x20`** (`200B`, `RSSI=1`, `30dBm`; `0x23` for `21dBm`) | **`0x20`** (`200B`, `RSSI=1`, `30dBm`; `0x23` for `21dBm`) | **`0x23`** (`200B`, `RSSI=1`, `21dBm` bench) |
+| **`REG0` (UART + Air Rate)** | **`0xE3`** (`115200 8N1`, `4.8k`) | **`0xE4`** (`115200 8N1`, `9.6k`) | **`0xE5`** (`115200 8N1`, `19.2k`) |
+| **`REG1` (Pkt + RSSI + Power)**| **`0x20`** (`200B`, `RSSI=1`, `30dBm`; `0x23` for `21dBm`) | **`0x20`** (`200B`, `RSSI=1`, `30dBm`; `0x23` for `21dBm`) | **`0x20`** (`200B`, `RSSI=1`, `30dBm`; `0x23` for `21dBm` bench) |
 | **`CHAN` (Frequency)** | **`0x4B`** (`CH 75` = `925.125 MHz`) | **`0x4B`** (`CH 75` = `925.125 MHz`) | **`0x4B`** (`CH 75` = `925.125 MHz`) |
 | **`REG3` (Transparent Mode)** | **`0x00`** (Transparent, LBT Off) | **`0x00`** (Transparent, LBT Off) | **`0x00`** (Transparent, LBT Off) |
 | **`CRYPT_H` / `CRYPT_L`** | `0x00` / `0x00` | `0x00` / `0x00` | `0x00` / `0x00` |

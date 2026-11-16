@@ -11,7 +11,7 @@ WorkingDirectory=/tmp
 Environment=PYTHONUNBUFFERED=1
 Environment="E220_POWER=30"
 EnvironmentFile=-/etc/default/e220-pacer
-ExecStart=/usr/bin/python3 -u /usr/local/bin/e220_pacer.py --tcp-connect 127.0.0.1:5016 --port /dev/ttyAMA0 --auto-config --baud 115200 --air-rate 19.2 --packet-size 200 --channel 75 --power $E220_POWER
+ExecStart=/usr/bin/python3 -u /usr/local/bin/e220_pacer.py --tcp-connect 127.0.0.1:5016 --port /dev/ttyAMA0 --auto-config --baud 115200 --air-rate 4.8 --packet-size 200 --channel 75 --power $E220_POWER
 Restart=always
 RestartSec=3
 

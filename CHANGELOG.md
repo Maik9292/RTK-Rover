@@ -5,6 +5,14 @@ All notable changes to the **RTK Rover** project will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.8.13] - 2026-11-16
+
+### Changed
+- **Default Field Profile `4.8 kbps` / `30 dBm` Across Base & Rover ([`user_config.h`](user_config.h) `v0.8.13`, [`src/settings_manager/settings_manager.cpp`](src/settings_manager/settings_manager.cpp), [`scripts/e220-pacer.service`](scripts/e220-pacer.service), [`README.md`](README.md), [`docs/e220-reference.md`](docs/e220-reference.md) `v3.2`):**
+  - Updated [`scripts/e220-pacer.service`](scripts/e220-pacer.service) default air-rate to **`--air-rate 4.8`** (paired with `E220_POWER=30`) for maximum forest canopy penetration (`-126 dBm` sensitivity).
+  - Updated [`user_config.h`](user_config.h) E220 target registers/defaults (`ROVER_E220_TARGET_REG0 = 0xE3`, `ROVER_E220_TARGET_REG1 = 0x20`, `ROVER_E220_DEFAULT_AIR_RATE_KBPS = 4.8f`, `ROVER_E220_DEFAULT_TX_POWER_DBM = 30`), synced `SETTINGS_DEFAULT` in [`src/settings_manager/settings_manager.cpp`](src/settings_manager/settings_manager.cpp) to reference the `user_config.h` macros, and bumped **`ROVER_E220_PROFILE_REV`** (`2 -> 3`) so existing `/settings.json` configurations auto-migrate once on next boot to match the Base default while preserving Tile 1 `4.8k / 9.6k / 19.2k` switching afterward.
+  - Compiled cleanly via `arduino-cli` (`esp32:esp32:esp32s3`, `--warnings default`): zero compiler warnings (`1,698,354 B` flash / `53%`, `67,152 B` static `DRAM0` / `20%`).
+
 ## [stage2_bench_verify.py v1.0.2] - 2026-11-16
 
 ### Added & Improved
