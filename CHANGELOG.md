@@ -5,6 +5,14 @@ All notable changes to the **RTK Rover** project will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [bench_e220_multirate.py v1.0.3] - 2026-11-16
+
+### Added & Updated
+- **Stage 1 Multi-Rate Benchmarks Archived (`21 dBm` & `30 dBm`), `e220-reference.md v3.0`, and Mode 0 Exit Probe ([`scripts/bench_e220_multirate.py`](scripts/bench_e220_multirate.py) `v1.0.3`, [`docs/benchmarks/e220_stage1_20261116/README.md`](docs/benchmarks/e220_stage1_20261116/README.md), [`docs/e220-reference.md`](docs/e220-reference.md), [`docs/plans/plan_async_mailbox_lora_transport_analysis.md`](docs/plans/plan_async_mailbox_lora_transport_analysis.md)):**
+  - Captured and scrubbed the full unattended Stage 1 hardware datasets (`21 dBm` and `30 dBm` across `4.8k`, `9.6k`, and `19.2k` from `test/_047`: `100.0%` `6/6` suites passing at `30 dBm`, `1,303/1,303` thermal soak frames, `120/120` Mode 3 switches, `1,620/1,620` framing PER, and `4.7–6.0 ms` idle Mode 0 RSSI down to `20 ms` turnaround) into versioned [`docs/benchmarks/e220_stage1_20261116/`](docs/benchmarks/e220_stage1_20261116/README.md).
+  - Updated [`docs/e220-reference.md`](docs/e220-reference.md) to `v3.0` (reconciling Table `6.1` `ToA` and throughput capacity with empirical `186.7 / 282.8 / 442.8 ms` `200 B` measurements, documenting `30 dBm` XTAL thermal soak stability, `20 ms` turnaround, idle burst FIFO tolerance, and post-Mode-3 Mode-0 liveness checks) and updated [`docs/plans/plan_async_mailbox_lora_transport_analysis.md`](docs/plans/plan_async_mailbox_lora_transport_analysis.md) to `v1.2.0` with recalibrated Max-Sat / Avg-SV macro-cycle projections.
+  - Updated [`scripts/bench_e220_multirate.py`](scripts/bench_e220_multirate.py) to `v1.0.3`: added a post-Mode-3 `C0 C1 C2 C3 00 02` Mode 0 liveness probe + clean `(1,1)->(0,0)` bounce inside `configure_registers()` (eliminating the rare `21 dBm` Test 6 `@ 9.6k` silent Mode-0 exit desync) and separated the `<= 3.0 kbps` (`2.4k`) `ToA` fallback branch in `estimate_subpacket_air_s()` / `estimate_frame_air_s()`.
+
 ## [set_e220_power.py v1.1.0] - 2026-11-16
 
 ### Fixed

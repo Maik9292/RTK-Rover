@@ -65,7 +65,7 @@ except ImportError:
 
 __filename__ = os.path.basename(__file__)
 __app_name__ = "bench_e220_multirate"
-__version__ = "v1.0.2"
+__version__ = "v1.0.3"
 __date__ = "2026-11-16"
 
 
@@ -133,11 +133,15 @@ def crc16_ccitt(data: bytes) -> int:
 def estimate_subpacket_air_s(n_bytes: int, air_rate_kbps: float) -> float:
     """
     Return silicon-calibrated single-subpacket Time-on-Air (1..200 B, seconds)
-    fitted to Pi FTDI-1ms empirical E220-900T30S measurements (test/_045, max err <= 1.9 ms).
+    fitted to Pi FTDI-1ms empirical E220-900T30S measurements (test/_045.._047,
+    max err <= 1.9 ms at 4.8k/9.6k/19.2k; conservative fallback at <= 3.0k or > 20k).
     """
     if n_bytes <= 0:
         return 0.0
     n = float(min(n_bytes, 200))
+    if air_rate_kbps <= 3.0:
+        rate_bps = max(air_rate_kbps, 2.4) * 1000.0
+        return 0.022 + ((n + 16.0) * 8.0) / (rate_bps * 0.60)
     if air_rate_kbps <= 5.0:
         return 0.070 + (0.00187 * n)
     if air_rate_kbps <= 10.0:
@@ -150,14 +154,14 @@ def estimate_subpacket_air_s(n_bytes: int, air_rate_kbps: float) -> float:
 def estimate_frame_air_s(frame_len: int, air_rate_kbps: float) -> float:
     """
     Return silicon-calibrated end-to-end RF air + E220 framing duration (seconds)
-    for 1..400 B single-burst frames (test/_045 fit, max err <= 1.9 ms), or
-    summed <=200 B chunk durations for >400 B frames.
+    for 1..400 B single-burst frames (test/_045.._047 fit, max err <= 1.9 ms), or
+    summed <=200 B chunk durations for >400 B frames or <=3.0 kbps.
     """
     if frame_len <= 0:
         return 0.0
     if frame_len <= 200:
         return estimate_subpacket_air_s(frame_len, air_rate_kbps)
-    if frame_len <= 400:
+    if frame_len <= 400 and air_rate_kbps > 3.0:
         n = float(frame_len)
         if air_rate_kbps <= 5.0:
             return 0.128 + (0.00180 * n)
@@ -592,11 +596,31 @@ class BaseE220Radio:
         self.wait_aux_high(1.0, 5.0)
         self.drain_rx()
 
+        mode0_tag = "ok"
+        if ok:
+            # Verify live Mode 0 UART responsiveness (~5ms); rescues rare FTDI Mode 3->0 exit desyncs
+            r_ok, _, _, _, r_note = self.query_mode0_rssi(timeout_s=0.12)
+            if not (r_ok or r_note == "0x80_sentinel"):
+                self.set_mode_pins(1, 1)
+                self._sleep(0.040)
+                self.set_mode_pins(0, 0)
+                self._sleep(0.025)
+                self.set_baudrate(self.baud)
+                self._sleep(0.055)
+                self.wait_aux_high(1.0, 5.0)
+                self.drain_rx()
+                r_ok2, _, _, _, r_note2 = self.query_mode0_rssi(timeout_s=0.12)
+                if r_ok2 or r_note2 == "0x80_sentinel":
+                    mode0_tag = "recovered"
+                else:
+                    ok = False
+                    mode0_tag = f"FAIL({r_note2})"
+
         if ok:
             self.air_rate_kbps = air_rate_kbps
             self.power_dbm = power_dbm
             self.channel = channel
-        return (ok, used_attempts, f"sync={sync_ok} op=0x{cmd_op:02X} raw={last_hex}")
+        return (ok, used_attempts, f"sync={sync_ok} op=0x{cmd_op:02X} raw={last_hex} m0={mode0_tag}")
 
     def read_registers_mode3(self) -> Optional[bytes]:
         """Enter Mode 3 cleanly, read 8 EEPROM/active registers via C1 00 08, return to Mode 0."""

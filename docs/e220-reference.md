@@ -1,7 +1,7 @@
 # Ebyte E220-900T30S Practical Engineering Reference
 
-**Document Version:** 2.9  
-**Last Updated:** November 15, 2026  
+**Document Version:** 3.0  
+**Last Updated:** November 16, 2026  
 **Firmware Target:** `v0.8.11`  
 **Companion Software:** `e220_pacer.py v3.6.5`  
 **Target Hardware:** Ebyte `E220-900T30S` (`850.125 - 930.125 MHz`, `1 W` / `+30 dBm` SMD UART LoRa Module)  
@@ -10,7 +10,7 @@
 **Reference Implementations in This Repository:**
 * **ESP32-S3 Rover Driver & RTCM3 Gatekeeper:** [`src/e220_driver/e220_driver.cpp`](../src/e220_driver/e220_driver.cpp), [`src/e220_driver/rover_telemetry.h`](../src/e220_driver/rover_telemetry.h), [`user_config.h`](../user_config.h)
 * **Raspberry Pi Hardware-Paced Transmitter Daemon:** [`scripts/e220_pacer.py`](../scripts/e220_pacer.py), [`scripts/e220-pacer.service`](../scripts/e220-pacer.service), [`scripts/update_e220_pacer.sh`](../scripts/update_e220_pacer.sh)
-* **Spectrum Scanner, Bench Suite & Configuration Utilities:** [`scripts/scan_e220_channels.py`](../scripts/scan_e220_channels.py), [`scripts/bench_e220_multirate.py`](../scripts/bench_e220_multirate.py) (`v1.0.0`), [`scripts/setup_e220.py`](../scripts/setup_e220.py), [`scripts/set_e220_power.py`](../scripts/set_e220_power.py)
+* **Spectrum Scanner, Bench Suite, Benchmarks & Configuration Utilities:** [`scripts/scan_e220_channels.py`](../scripts/scan_e220_channels.py), [`scripts/bench_e220_multirate.py`](../scripts/bench_e220_multirate.py) (`v1.0.3`), [`docs/benchmarks/e220_stage1_20261116/`](benchmarks/e220_stage1_20261116/README.md), [`scripts/setup_e220.py`](../scripts/setup_e220.py), [`scripts/set_e220_power.py`](../scripts/set_e220_power.py) (`v1.1.0`)
 
 ---
 
@@ -61,11 +61,11 @@ Understanding the `E220-900T30S` requires recognizing that **your host MCU does 
 ### Critical Silicon Realities
 
 1. **400-Byte MCU RAM Buffer vs. 200-Byte LoRa Packet Limit:**
-   * The internal MCU buffers up to **400 bytes** from `RXD`, while each over-the-air `LLCC68` LoRa packet carries at most **200 bytes** (`REG1[7:6] = 00`).
-   * This 400-byte buffer enables **zero-dead-air hardware packet chaining**: when you write a `201..400 B` message at `115200` baud with no inter-byte gaps, the MCU loads the first `200 B` into the `LLCC68` immediately and holds bytes `201..N` in RAM, chaining Subpacket 2 onto the air the instant Subpacket 1 completes.
+   * Each single over-the-air `LLCC68` LoRa packet carries at most **200 bytes** (`REG1[7:6] = 00`), and hardware `AUX` chaining is guaranteed only up to **400 bytes** per atomic write. *(Bench testing in [`test/_045.._047`](benchmarks/e220_stage1_20261116/README.md) observed the internal UART FIFO absorbing isolated idle pairs up to `442 B` (`253 + 189 B`), but sustained continuous pacing must still obey full `ToA` floors so FIFO never overflows.)*
+   * This 400-byte staging enables **zero-dead-air hardware packet chaining**: when you write a `201..400 B` message at `115200` baud with no inter-byte gaps, the MCU loads the first `200 B` into the `LLCC68` immediately and holds bytes `201..N` in RAM, chaining Subpacket 2 onto the air the instant Subpacket 1 completes.
 2. **Passive `32 MHz` Crystal (`XTAL`), NOT a `TCXO`:**
    * Unlike industrial modules fitted with a temperature-compensated oscillator (`TCXO`), the `E220-900T30S` uses a **passive `32 MHz` quartz crystal** adjacent to a `1 W` power amplifier.
-   * Under high duty cycles (`> 60%`), PA self-heating induces thermal carrier drift. Wide bandwidth rates (`38.4 kbps`, `62.5 kbps`) tolerate this drift effortlessly. Lower rates (`19.2 kbps`, `9.6 kbps`) provide exceptional link margin (`+3.5 dB` to `+6 dB`) but require managed duty cycles and conservative guard bands.
+   * Under high duty cycles (`> 60%`), PA self-heating can induce slight carrier offset; however, full Stage 1 bench soak testing at **`30 dBm` (`1 W`) and `~85–90%` duty for `5.0 min/rate`** confirmed **`526/526` (`100.0%`) @ `4.8 kbps`** and **`777/777` (`100.0%`) @ `9.6 kbps`** with **`0` CRC errors** on stable `5 V` power. Wide bandwidth rates (`38.4`, `62.5 kbps`) tolerate thermal offset even more broadly, while `4.8` / `9.6` / `19.2 kbps` still require managed pacing and clean `>= 20 ms` turnaround guards.
 3. **Uncalibrated Internal RC Sleep Timer (`~330 ppm`):**
    * In Wake-on-Radio (`WOR`) Modes 1 and 2, the sleep/wake period (`500..4000 ms`) runs off an internal low-power RC oscillator measured at **`+320..+340 ppm`** (`~115 ms` drift per 6 minutes relative to GPS UTC). Transparent Mode 0 (`M0=0, M1=0`) bypasses this timer entirely.
 
@@ -123,7 +123,7 @@ When switching between any two modes, the E220 pulls `AUX` **`LOW` for `9..11 ms
 * **Mode 3 (`M1=1, M0=1`) ALWAYS uses `9600 bps, 8N1`**, regardless of the operational baud rate in `REG0`.
 * Flush Mode 0 UART TX, assert **`M0=1, M1=1` BEFORE switching host UART to `9600 bps`**, and wait `>= 60 ms` settle time. Switching the ESP32 UART to `9600` while the E220 is still listening at `115200` in Mode 0 injects a baud-mismatch framing glitch into the transceiver RX shift register (`test/_040`).
 * Issue a pre-write Mode 3 read probe (`C1 00 06`) to verify UART alignment before sending `C0 00 06`, insert **`>= 15–20 ms` settling delay between consecutive Mode 3 commands** (`C1 <-> C2` in either direction, preventing `verify_mismatch:none` or retry frames seen in `test/_044` and `test/_045`), and keep `M0=1, M1=1` steady between initial retries instead of toggling `Mode 0 -> Mode 3` at `9600` baud.
-* Wait **`25 ms` after `M0=0, M1=0`** before restoring operational baud (`115200`), then wait **`>= 60–80 ms` + `AUX == HIGH`** + flush Mode 3 reply (`test/_045` Cycle 3 `9.6k -> 4.8k` showed `45 ms` was marginal before transmitting a slower-SF `4.8k` RF frame).
+* Wait **`25 ms` after `M0=0, M1=0`** before restoring operational baud (`115200`), wait **`>= 60–80 ms` + `AUX == HIGH`**, flush Mode 3 reply (`test/_045` Cycle 3 `9.6k -> 4.8k` showed `45 ms` was marginal before transmitting a slower-SF `4.8k` RF frame), and optionally run a fast **`5 ms` Mode 0 liveness probe (`C0 C1 C2 C3 00 02`)** when `REG1[5]=1` to detect and bounce rare FTDI/Mode-0 exit desyncs (observed once at `9.6k` in `test/_047` `21 dBm`).
 
 ### 4.2 Binary Command Frame Formats
 
@@ -199,64 +199,58 @@ LLCC68 RF PA:          |=== Subpkt 1: 200B (up to 545ms @4.8k) ===|=== Subpkt 2:
 
 ### 5.4 Hardware-Calibrated Time-on-Air (`ToA`) Formula
 
-> **Stage 1 Bench Empirical Correction (`test/_045`, `1 ms` USB-FTDI polling, `18..400 B`):**
-> Direct Pi-to-FTDI bench characterization (`bench_e220_multirate.py v1.0.1`) revealed that E220-900T30S (`REG0 = 0xE3/0xE4/0xE5`, `Pkt = 200 B`) transfers frames **35–37% faster at `4.8 kbps`** (`316 B` = **`696.6 ms`**, `400 B` = **`847.2 ms`**) and **19% faster at `9.6 kbps`** (`200 B` = **`282.1 ms`**, `400 B` = **`527.5 ms`**) than the earlier `0.60`/`0.68` efficiency extrapolation below:
-> * **`4.8 kbps`:** `70 + 1.87 * N ms` (`1..200 B`, `200 B = 443.2 ms`), `128 + 1.80 * N ms` (`201..400 B`, `253 B = 582.3 ms`, `316 B = 696.6 ms`, `400 B = 847.2 ms`; `AUX_low = 383.3..403.0 ms`; `max |err| <= 1.9 ms`).
-> * **`9.6 kbps`:** `45 + 1.19 * N ms` (`1..200 B`, `200 B = 282.1 ms`), `80 + 1.12 * N ms` (`201..400 B`, `253 B = 362.2 ms`, `400 B = 527.5 ms`; `AUX_low = 226.1..243.4 ms`; `max |err| <= 1.8 ms`).
-> * **`19.2 kbps`:** `29 + 0.80 * N ms` (`1..200 B`, `200 B = 187.7 ms`), `55 + 0.70 * N ms` (`201..400 B`, `253 B = 232.9 ms`, `400 B = 336.1 ms`; `AUX_low = 131.5..146.1 ms`; `max |err| <= 1.7 ms`).
->
-> *Production `e220_pacer.py` (`v3.6.5`) and firmware currently retain the conservative formulas below pending `v1.0.2` Stage 1 guard-floor validation (`bench_e220_multirate.py` `Test 2`):*
+Full Stage 1 bench characterization ([`docs/benchmarks/e220_stage1_20261116/`](benchmarks/e220_stage1_20261116/README.md), `1 ms` USB-FTDI resolution across `18..400 B` at `21 dBm` and `30 dBm`) measured end-to-end TX-to-RX RF airtime (`<= 1.9 ms` fit residual across all tested points, proving `4.8 kbps` transfers **`35–37%` faster** than earlier `0.60`-efficiency extrapolations while `19.2 kbps` measures `186.7 ms @ 200 B`):
 
-* **`>= 9.6 kbps` (`Guard_Delay = 35 ms`):**
-$$\text{ToA}(N) = 0.016 + \frac{(N + 16) \times 8}{\text{AirRate}_{\text{bps}} \times 0.68}\ \text{seconds} \quad (1 \le N \le 200)$$
+| Air Rate | Single-Subpacket (`1..200 B`) | `200 B` Measured | Two-Subpacket (`201..400 B`) | `316 B` / `400 B` Measured | Recommended Min Guard (`>= 10 ms` verified) |
+| :---: | :--- | :---: | :--- | :---: | :---: |
+| **`4.8 kbps`** | `0.070 + 0.00187 * N` s | `442.8 ms` | `0.128 + 0.00180 * N` s | `695.4` / `847.0 ms` | **`30–35 ms`** |
+| **`9.6 kbps`** | `0.045 + 0.00119 * N` s | `282.8 ms` | `0.080 + 0.00112 * N` s | `433.2` / `527.2 ms` | **`30 ms`** |
+| **`19.2 kbps`** | `0.029 + 0.00080 * N` s | `186.7 ms` | `0.055 + 0.00070 * N` s | `277.8` / `336.7 ms` | **`25–30 ms`** |
 
-* **`<= 4.8 kbps` (`Guard_Delay = 50 ms`, calibrated `test/_039`):**
-$$\text{ToA}(N) = 0.022 + \frac{(N + 16) \times 8}{\text{AirRate}_{\text{bps}} \times 0.60}\ \text{seconds} \quad (200\text{ B} \approx 622.0\text{ ms},\ 41\text{ B} \approx 180.3\text{ ms})$$
+*(Note: Production `e220_pacer.py v3.6.5` and `v0.8.11` firmware still retain the legacy conservative formulas below—`0.022 + (N+16)*8/(4800*0.60)` at `<= 5k` and `0.016 + (N+16)*8/(AirRate*0.68)` at `>= 9.6k`—until upgraded to the Stage-1-calibrated async mailbox scheduler.)*
 
 ---
 
 ## 6. Air Rates, Link Capacity & Multi-Constellation Interleaving
 
-### 6.1 Link Budget & Air Rate Comparison
+### 6.1 Link Budget & Air Rate Comparison (Stage 1 Calibrated)
 
-| Air Rate | `REG0[2:0]` | Sensitivity | 200B Subpacket ToA | Max Net Capacity | RTCM Stream Viability (`~650 B/s`) |
+| Air Rate | `REG0[2:0]` | Sensitivity | `200 B` Subpacket Measured ToA | Est. Net Throughput (`+30 ms` Guard) | RTCM Stream Viability (`~600–760 B/s`) |
 | :---: | :---: | :---: | :---: | :---: | :--- |
-| **`2.4 kbps`** | `000` | `-129 dBm` | `1,180 ms` | `110 B/s` | Unusable for multi-constellation RTCM |
-| **`4.8 kbps`** | `011` | `-126 dBm` | `622 ms` | `215 B/s` | Alternating single-constellation interleaving (`1074` held across Sec 0; `1005/1006/1230` gated to odd epochs; `+6 dB` margin) |
-| **`9.6 kbps`** | `100` | **`-124 dBm`** | `295 ms` | `450 B/s` | **Requires Adaptive Interleaving** (`+3.5 dB` foliage gain) |
-| **`19.2 kbps`**| `101` | **`-121 dBm`** | `148 ms` | `900 B/s` | **Standard Production Baseline** (`~60%` duty cycle, full 4-constellation) |
-| **`38.4 kbps`**| `110` | `-118 dBm` | `82 ms` | `1,800 B/s` | Bench / High-rate telemetry (`500 kHz` BW) |
-| **`62.5 kbps`**| `111` | `-115 dBm` | `57 ms` | `2,800 B/s` | Short range / Line of sight only |
+| **`2.4 kbps`** | `010` | `-129 dBm` | `~1,180 ms` *(est.)* | `~110–160 B/s` | Unusable for multi-constellation RTK (`+2-3 dB` over `4.8k` vs `3-8 s` age) |
+| **`4.8 kbps`** | `011` | `-126 dBm` | **`442.8 ms`** | **`~390–420 B/s`** | **Async Ping-Pong Mailbox + `<=200 B` Coalescing** (`316 B` = `695 ms`; `+5 dB` vs `19.2k`) |
+| **`9.6 kbps`** | `100` | **`-124 dBm`** | **`282.8 ms`** | **`~610–640 B/s`** | **Async Interleaving (`~1.24–1.35 s` refresh at Max-Sat; `+3 dB` vs `19.2k`)** |
+| **`19.2 kbps`**| `101` | **`-121 dBm`** | **`186.7 ms`** | **`~920–990 B/s`** | **Standard Production Baseline** (`~1 Hz` full 3-constellation up to Max-Sat) |
+| **`38.4 kbps`**| `110` | `-118 dBm` | `~82 ms` *(est.)* | `~1,800 B/s` | Bench / High-rate telemetry (`500 kHz` BW) |
+| **`62.5 kbps`**| `111` | `-115 dBm` | `~57 ms` *(est.)* | `~2,800 B/s` | Short range / Line of sight only |
 
-### 6.2 The 9.6 kbps Channel Saturation Problem
-A standard 4-constellation RTCM3 stream contains:
+### 6.2 The 9.6 kbps & 4.8 kbps Channel Saturation Reality
+A standard 4-constellation (`GPS + GLO + GAL`) RTCM3 stream contains:
 * `1006` Base Antenna Position: Every 5s (`27 B`)
-* `1074` GPS MSM4: 1.0 Hz (`~197 - 245 B`, 2 subpackets)
-* `1084` GLONASS MSM4: 1.0 Hz (`~138 - 197 B`, 1 subpacket)
-* `1094` Galileo MSM4: 1.0 Hz (`~239 - 325 B`, 2 subpackets)
+* `1074` GPS MSM4: 1.0 Hz (`~197 - 316 B`, 2 subpackets)
+* `1084` GLONASS MSM4: 1.0 Hz (`~138 - 173 B`, 1 subpacket)
+* `1094` Galileo MSM4: 1.0 Hz (`~209 - 275 B`, 2 subpackets)
 * `1230` GLONASS Code-Phase Biases: Every 10s (`~18 B`)
-* **Total Throughput:** **`~625 - 650 Bytes/second` (5 to 6 physical subpackets per second)**.
+* **Total Throughput:** **`~600 B/s` typical (`~764 B/s` at 14-SV Max Open-Sky)**.
 
-At `19.2 kbps`, 5 subpackets require $\approx 550\text{--}620\text{ ms}$ airtime, leaving an ample $\approx 380\text{--}450\text{ ms}$ half-duplex quiet window each 1-second epoch.
+At `19.2 kbps`, `1074 (316 B) + 1094 (275 B) + 1084 (173 B)` completes in `~780 ms` (`+30 ms` guards), fitting cleanly inside a `1.0 s` cadence.
 
-At `9.6 kbps`, each 200B subpacket requires $295\text{ ms}$. Transmitting 5 subpackets requires:
-$$5 \times 295\text{ ms} + 5 \times 35\text{ ms (guard)} = 1,650\text{ ms}$$
-Because $1,650\text{ ms} > 1,000\text{ ms}$, **the 9.6 kbps channel saturates 100%**. Transmit queues explode, latency grows by seconds each epoch, the quiet window vanishes, and all rover telemetry is lost.
+At `9.6 kbps` and `4.8 kbps`, standalone `ToA` + `30 ms` guards still exceed `1,000 ms` (`~1,163 ms` @ `9.6k`, `~1,803 ms` @ `4.8k` at Max-Sat), so naive FIFO queuing falls behind linearly and drops frames. Combining **Asynchronous Latest-Value Ping-Pong Mailboxes**, **`<= 200 B` coalescing** (`1006+1230+1084`), and a **content-independent `5 s` / `10 s` macro-cycle** eliminates FIFO lag permanently while keeping age `< 1.0 s` at TX.
 
-### 6.3 Closed-Loop Airtime Budgeting & Constellation Reservation ([`e220_pacer.py`](../scripts/e220_pacer.py))
-To unlock the $+3.5\text{ dB}$ link margin of $9.6\text{ kbps}$ and $+7\text{ dB}$ margin of $4.8\text{ kbps}$ under varying satellite counts without dropping RTK fix or overflowing queues:
+### 6.3 Closed-Loop Airtime Budgeting & Constellation Reservation (`v3.6.5` Current Baseline)
+Prior to the Async Mailbox refactor, [`e220_pacer.py`](../scripts/e220_pacer.py) (`v3.6.5`) maintains `9.6k` and `4.8k` stability inside `utc_sec % 5` slots via:
 1. **Calibrated Wall-Time Estimator (`_estimate_frame_toa_ms()`):** Incorporates per-subpacket ToA, UART serialization time, multi-subpacket inter-frame guard (`>= 48 ms`), and `+8 ms` handover margin per extra subpacket (supporting `2` or `3+` subpackets if satellite count exceeds `400 B`).
 2. **Starvation-Age Priority & Airtime Reservation (`_select_epoch_target_msm()`, `msm_epochs_since_tx`):** Tracks `last_len` and skipped-epoch age per constellation (`1074`, `1084`, `1094`, `1124`). If transmitting an earlier constellation (`1074`/`1084`) would push the epoch's priority starved constellation past the superframe cutoff, the earlier constellation yields cleanly in `0 ms` so no constellation is starved even as satellite counts grow.
-3. **Fit-or-Skip Admission Control:** At `>= 9.6 kbps`, any MSM frame exceeding `cutoff_ms` (`700/740 ms` in Second 0, `850 ms` in Seconds `1..4`) is discarded immediately (`[SEC0 SKIP]` / `[BUDGET SKIP]`) rather than spilling across second boundaries. At `<= 4.8 kbps`, where single MSM frames exceed `850 ms`, Seconds `1..3` permit `1` lead MSM up to `1,750 ms` (after `1006 + 1230` or prior spillover) and `Second 4` caps spillover strictly at `1,680 ms` so TX never enters Second 0's `720..800 ms` uplink window, follow-on and non-MSM frames stay capped at `850 ms` (`sec_msm_count`), and a smaller secondary MSM (`1084`) is opportunistically admitted whenever `epoch_target_msm` cannot fit `cutoff_ms`. Only non-MSM station/bias frames (`1005/1006/1033/1230`) hold cleanly for the top of the next second.
+3. **Fit-or-Skip Admission Control:** At `>= 9.6 kbps`, any MSM frame exceeding `cutoff_ms` (`700/740 ms` in Second 0, `850 ms` in Seconds `1..4`) is discarded immediately (`[SEC0 SKIP]` / `[BUDGET SKIP]`) rather than spilling across second boundaries. At `<= 4.8 kbps`, Seconds `1..3` permit `1` lead MSM up to `1,750 ms` (after `1006 + 1230` or prior spillover) and `Second 4` caps spillover strictly at `1,680 ms` so TX never enters Second 0's `720..800 ms` uplink window, follow-on and non-MSM frames stay capped at `850 ms` (`sec_msm_count`), and a smaller secondary MSM (`1084`) is opportunistically admitted whenever `epoch_target_msm` cannot fit `cutoff_ms`. Only non-MSM station/bias frames (`1005/1006/1033/1230`) hold cleanly for the top of the next second.
 
 ### 6.4 Rate-Adaptive Truncation Timeouts ([`e220_driver.cpp`](../src/e220_driver/e220_driver.cpp))
-On the receiving rover, multi-subpacket frames (`201..400 B`) exhibit an inter-subpacket gap while the base E220 finishes airing Subpacket 1 before starting Subpacket 2. The sliding-window gatekeeper must scale its truncation timeout accordingly:
+On the receiving rover, multi-subpacket frames (`201..400 B`) exhibit an inter-subpacket gap while the base E220 finishes airing Subpacket 1 before RX receives Subpacket 2 (`186.7 / 282.8 / 442.8 ms` `200 B` ToA):
 
-| Air Rate | Single-Subpacket ToA | Inter-Subpacket Gap | Truncation Timeout (`TRUNC_TIMEOUT_MS`) |
-| :---: | :---: | :---: | :---: |
-| **`19.2 kbps`** | `148 ms` | `~150 ms` | **`280 ms`** |
-| **`9.6 kbps`** | `295 ms` | `~300 ms` | **`650 ms`** |
-| **`4.8 kbps`** | `590 ms` | `~600 ms` | **`1,200 ms`** |
+| Air Rate | Empirical `200 B` ToA | Max Subpkt-1 -> Subpkt-2 Gap (`201..400 B`) | `v0.8.11` `TRUNC_TIMEOUT_MS` | Stage 2 Target Timeout |
+| :---: | :---: | :---: | :---: | :---: |
+| **`19.2 kbps`** | **`186.7 ms`** | `~150 ms` | **`280 ms`** | **`280 ms`** |
+| **`9.6 kbps`** | **`282.8 ms`** | `~245 ms` | **`650 ms`** | **`350–450 ms`** |
+| **`4.8 kbps`** | **`442.8 ms`** | `~404 ms` | **`1,200 ms`** *(exceeds 1s epoch!)* | **`450–500 ms`** |
 
 ---
 
@@ -282,7 +276,7 @@ Raw bytes lie in `0x80 .. 0xF5` (`>= 128`, representing `-128 dBm .. -11 dBm`).
 Never issue `C0 C1 C2 C3 00 02` blindly during active reception, during single-subpacket RF TX (`< s_tx_air_busy_until_ms`), or when a Mode 3 rate-switch / rollback is due:
 1. **Second 0 Post-Uplink Gap (`sf_sec == 0`):** Poll strictly *after* the Rover's uplink TX finishes RF airing (`now >= s_tx_air_busy_until_ms` and `sf_ms` in `810..895 ms`), accommodating `48 B` uplink air time at all rates (`~60 ms` @ `19.2k`, `~105 ms` @ `9.6k`, `~168 ms` @ `4.8k`) and leaving a full `95 ms` reply margin before `.000 s`.
 2. **Seconds 1..4 End-of-Second Micro-Slot (`sf_sec != 0`):** The Base (`e220_pacer.py v3.6.5`) enforces an `850.0 ms` downlink ceiling at `>= 9.6 kbps` (and `1` MSM up to `1,750 ms` in Sec 1..3 / `1,680 ms` in Sec 4 at `4.8 kbps`, with `850.0 ms` caps on follow-on/non-MSM frames). The Rover polls inside **`sf_ms = 855..895 ms`** (`E220_RSSI_POLL_INTERVAL_MS = 750 ms`, `last_rx_ms` idle `>= 25 ms`), requiring either `s_last_valid_msm_utc_sec == sf_utc_sec` (essential at `<= 5.0 kbps` where a single lead `1094` may span past `855 ms`) or `last_rx_ms` idle `>= 200 ms` at `> 5.0 kbps`. Also caps `idle_link_probe` at `sf_ms <= 880 ms`.
-3. **Bounded Intercept, `95 ms` / `.990 s` Hard Expiry & Carrier-Contamination Filter:** Set `E220_RSSI_REPLY_TIMEOUT_MS = 95 ms` (accommodating the E220-900T30S's measured `70-85 ms` response latency observed in `test/_042`) and expire any active query at `sf_ms >= 990 ms` so queries never spill past `.000 s`. Gate Stage `0b` `0xC1 0x00` interception within `250 ms` of `last_rssi_poll_ms`, reject both `0x80` (`-128 dBm`) sentinel glitches and carrier-contaminated noise samples (`cand_noise_dbm > -65` within `8 dB` of `cand_pkt_dbm`), and bound `noise_raw` (`0x81..0xE4`) and `pkt_raw` (`0x80..0xF6`). Clear `isr_aux_fall_us = 0` when unmasking `e220_suppress_aux_isr`. Never mark `radio_online = false` or `rssi_valid = false` on poll timeout streak if RTCM bytes arrived within `10 s`.
+3. **Bounded Intercept, Hardware Idle Latency (`4.7–6.0 ms` vs. `70–85 ms` Queued), & `.990 s` Hard Expiry:** Stage 1 (`Test 4`) proved the E220-900T30S answers `C0 C1 C2 C3 00 02` in **`4.7–6.0 ms`** when queried cleanly after **`>= 20 ms`** half-duplex turnaround (`0` `5 B` spills across `4.8k/9.6k/19.2k`), confirming `test/_042`'s `70–85 ms` latency resulted from lingering post-RX/TX FreeRTOS queuing rather than slow silicon. On Rover `v0.8.11`, keep `E220_RSSI_REPLY_TIMEOUT_MS = 95 ms` and expire any active query at `sf_ms >= 990 ms` so queries never spill past `.000 s`. Gate Stage `0b` `0xC1 0x00` interception within `250 ms` of `last_rssi_poll_ms`, reject both `0x80` (`-128 dBm`) sentinel glitches and carrier-contaminated noise samples (`cand_noise_dbm > -65` within `8 dB` of `cand_pkt_dbm`), and bound `noise_raw` (`0x81..0xE4`) and `pkt_raw` (`0x80..0xF6`). Clear `isr_aux_fall_us = 0` when unmasking `e220_suppress_aux_isr`. Never mark `radio_online = false` or `rssi_valid = false` on poll timeout streak if RTCM bytes arrived within `10 s`.
 
 ---
 

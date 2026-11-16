@@ -1,24 +1,24 @@
 # Asynchronous Latest-Value Mailbox & Content-Independent LoRa Transport Architecture (Trade Study)
 
 > [!NOTE]
-> **Status: STANDALONE ARCHITECTURE TRADE STUDY & BENCH VERIFICATION PLAN (NO CODE CHANGES APPLIED)**  
-> **Document Version:** `1.1.0`  
+> **Status: STAGE 1 HARDWARE-VALIDATED DESIGN SPEC (READY FOR IMPLEMENTATION)**  
+> **Document Version:** `1.2.0`  
 > **Date:** November 16, 2026  
 > **Baseline System:** Rover Firmware `v0.8.11` (`src/e220_driver/e220_driver.cpp`) + Base Station `e220_pacer.py v3.6.5`  
-> **Scope:** Independent architectural evaluation and E220 hardware-in-the-loop verification strategy to confirm safe `4.8k / 9.6k / 19.2k` timing, buffering, and max-satellite performance *before* implementing firmware or pacer changes.  
-> **Empirical Baseline Reference:** [`test/_043`](../../test/_043/) (`77 min` Base TX / `66 min` Rover RX, `7/7` air-rate switches, `740/740` uplinks) and [`docs/e220-reference.md`](../e220-reference.md) (`v2.9`).
+> **Scope:** Independent architectural evaluation and E220 hardware-in-the-loop verification strategy confirming safe `4.8k / 9.6k / 19.2k` timing, buffering, and max-satellite performance prior to implementation.  
+> **Empirical Baselines:** [`test/_043`](../../test/_043/) (`7/7` air-rate switches, `740/740` uplinks), [`docs/benchmarks/e220_stage1_20261116/`](../benchmarks/e220_stage1_20261116/README.md) (**Stage 1 `21 dBm` + `30 dBm` full characterization**, `bench_e220_multirate.py v1.0.2/v1.0.3`), and [`docs/e220-reference.md`](../e220-reference.md) (`v3.0`).
 
 ---
 
 ## 1. Executive Summary & Design Envelope
 
-Field test `test/_043` validated deterministic 3-rate switching (`7 / 7 = 100%` first-attempt switches across `4.8k`, `9.6k`, and `19.2k`) and lossless uplink telemetry (`740 / 740 = 100%`), while proving zero steady-state TCP queue shedding. However, `test/_043` and worst-case satellite scaling math simultaneously exposed fundamental **structural limitations of locking LoRa transmissions onto 1.0-second slots (`utc_sec % 5`)**:
+Field test `test/_043` validated deterministic 3-rate switching (`7 / 7 = 100%` first-attempt switches across `4.8k`, `9.6k`, and `19.2k`) and lossless uplink telemetry (`740 / 740 = 100%`), while exposing structural limits of `1.0 s` TDMA sub-slots (`utc_sec % 5`). Subsequent **Stage 1 full bench characterization (`21 dBm` and `30 dBm`)** quantified true `E220-900T30S` silicon performance and proved:
 
-1. **Max-Satellite MSM4 Exceeds 1-Second Slots at `4.8 kbps`:** At `14` GPS satellites (`3` signals = `316 B`), a single `Type 1074` message takes **`1,096.1 ms`** at `4.8 kbps` (and up to **`1,336.7 ms`** at the `400 B` E220 limit). Any protocol confined to `850 ms` or `1,000 ms` sub-slots physically breaks as satellite count grows.
-2. **Severe Dead-Air Fragmentation:** Fixed 1-second framing wastes **`469-804 ms`** of idle airtime whenever short messages (`1006 = 27 B`, `1084 = 144 B`) finish early in a second, plus **`600 ms / 5 s` (`12%` of total capacity)** reserved for per-second `850..1000 ms` Mode 0 RSSI micro-gaps.
-3. **E220 Mode 0 RSSI & Truncation Collisions at `4.8 kbps`:** In `test/_043` Phase 5 (`4.8k`), E220's `140-205 ms` Mode 0 RSSI reply collided across the `.000 s` boundary (`111` `5 B` burst events), while Rover's `1,200 ms` truncation timeout (`> 1,000 ms` epoch spacing) concatenated consecutive seconds into `120` `[RTCM DROP CRC]` failures.
+1. **`4.8 kbps` Silicon Speedup (`-36%` `ToA`):** Empirical `4.8k` end-to-end airtime is **`442.8 ms @ 200 B`**, **`695.4 ms @ 316 B`**, and **`847.0 ms @ 400 B`** (`<= 1.9 ms` fit error) — `35–37%` faster than the prior `0.60`-efficiency formula (`1,096–1,337 ms`). Even a max-open-sky `316 B` `1074` finishes under `730 ms` (with `30 ms` guard), enabling **`2.00 s`** (`10 s` cycle) or **`1.67–2.50 s`** (`5 s` cycle) 3-constellation refreshes under Max-Sat load.
+2. **Dead-Air Fragmentation & Early `AUX` Release:** Fixed `1.0 s` fences still strand **`300–800 ms`** whenever short frames (`1006`, `1084`) finish early, while `201..400 B` frames still release `AUX HIGH` early (`385.7–400.1 ms` @ `4.8k`, `226.9–242.6 ms` @ `9.6k`, `129.1–145.5 ms` @ `19.2k`).
+3. **`100.0%` Multi-Rate Streaming & `30 dBm` Thermal Proof:** Across Stage 1 `30 dBm` testing, `sliced_200B_stream` (`1,620/1,620`), guard sweep down to `10 ms` (`648/648`), bidirectional turnaround down to `20 ms` with **`4.7–6.0 ms` idle Mode 0 RSSI (`0` spills)**, **`120/120` switches**, and **`1,303/1,303` `30 dBm` (`1 W`) `5 min/rate` high-duty thermal soak packets** all passed at **`100.0%`** (`0` CRC errors).
 
-This document defines the exact RTCM3 worst-case byte budgets and Ebyte `E220-900T30S` silicon boundaries, audits what must be preserved vs. replaced, and evaluates **five candidate architectures** — including asynchronous **Latest-Value Ping-Pong Mailboxes**, **content-independent macro-cycles**, **paced byte-stream tunneling**, **GPS-free poll/token TDD**, and **adaptive `4.8k` signal thinning**.
+This document defines exact silicon-calibrated RTCM3 byte budgets, evaluates **five candidate architectures**, and locks in **Architecture 2B + Stage 2 Split Verification**.
 
 ---
 
@@ -32,33 +32,33 @@ $$\text{Bytes}_{\text{MSM4}} = 6 + \left\lceil \frac{169 + N_{\text{sat}} N_{\te
 
 *(Specifically: `6 B` transport + CRC24Q overhead, `169 bits` fixed MSM header, `N_sat * N_sig` cell mask bits, `18 * N_sat` satellite rough-range bits, and `48 * N_cell` signal pseudorange/phase/lock/CNR bits.)*
 
-Using the empirically calibrated E220 Time-on-Air (`ToA`) model from [`e220_pacer.py`](../../scripts/e220_pacer.py#L326-L338) and [`_estimate_frame_toa_ms()`](../../scripts/e220_pacer.py#L948-L968) (including UART transfer @ `115200` baud and hardware RX-drain guards):
+Using the **Stage 1 (`test/_045.._047`, `1 ms` FTDI)** silicon-calibrated E220 airtime equations (`max |err| <= 1.9 ms`) plus a **`30 ms` post-TX turnaround guard** (`10 ms` verified lossless floor + `20 ms` margin):
 
-| Frame / Scenario | Size (Bytes) | Subpkts (`200 B`) | Total Airtime + Guard `@ 4.8k` | Total Airtime + Guard `@ 9.6k` | Total Airtime + Guard `@ 19.2k` |
+| Frame / Scenario | Size (Bytes) | Subpkts (`200 B`) | Silicon `ToA` + `30 ms` Guard `@ 4.8k` | Silicon `ToA` + `30 ms` Guard `@ 9.6k` | Silicon `ToA` + `30 ms` Guard `@ 19.2k` |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **`1230` GLONASS Biases** | `18 B` | `1` | `170.0 ms` | `111.2 ms` | `78.4 ms` |
-| **`1006` Base ARP** | `27 B` | `1` | `195.8 ms` | `123.0 ms` | `84.7 ms` |
-| **Coalesced `1006 + 1230`** | `45 B` | `1` | **`247.4 ms`** *(saves `118 ms`)* | **`146.7 ms`** *(saves `88 ms`)* | **`97.3 ms`** *(saves `66 ms`)* |
-| **`1084` Avg `test/_043` (`8 SVs x 2 sig`)** | `144 B` | `1` | `530.9 ms` | `276.6 ms` | `166.5 ms` |
-| **Coalesced `1006 + 1230 + 1084`** | `189 B` | `1` | **`659.9 ms`** *(saves `237 ms`)* | **`335.6 ms`** *(saves `175 ms`)* | **`198.0 ms`** *(saves `132 ms`)* |
-| **`1084` Max Expected (`10 SVs x 2 sig`)** | `173 B` | `1` | `614.0 ms` | `314.6 ms` | `186.8 ms` |
-| **`1084` Extreme (`12 SVs x 2 sig`)** | `202 B` | `2` | `769.5 ms` | `392.3 ms` | `248.9 ms` |
-| **`1074`/`1094` Max Observed `test/_043`** | `253 B` | `2` | `915.6 ms` | `459.2 ms` | `284.6 ms` |
-| **`1074`/`1094` Max (`12 SVs x 3 sig`)** | `275 B` | `2` | `978.6 ms` | `488.1 ms` | `300.0 ms` |
-| **`1074` Max Open-Sky (`14 SVs x 3 sig`)** | **`316 B`** | `2` | **`1,096.1 ms` (`> 1.0 s!`)** | `541.9 ms` | `328.7 ms` |
-| **`1074`/`1094` Extreme (`16 SVs x 3 sig`)** | `358 B` | `2` | **`1,216.4 ms` (`> 1.2 s!`)** | `597.0 ms` | `358.0 ms` |
-| **E220 FIFO Cap (`400 B`)** | `400 B` | `2` | **`1,336.7 ms` (`> 1.3 s!`)** | `652.1 ms` | `387.4 ms` |
-| **RTCM `64`-Cell Cap (`16 SVs x 4 sig`)** | `456 B` | `3` | **`1,571.6 ms` (3 pkts)** | `769.2 ms` | `460.4 ms` |
-| **Rover Uplink Telemetry (`0x01`)** | `48 B` | `1` | `255.9 ms` | `150.6 ms` | `99.4 ms` |
-| **Switch Req / Ack (`0x02` / `0x82`)** | `10-11 B` | `1` | `150.0 ms` | `102.0 ms` | `73.5 ms` |
+| **`1230` GLONASS Biases** | `18 B` | `1` | `133.7 ms` *(air `103.7`)* | `96.4 ms` *(air `66.4`)* | `73.4 ms` *(air `43.4`)* |
+| **`1006` Base ARP** | `27 B` | `1` | `150.5 ms` *(air `120.5`)* | `107.1 ms` *(air `77.1`)* | `80.6 ms` *(air `50.6`)* |
+| **Coalesced `1006 + 1230`** | `45 B` | `1` | **`184.2 ms`** *(saves `100 ms`)* | **`128.6 ms`** *(saves `75 ms`)* | **`95.0 ms`** *(saves `59 ms`)* |
+| **`1084` Avg `test/_043` (`8 SVs x 2 sig`)** | `144 B` | `1` | `369.3 ms` *(air `339.3`)* | `246.4 ms` *(air `216.4`)* | `174.2 ms` *(air `144.2`)* |
+| **Coalesced `1006 + 1230 + 1084`** | `189 B` | `1` | **`453.4 ms`** *(saves `200 ms`)* | **`299.9 ms`** *(saves `150 ms`)* | **`210.2 ms`** *(saves `118 ms`)* |
+| **`1084` Max Expected (`10 SVs x 2 sig`)** | `173 B` | `1` | `423.5 ms` *(air `393.5`)* | `280.9 ms` *(air `250.9`)* | `197.4 ms` *(air `167.4`)* |
+| **`1084` Extreme (`12 SVs x 2 sig`)** | `202 B` | `2` | `521.6 ms` *(air `491.6`)* | `336.2 ms` *(air `306.2`)* | `226.4 ms` *(air `196.4`)* |
+| **`1074`/`1094` Avg/Obs `test/_043`** | `235–253 B` | `2` | `581.0–613.4 ms` | `373.2–393.4 ms` | `249.5–262.1 ms` |
+| **`1074`/`1094` Max (`12 SVs x 3 sig`)** | `275 B` | `2` | `653.0 ms` *(air `623.0`)* | `418.0 ms` *(air `388.0`)* | `277.5 ms` *(air `247.5`)* |
+| **`1074` Max Open-Sky (`14 SVs x 3 sig`)** | **`316 B`** | `2` | **`726.8 ms`** *(air `696.8`)* | `463.9 ms` *(air `433.9`)* | `306.2 ms` *(air `276.2`)* |
+| **`1074`/`1094` Extreme (`16 SVs x 3 sig`)** | `358 B` | `2` | **`802.4 ms`** *(air `772.4`)* | `511.0 ms` *(air `481.0`)* | `335.6 ms` *(air `305.6`)* |
+| **E220 FIFO Cap (`400 B`)** | `400 B` | `2` | **`878.0 ms`** *(air `848.0`)* | `558.0 ms` *(air `528.0`)* | `365.0 ms` *(air `335.0`)* |
+| **RTCM `64`-Cell Cap (`16 SVs x 4 sig`)** | `456 B` | `3` | **`1,152.7 ms` (3 pkts)** | `767.6 ms` | `541.8 ms` |
+| **Rover Uplink Telemetry (`0x01`)** | `48 B` | `1` | `189.8 ms` *(air `159.8`)* | `132.1 ms` *(air `102.1`)* | `97.4 ms` *(air `67.4`)* |
+| **Switch Req / Ack (`0x02` / `0x82`)** | `11 B` | `1` | `120.6 ms` *(air `90.6`)* | `88.1 ms` *(air `58.1`)* | `67.8 ms` *(air `37.8`)* |
 
 #### Key Capacity Reality Check
 * At **Max Expected Open-Sky Load (`1074 = 316 B`, `1084 = 173 B`, `1094 = 275 B`, `1006 = 27 B`, `1230 = 18 B`)**:
   * **Incoming RTCM Rate:** `764 B/s` continuous (`~771 B/s` including `1006` + `1230`), rising to `~960+ B/s` at extreme `400/202/358 B` caps (or `~1,000 B/s` if BeiDou `1124` is added).
-  * **Link Bandwidth vs. Demand:**
-    * **`19.2 kbps` (`~850-900 B/s` net):** Carries all 3 constellations at **`1.0 Hz`** (`815.5 ms/s` total MSM ToA at Max-Sat), touching saturation only at Extreme `400 B` caps (`994.4 ms`).
-    * **`9.6 kbps` (`~440-480 B/s` net):** `1.0 Hz` full stream takes `1,344.6 ms/s` (`~1.5x` oversubscribed). Cannot carry 3 constellations every `1.0 s`; needs asynchronous interleaving without `850 ms` fences.
-    * **`4.8 kbps` (`~220-265 B/s` net):** `1.0 Hz` full stream takes `2,688.8 ms/s` (**`~3.0x` oversubscribed**). Temporal decimation + intelligent newest-epoch shedding is **physically mandatory** regardless of framing or buffering method.
+  * **Link Bandwidth vs. Demand (Empirical `test/_047`):**
+    * **`19.2 kbps` (`~920–990 B/s` net):** Carries all 3 constellations at **`1.0 Hz`** (`781.1 ms/s` total MSM ToA at Max-Sat), touching saturation only at Extreme `400 B` caps (`927.0 ms/s` + pauses).
+    * **`9.6 kbps` (`~610–640 B/s` net):** `1.0 Hz` full Max-Sat stream takes `1,162.8 ms/s` (`~1.25x` oversubscribed vs continuous link); asynchronous interleaving delivers **`1.24–1.35 s`** updates (`~75%` of `1 Hz`).
+    * **`4.8 kbps` (`~390–420 B/s` net):** `1.0 Hz` full Max-Sat stream takes `1,803.3 ms/s` (**`~2.0x` oversubscribed** — much healthier than earlier `3.0x` estimates!). Temporal decimation + newest-epoch mailbox shedding yields **`1.67–2.50 s` (`5 s` cycle)** to **`2.00 s` uniform (`10 s` cycle)** refreshes at Max-Sat.
 
 ### 2.2 Ebyte `E220-900T30S` Silicon Realities (Verified in `test/_022.._043`)
 
@@ -182,28 +182,27 @@ Eliminate all per-second `850..1000 ms` micro-gaps and relocate uplink/RSSI into
   * Base receives it by `4,560 ms`, holds RTCM Downlink cleanly at the start of **`Sec 0` (`0 .. 700 ms`)**, sends the **4-ACK train (`80/260/440/620 ms`)**, and both nodes synchronously reconfigure E220 Mode 3 registers at **`Sec 1.000`** (`~1 s` faster than current!).
   * **Base->Rover Initiated Commands / Base Telemetry:** Base simply inserts a `24-32 B` `0xAA 0x55` frame into a `BaseCmd` mailbox transmitted during normal Downlink — Rover's `rx_stage` already extracts `0xAA 0x55` frames cleanly from between `0xD3` RTCM messages.
 
-#### 4.2.4 Simulated Max-Sat Performance (Discrete-Time Simulation, `120 s`)
-Using exact E220 calibrated ToA equations under **Max Expected Open-Sky Load (`1074 = 316 B`, `1084 = 173 B`, `1094 = 275 B`, `1006 = 27 B`, `1230 = 18 B`)** and **Extreme `400 B` Load (`400 / 202 / 358 B`)**:
+#### 4.2.4 Simulated Max-Sat Performance (Stage 1 Calibrated `ToA` + `30 ms` Guard, `120 s`)
+Using empirical **Stage 1 (`test/_045.._047`) E220 ToA equations** under **Max Expected Open-Sky Load (`1074 = 316 B`, `1084 = 173 B`, `1094 = 275 B`, `1006 = 27 B`, `1230 = 18 B`)** and **Extreme `400 B` Load (`400 / 202 / 358 B`)**:
 
 | Air Rate & Variant | Cycle (`T_down / T_ul`) | Unutilized Downlink Slack | `1074` Refresh Period | `1084` Refresh Period | `1094` Refresh Period | `1006 / 1230` Delivery | Max Queue Age at TX |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`4.8k` Variant 2A** (`Max-Sat`) | `5 s` (`4.35 s / 0.65 s`) | `9.8%` | `3.75 s` (`27%`) | `3.33 s` (`30%`) | `3.75 s` (`27%`) | **`100% / 100%`** | **`< 0.96 s`** |
-| **`4.8k` Variant 2B** (`Max-Sat`) | `5 s` (`4.40 s / 0.60 s`) | **`4.6%`** | **`3.33 s` (`30%`)** | **`3.33 s` (`30%`)** | **`3.33 s` (`30%`)** | **`100% / 100%`** | **`< 0.96 s`** |
-| **`4.8k` Variant 2B** (`Max-Sat, 10s`) | `10 s` (`9.40 s / 0.60 s`) | **`2.3%`** | `3.33 s` (`30%`) | `2.86 s` (`35%`) | `2.86 s` (`35%`) | **`100% / 100%`** | **`< 0.96 s`** |
-| **`4.8k` Variant 2B** (`Extreme 400B, 5s`) | `5 s` (`4.35 s / 0.65 s`) | **`0.8%`** | `5.00 s` (`20%`) | `2.50 s` (`40%`) | `5.00 s` (`20%`) | **`100% / 100%`** | **`< 0.80 s`** |
-| **`9.6k` Variant 2B** (`Max-Sat, 5s`) | `5 s` (`4.60 s / 0.40 s`) | **`3.5%`** | **`1.67 s` (`60%`)** | **`1.25 s` (`80%`)** | **`1.67 s` (`60%`)** | **`100% / 100%`** | **`< 0.87 s`** |
-| **`19.2k` Variant 2B** (`Max-Sat, 5s`) | `5 s` (`4.70 s / 0.30 s`) | `18.7%` (surplus) | **`1.11 s` (`90%`)** | **`1.00 s` (`100%`)** | **`1.11 s` (`90%`)** | **`100% / 100%`** | **`< 0.73 s`** |
+| **`4.8k` Variant 2B** (`Max-Sat, 5s`) | `5 s` (`4.45 s / 0.55 s`) | `6.8%` | **`2.50 s` (`40%`)** | **`1.67 s` (`60%`)** | **`2.50 s` (`40%`)** | **`100% / 100%`** | **`< 1.00 s`** |
+| **`4.8k` Variant 2B** (`Max-Sat, 10s`) | `10 s` (`9.45 s / 0.55 s`) | **`2.1%`** | **`2.00 s` (`50%`)** | **`2.00 s` (`50%`)** | **`2.00 s` (`50%`)** | **`100% / 100%`** | **`< 1.00 s`** |
+| **`4.8k` Variant 2B** (`Extreme 400B, 5s`) | `5 s` (`4.45 s / 0.55 s`) | `7.2%` | `2.86 s` (`35%`) | `2.55 s` (`39%`) | `2.86 s` (`35%`) | **`100% / 100%`** | **`< 0.96 s`** |
+| **`9.6k` Variant 2B** (`Max-Sat, 5s`) | `5 s` (`4.65 s / 0.35 s`) | **`3.1%`** | **`1.33 s` (`75%`)** | **`1.24 s` (`81%`)** | **`1.35 s` (`74%`)** | **`100% / 100%`** | **`< 0.95 s`** |
+| **`19.2k` Variant 2B** (`Max-Sat, 5s`) | `5 s` (`4.72 s / 0.28 s`) | `22.2%` (surplus) | **`1.11 s` (`90%`)** | **`1.00 s` (`100%`)** | **`1.11 s` (`90%`)** | **`100% / 100%`** | **`< 0.61 s`** |
 
-*Note on `19.2k` `90%` -> `100%` note:* In the simulation, 1 epoch every `5 s` arrived right before the `300 ms` uplink pause; with `220 ms` uplink pause at `19.2k` or polling `1x / 10 s`, **`19.2k` reaches `100%` across all 3 constellations at `Max-Sat`**.
+*Note on `19.2k` `90%` -> `100%`:* In the `5 s` simulation, 1 epoch every `5 s` arrived right before the `280 ms` uplink pause; polling RSSI/uplink once every `10 s` or shortening the pause raises `19.2k` toward **`100%`** across all 3 constellations at Max-Sat.
 
-#### 4.2.5 Simulated Average-SV Performance (`4.8k`, `10 s` Macro-Cycle + Optional `2-Signal` Booster)
-In `test/_043` (`pacer_test.log`), average sky conditions yielded median sizes of **`1074 = 235 B`** (`mean 234.6 B`, `~10 SVs x 3 sig`), **`1084 = 144 B`** (`mean 140.7 B`, `~8 SVs x 2 sig`), and **`1094 = 209–224 B`** (`mean 216.1 B`, `~9 SVs x 3 sig`). Under a **`10 s` macro-cycle (`9.35 s` Downlink / `0.65 s` Consolidated Uplink + RSSI)** at `4.8 kbps`:
+#### 4.2.5 Simulated Average-SV Performance (`4.8k`, `5 s` & `10 s` Macro-Cycles + Optional `2-Signal` Booster)
+In `test/_043` (`pacer_test.log`), average sky conditions yielded median sizes of **`1074 = 235 B`** (`mean 234.6 B`, `~10 SVs x 3 sig`), **`1084 = 144 B`** (`mean 140.7 B`, `~8 SVs x 2 sig`), and **`1094 = 209–224 B`** (`mean 216.1 B`, `~9 SVs x 3 sig`). Under calibrated `4.8 kbps` silicon `ToA`:
 
-| Configuration (`@ 4.8k`, `10 s` Macro-Cycle) | Payload Sizes (`1074 / 1084 / 1094`) | Subpackets per Frame | Unutilized Downlink Slack | `1074` Refresh Period | `1084` Refresh Period | `1094` Refresh Period | Total MSM/s | Max TX Queue Age |
+| Configuration (`@ 4.8k`) | Payload Sizes (`1074 / 1084 / 1094`) | Subpackets per Frame | Unutilized Downlink Slack | `1074` Refresh Period | `1084` Refresh Period | `1094` Refresh Period | Total MSM/s | Max TX Queue Age |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Arch 2B** (`No 2-Sig Booster`) | `235 / 144 / 224 B` | `2 / 1 / 2` | **`0.2%`** | `2.86 s` (`35%`) | `1.67 s` (`60%`) | `2.86 s` (`35%`) | `1.30 / s` | **`< 0.95 s`** |
-| **Arch 2B + Arch 5 (`4.8k` 2-Sig Booster)** | **`173 / 144 / 158 B`** | **`1 / 1 / 1` (ALL <= 200B!)** | **`0.4%`** | **`2.00 s` (`50%`)** | **`1.67 s` (`60%`)** | **`2.00 s` (`50%`)** | **`1.60 / s`** | **`< 0.99 s`** |
-| *Ref: Arch 2B + Arch 5 (`5 s` cycle)* | `173 / 144 / 158 B` | `1 / 1 / 1` | `5.8%` | `2.22 s` (`45%`) | `2.00 s` (`50%`) | `2.22 s` (`45%`) | `1.40 / s` | `< 0.99 s` |
+| **Arch 2B (`5 s` cycle, No Booster)** | `235 / 144 / 224 B` | `2 / 1 / 2` | `1.1%` | `2.00 s` (`50%`) | `1.25 s` (`80%`) | `2.00 s` (`50%`) | `1.80 / s` | `< 0.99 s` |
+| **Arch 2B (`10 s` cycle, No Booster)** | `235 / 144 / 224 B` | `2 / 1 / 2` | **`0.8%`** | **`1.82 s` (`55%`)** | **`1.25 s` (`80%`)** | **`1.82 s` (`55%`)** | `1.90 / s` | `< 0.98 s` |
+| **Arch 2B + Arch 5 (`10 s`, 2-Sig Booster)** | **`173 / 144 / 158 B`** | **`1 / 1 / 1` (ALL <= 200B!)** | `2.3%` | **`1.33 s` (`75%`)** | **`1.25 s` (`80%`)** | **`1.33 s` (`75%`)** | **`2.30 / s`** | **`< 0.91 s`** |
 
 **Crucial Finding at Average Sky Geometry:** Enabling live `3-sig -> 2-sig` pruning strictly when downshifted to **`4.8 kbps`** shrinks **100% of all constellations (`8–11 SVs`) below `200 B`**. Every transmitted RTCM frame fits inside **a single `Regime A` LoRa packet** (`0` multi-subpacket `AUX` RAM chaining, `0` partial-frame concatenation), combining **`99.6%` downlink utilization (`0.4%` slack)**, **`1.67–2.00 s` multi-constellation updates**, and the **`~2x` higher single-packet delivery reliability (`66.5%` vs `36.6%`)** empirically measured in `test/_043`!
 
@@ -305,12 +304,13 @@ We recommend adopting **Architecture 2B (Latest-Value Ping-Pong Mailboxes + Cont
 
 ### 6.2 Rover Firmware Adjustments (`src/e220_driver/e220_driver.cpp`)
 
-1. **Rate-Matched Truncation Timeout at `4.8 kbps` (`1,200 ms -> 350 ms`):**
-   * Because Subpacket 2 at `4.8 kbps` arrives **`~70-130 ms`** after Subpacket 1, lowering `e220_get_trunc_timeout_ms()` from `1,200 ms` to **`350 ms`** quarantines orphaned `200 B` Subpacket 1 heads within the *same* transmission interval — completely preventing cross-frame `[RTCM DROP CRC]` concatenation and never delaying a following `1006` / `1084` frame.
-2. **Consolidated Uplink + RSSI Schedule (`sf_sec == 4` / End of Macro-Cycle):**
-   * **Stop polling Mode 0 `C0 C1 C2 C3 00 02` inside Seconds `1..4` downlink (`855..895 ms`)** — eliminating `100%` of `5 B` RSSI spillover bursts (`111` in `test/_043` Phase 5) and unlocking the full continuous `4.35-4.65 s` downlink window.
-   * Schedule Rover **Uplink (`48 B` Telemetry or `10 B` Switch Req)** after `T_dl_end + 50 ms` guard (`4,400 ms` @ `4.8k`, `4,600 ms` @ `9.6k`, `4,700 ms` @ `19.2k` — well past the `.175 s` NMEA arrival), wait `s_tx_air_busy_until_ms` (`~166 ms` @ `4.8k`, `~105 ms` @ `9.6k`, `~60 ms` @ `19.2k`), then execute **1x Mode 0 RSSI query** immediately afterward inside the tail of `Second 4`, finishing before `5,000 ms` (`Second 0.000`) resumes Downlink.
-   * **Synchronous Switch Execution:** `Switch Req` in `Second 4` (`4,400/4,600/4,700 ms`) -> `4-ACK Train` in `Second 0` (`80/260/440/620 ms`) -> synchronous Mode 3 `C0 00 06` register write at `Second 1.000` (maintaining all existing 60s dynamic fallback watchdog invariants).
+1. **Rate-Matched Truncation Timeout at `4.8 kbps` (`1,200 ms -> 450–500 ms`):**
+   * Because empirical `200 B` Subpacket 1 ToA at `4.8 kbps` is `442.8 ms` (`max AUX_low = 403 ms`), Subpacket 2 completes shortly after `~450–850 ms`; lowering `e220_get_trunc_timeout_ms()` at `4.8 kbps` from `1,200 ms` to **`450–500 ms`** (`350–450 ms` at `9.6 kbps`) quarantines orphaned `200 B` heads cleanly without delaying subsequent frames (`<= 30 ms` inter-frame guard proven `100%` intact in Stage 1).
+2. **Consolidated Uplink + RSSI Schedule (`sf_sec == 4` or `9` / End of Macro-Cycle) + Mode 0 Exit Probe:**
+   * **Stop polling Mode 0 `C0 C1 C2 C3 00 02` inside Seconds `1..4` downlink (`855..895 ms`)** — eliminating `100%` of `5 B` RSSI spillover bursts (`111` in `test/_043` Phase 5) and unlocking the continuous `4.45–4.72 s` (`5 s`) / `9.45 s` (`10 s`) downlink window.
+   * Schedule Rover **Uplink (`48 B` Telemetry `~160 ms` @ `4.8k` or `10 B` Switch Req)** after `T_dl_end + 30–50 ms` guard (well past the `.175 s` NMEA arrival), wait `s_tx_air_busy_until_ms`, then execute **1x Mode 0 RSSI query** (`4.7–6.0 ms` when idle, bounded defensively at `>= 40–95 ms` on ESP32) before `Second 0.000` resumes Downlink.
+   * **Post-Mode-3 Liveness Probe:** After any Mode 3 air-rate switch (`Second 2 -> Mode 0`), run a single fast `C0 C1 C2 C3 00 02` liveness probe and cleanly re-toggle `(1,1)->(0,0)` if silent, preventing the rare Mode-0 exit UART desync caught in `test/_047` `21 dBm`.
+   * **Synchronous Switch Execution:** `Switch Req` in consolidated tail -> `4-ACK Train` in `Second 0` (`80/260/440/620 ms`) -> synchronous Mode 3 `C0 00 06` register write at `Second 1.000` (maintaining all existing 60s dynamic fallback watchdog invariants).
 
 ### 6.3 Why Previous External `200 B / 400 B` Chunking Wedged E220 vs. This Architecture
 
@@ -325,9 +325,9 @@ Earlier buffer/chunking failures ("corrupted buffers and E220 stuck in a funky s
 
 ---
 
-## 7. Independent Multi-Rate E220 Silicon & Driver Bench Verification Suite
+## 7. Independent Multi-Rate E220 Silicon & Driver Bench Verification Suite (**Stage 1 Completed**)
 
-Whereas [`scripts/test_e220_link.py`](../../scripts/test_e220_link.py) (`v1.1.0`) performs only an unpaced `2,100 B` text burst at `19200` baud with no GPIO (`M0`/`M1`/`AUX`/`RST`) control, the standalone **Hardware-in-the-Loop Multi-Rate Bench Suite** is now implemented in [`scripts/bench_e220_multirate.py`](../../scripts/bench_e220_multirate.py) (`v1.0.0`), covering all six experiments at **`4.8k`, `9.6k`, and `19.2k`**.
+Whereas [`scripts/test_e220_link.py`](../../scripts/test_e220_link.py) (`v1.1.0`) performs only an unpaced `2,100 B` text burst at `19200` baud with no GPIO (`M0`/`M1`/`AUX`/`RST`) control, the standalone **Hardware-in-the-Loop Multi-Rate Bench Suite** in [`scripts/bench_e220_multirate.py`](../../scripts/bench_e220_multirate.py) (`v1.0.3`) has now completed full unattended **Stage 1 characterization at both `21 dBm` and `30 dBm`** across **`4.8k`, `9.6k`, and `19.2k`**. Results and raw CSVs are archived in [`docs/benchmarks/e220_stage1_20261116/`](../benchmarks/e220_stage1_20261116/README.md).
 
 ### 7.1 Bench Fixture, Service Management & FTDI Electrical Checklist
 * **Mandatory `e220-pacer.service` Pre-Flight Lockout:** On startup, the bench suite must query `systemctl is-active e220-pacer`. Because `e220_pacer.py` holds `/dev/ttyAMA0` with `TIOCEXCL` and actively drives BCM pins `18/17/27/22`, the runner must either refuse to run while active or (with `--stop-service`) cleanly execute `sudo systemctl stop e220-pacer` before opening `/dev/ttyAMA0` and automatically restart it inside a `finally:` block on exit/Ctrl-C.
@@ -372,7 +372,7 @@ Splitting verification into two stages avoids debugging E220 radio silicon quirk
 | **Hardware Wiring** | Base E220 on Pi GPIO + Rover (or 3rd spare) E220 on Pi USB-FTDI; `e220-pacer.service` stopped; ESP32 & `UM982` out of loop. | Second E220 reconnected to Rover ESP32-S3; `e220-pacer.service` restarted; updated Pi script & Rover firmware active. |
 | **What It Isolates** | Pure `E220-900T30S` silicon behavior & TX pacing under a single zero-skew Pi `time.monotonic()` clock, bypassing ESP32 `rx_stage` filters. | Full 5-layer stack: ESP32 FreeRTOS tasks, `rx_stage` reassembly of coalesced `<= 200 B` bursts, NMEA UTC time sync, and live `UM982` RTK solving. |
 | **Core Questions Answered** | Do `300..400 B` writes chain cleanly at `4.8k`? What exact guard (`10..60 ms`) yields `0` drops? Do `<= 200 B` coalescing, Mode 0 RSSI, and `50x` Mode 3 switches never wedge `AUX`? | Does `Arch 2B` (`10 s @ 4.8k` + optional `2-sig` booster) sustain `Fix:4` (`RTK_FIX`), `Diff age`, `SLV_FIX` heading, `0` `[RTCM DROP CRC]`, and `0` `5 B` spillover in live runs? |
-| **Exit Gate** | All empirical `ToA` curves (`<= 400 B`), safe guard constants, and pacing primitives confirmed *before* rewriting `e220_pacer.py` or `e220_driver.cpp`. | Clean multi-rate soak log matching `test/_043` or better before merging code changes to `master`. |
+| **Exit Gate** | **PASSED (`30 dBm` 6/6 suites `100.0%`, `test/_047`).** Empirical `ToA` equations (`4.8k = 442.8 ms @ 200 B`), `10 ms` guard floor, `20 ms` turnaround, and `30 dBm` thermal soak verified before implementation. | Clean multi-rate split Pi <-> ESP32 soak log (`0` `[RTCM DROP CRC]`, `0` `5 B` spillover, `100%` rate switches, steady `Fix:4`) before merging transport code to `master`. |
 
 *(Operational tip: Keeping a dedicated 3rd spare E220 on the FTDI USB rig avoids unwiring the Rover's E220 between Stage 1 and Stage 2; with a 2-radio setup, simply move the Rover E220 to FTDI for Stage 1 and reconnect it to the ESP32 once Stage 1 passes.)*
 
