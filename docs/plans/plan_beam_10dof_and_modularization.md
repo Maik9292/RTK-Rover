@@ -1,13 +1,13 @@
-# Composite Plan: Token-Efficient Modularization & Beam-Mounted DFRobot Gravity 10DOF (`SEN0696` / `Product 3126`) 9-DOF Heading Fusion
+# Composite Plan: Token-Efficient Modularization, Shared Library Reuse & Beam-Mounted DFRobot Gravity 10DOF (`SEN0696` / `Product 3126`) Heading Fusion
 
-**Document Version:** `1.0.1`  
+**Document Version:** `1.1.0`  
 **Date:** November 16, 2026  
 **Product Reference:** DFRobot Gravity: BMI323 + BMM350 + BMP581 10DOF IMU (`SKU: SEN0696` / [`Product 3126`](https://www.dfrobot.com/product-3126.html))  
 **Firmware Baseline:** `v0.8.14` (`e220_pacer.py v3.7.1`, `stage2_bench_verify.py v1.0.3`)  
-**Target Firmware Milestones:** `v0.8.15` (Hygiene & Modularization) $\rightarrow$ `v0.9.0` (`SEN0696` Beam 10DOF Driver, 3D AHRS & Diagnostics)  
-**Supersedes:** Part 2 (outboard compass/IMU roadmap) of [`plan_phase8_single_uart_um982_and_mmc5983ma_compass.md`](plan_phase8_single_uart_um982_and_mmc5983ma_compass.md) *(Note: Part 1 Single-UART `UM982 COM1` shipped in `v0.8.0` and remains active)*  
-**Consolidates & Updates:** [`plan_project_structure_and_token_optimization.md`](plan_project_structure_and_token_optimization.md) (Phases 1–6 updated to `v0.8.14` line counts)  
-**Forward Compatibility:** [`plan_smart_pole_and_android_app.md`](plan_smart_pole_and_android_app.md) (`ESP32-S3-Touch-LCD-3.49-V2` beam box)
+**Target Firmware Milestones:** `v0.8.15` (Hygiene, Reuse-Safe Modularization & `MFS` Fusion Port) $\rightarrow$ `v0.9.0` (`SEN0696` Beam 10DOF Driver, 3D AHRS & Diagnostics) $\rightarrow$ `Field_Instrument_Core` Extraction  
+**Replaces:** [`plan_phase8_single_uart_um982_and_mmc5983ma_compass.md`](plan_phase8_single_uart_um982_and_mmc5983ma_compass.md) *(now marked `[COMPLETED & DEPRECATED]`: Single-UART `UM982 COM1` already shipped in `v0.8.0`)*  
+**Consolidates & Updates:** [`plan_project_structure_and_token_optimization.md`](plan_project_structure_and_token_optimization.md) (Phases 1–6 updated to `v0.8.14` line counts & shared-library boundaries)  
+**Cross-Project Target:** [`plan_smart_pole_and_android_app.md`](plan_smart_pole_and_android_app.md) (`Field_Instrument_Core` shared across `RTK_Rover`, `Magnetic_Field_Scanner`, `RTK_Smart_Pole`, and future Waveshare ESP32-S3 instruments)
 
 ---
 
@@ -17,9 +17,10 @@ Now that `v0.8.14` has proven clean `4.8 kbps` LoRa downlink and continuous `RTK
 
 Previously, the handheld **Waveshare `QMI8658` (`0x6B`)** measured the orientation of the *display enclosure*, not the dual-antenna beam, forcing a fragile mental/UI decoupling and providing only 6-DOF gyro/hold fallback unless a standalone `MMC5983MA` was mounted on the crossbar.
 
-Mounting the newly arrived **DFRobot Gravity: 10DOF IMU Sensor (`SKU: SEN0696`)** **directly onto the rigid antenna beam** (between the center pole and Slave antenna) transforms the sensor architecture:
+Mounting the newly arrived **DFRobot Gravity: 10DOF IMU Sensor (`SKU: SEN0696` / `Product 3126`)** **directly onto the rigid antenna beam** (between the center pole and Slave antenna) transforms the sensor architecture:
 1. **Single Rigid Body Frame Shared by Accel + Gyro + Mag + Baro:** Because the `BMI323` (6-axis accel/gyro), `BMM350` (3-axis TMR magnetometer), and `BMP581` (barometric pressure & temperature) live together on one PCB bolted directly to the beam, **beam tilt compensation, 3D gravity-projected yaw rate, Dual-GNSS True-North tare learning, and pole bubble level all operate natively in the beam frame** — no screen-to-pole coordinate translation is ever needed.
-2. **Modular Codebase First (`A4` Decision):** Before adding a new multi-sensor driver, 3D AHRS calibration, and UI diagnostic cards, **Phase 1** executes the deferred hygiene and source-file modularization work from [`plan_project_structure_and_token_optimization.md`](plan_project_structure_and_token_optimization.md) so every `.c`/`.cpp`/`.py` module stays under Antigravity's single-call `read_file` window (`< 800 lines` / `< 46 KB`) and eliminates duplicate search noise.
+2. **Modular, Library-Ready Codebase First (`A4` + `Field_Instrument_Core` Convergence):** Before adding new drivers and UI cards, **Phase 1** executes [`plan_project_structure_and_token_optimization.md`](plan_project_structure_and_token_optimization.md) **with strict layer separation** so low-level drivers (`i2c_bsp`, `sen0696_driver`, `mmc5983ma_driver`, `imu_bsp`, `um982_driver`, `e220_driver`, `lvgl_port_core`, `storage`), math (`matrix_math` ported from `Magnetic_Field_Scanner`), and `ahrs_9dof` fusion carry **zero sketch-specific globals** — enabling trivial extraction into `Documents/Arduino/libraries/Field_Instrument_Core` (`github.com/rguilmet/Field-Instrument-Core`) alongside **`Magnetic_Field_Scanner`** and future Waveshare ESP32-S3 instruments.
+3. **Cross-Project Sensor Fusion Reuse (`Magnetic_Field_Scanner` $\rightarrow$ Shared Core):** Directly adapts battle-tested algorithms already written in `Arduino/Magnetic_Field_Scanner` — specifically its **`matrix_math.h` 3D ellipsoid hard/soft-iron solver & Kabsch alignment**, its **50-sample stationary accel-variance gyro FOC bias tracker** (`SensorFusion.cpp`), and an **instance-safe refactor of `MadgwickAHRS.c`** — instead of reinventing fusion primitives inside `RTK_Rover` alone.
 
 > **Important Sensor Capability Note (Temperature + Pressure vs. Humidity):**  
 > The Bosch **`BMI323`**, **`BMM350`**, and **`BMP581`/`BMP580`** datasheets in [`docs/datasheets/`](../datasheets/) provide **3-axis acceleration, 3-axis angular rate, 3-axis magnetic flux, 24-bit barometric pressure (`300–1250 hPa`, `±6 Pa` / `±50 cm` relative altitude), and ambient/die temperature** (**10 DOF + Temperature**). **None of these three Bosch chips includes a relative humidity (`%RH`) transducer.** If relative humidity logging is wanted later in the field, an optional I2C humidity sensor (e.g., `SHT40` at `0x44`) can share the same `I2C0` bus with zero conflict.
@@ -78,26 +79,41 @@ Create `.gitignore`'d workspace runbooks matching `.agents/` boundaries:
 1. **`.agents/skills/firmware-build-and-release/SKILL.md`:** Windows `arduino-cli` exact FQBN command, `--warnings default` zero-warning rule, `DRAM0 <= 25%` (`< 80 KB`) + `xtensa-esp32s3-elf-size -A` trigger (`>= 23%`), `stage2_bench_verify.py --self-test`, `test_rover_telemetry.py`, `check_secrets.py`, tiered doc sync, and atomic commit/push workflow.
 2. **`.agents/skills/field-test-log-analysis/SKILL.md`:** Standard metrics extraction for `test/_0XX/pacer_test.log` + `serial-log_*.txt` (`stage2_bench_verify.py --from-log`, subpacket delivery by size/rate, `AUX_low` anomaly correlation, `Fix`/`HDG` transitions, `I2C WARN` counts).
 
-### Step 1.3 — Surgical C/C++ Module Splits (One PR/Build Gate Per Subsystem)
-1. **Split `src/e220_driver/e220_driver.cpp` (`1,596 L` $\rightarrow$ `e220_driver_internal.h` + 3 Files):**
-   * `e220_config_mode3.cpp` (`~520 L`): Pin init, `REG0/1/3` builders, Mode 0$\leftrightarrow$3 transitions, `e220_exit_mode3_to_mode0()`, `e220_probe_mode0_liveness()`, readback/write retries, selftest.
+### Step 1.3 — Reuse-Safe C/C++ Module Splits (Enabling `Field_Instrument_Core` Extraction)
+
+> [!IMPORTANT]
+> **Cross-Project Reuse Constraint (Must Govern Every Split Below):**  
+> Today, modules in both `RTK_Rover` and `Magnetic_Field_Scanner` mix reusable hardware/algorithm code with app globals (`user_config.h`, `current_settings`, `RoverUIData_t`, `mark_settings_dirty()`, `play_rover_beep()`). To avoid doing a second rewrite when extracting `Documents/Arduino/libraries/Field_Instrument_Core` (`Field-Instrument-Core`), every split unit in Phase 1 and every new Phase 2–3 module MUST respect three dependency rules:
+> 1. **Dependency Direction (`App Adapter` $\rightarrow$ `Core Library`, Never Reverse):** Core modules (`i2c_bsp`, `sen0696_driver`, `mmc5983ma_driver`, `imu_bsp`, `um982_driver`, `e220_driver`, `lvgl_port_core`, `storage`, `matrix_math`, `sensor_fusion/ahrs_9dof`) receive pins, I2C bus/device handles, display geometry, signed 3x3 axis orientation matrices, and logging callbacks via **`*Config_t` / `*Hooks_t` structs at `init()`** — **zero `#include "../../user_config.h"`**, **zero `current_settings`**, and **zero `RoverUIData_t` references** inside Core files.
+> 2. **Instance-Safe Filter & Driver State (Zero Singletons Where Multi-Sensor Applies):** Do not store filter state in global singletons (e.g., `MFS` `MadgwickAHRS.c` global `q0..q3`); pass an explicit context struct pointer (`Ahrs9DofState_t *`, `Sen0696Handle_t *`) so multiple Waveshare/sensor instances can coexist (`QMI8658` display pose + `SEN0696` beam 10DOF on `RTK_Rover`, or dual `RM3100` + IMU on `MFS`).
+> 3. **Separate Board/Display Port From App Tiles:** `lvgl_port_core.c` owns QSPI init, PSRAM `heap_caps_malloc_extmem_enable(64)` wrapping, DMA bounce buffers, and mutexes parameterized by board geometry (`320x480` `3.5B` vs. `172x640` `3.49-V2`), while `ui_tile0..tile4.c` remain strictly sketch-local (`RTK_Rover`).
+
+1. **Seed Pure Reusable Math & Fusion Layer (`src/matrix_math/` + `src/sensor_fusion/`):**
+   * Port `Magnetic_Field_Scanner/src/matrix_math/matrix_math.h` (`317 lines` — zero app dependencies) cleanly into `src/matrix_math/`, generalizing integer/fixed scaling (`5000.0`) so both `MFS` (nT) and `RTK_Rover` (uT) share `solve_9x9()`, `invert_3x3()`, `jacobi_eigen_3x3()`, **`get_calibration_matrices()`**, and **`kabsch_align_3x3()`**.
+   * Extract an instance-safe, app-agnostic `ahrs_9dof.h/.cpp` seeded from `MFS` `MadgwickAHRS.c` + `SensorFusion.cpp`'s 50-sample stationary gyro FOC bias tracker (ready for Phase 3 and clean re-adoption back into `MFS`).
+2. **Decouple `imu_bsp` (`QMI8658`), `mag_bsp` (`MMC5983MA`), and `storage` (`serial_logger`/`rtcm_logger`) Hooks:**
+   * Move `current_settings.enable_imu_logging` and `pole_tilt_tare_*` checks out of `src/imu_bsp/imu_bsp.c` (`L111, 188-189`) up into the caller (`RTK_Rover.ino` / app adapter) so `imu_bsp` becomes 100% portable across `3.5B`, `3.49-V2`, and `MFS`.
+   * Keep `log_cb(const char *)` and filesystem/mutex hooks injected cleanly into `serial_logger`, `rtcm_logger`, `e220_driver`, and `um982_driver`.
+3. **Split `src/e220_driver/e220_driver.cpp` (`1,596 L` $\rightarrow$ `e220_driver_internal.h` + 3 Files):**
+   * `e220_config_mode3.cpp` (`~520 L`): Pin config struct + `REG0/1/3` builders, Mode 0$\leftrightarrow$3 transitions, `e220_exit_mode3_to_mode0()`, `e220_probe_mode0_liveness()`, readback/write retries, selftest.
    * `e220_rtcm_gatekeeper.cpp` (`~400 L`): `rx_stage[]`, `rtcm_crc24q_compute()`, `e220_process_rx_stage()`, late RSSI intercept (`0b`), `e220_ingest_rx_bytes()`, burst logging.
    * `e220_tdma_scheduler.cpp` (`~550 L`): `e220_aux_isr()`, superframe clock, `e220_is_uplink_slot_active()`, `e220_poll_and_forward_rtcm()`, RSSI query state machine, uplink telemetry & 4-ACK switch execution, 60s watchdog.
-2. **Split `src/um982_driver/um982_driver.cpp` (`1,146 L` $\rightarrow$ `um982_driver_internal.h` + 2 Files):**
-   * `um982_config_audit.cpp`: `Serial1` init, `s_com1_tx_mutex`, quiet-first setup, `um982_query_receiver_state()`, powerup selftest.
-   * `um982_nmea_parser.cpp`: Strict 3-way `process_com1_line()` demux (`NMEA`/`UNIHEADINGA`/`BASEINFOA`/CMD ACK), `nmea_logger_feed()`, `um982_forward_rtcm_to_com2()` (`COM1` TX).
-3. **Split `src/waypoint_manager/waypoint_manager.cpp` (`1,017 L` $\rightarrow$ 2 Files):**
-   * `waypoint_csv_store.cpp`: Chunked `512 B` loader, stem cache, file switcher.
+   * Keep `RTK_Rover`-specific `RoverUIData_t` $\leftrightarrow$ `RoverUplinkTelemetry_t` adapters separated cleanly from core transport logic.
+4. **Split `src/um982_driver/um982_driver.cpp` (`1,146 L` $\rightarrow$ `um982_driver_internal.h` + 2 Files):**
+   * `um982_config_audit.cpp`: Parameterized `HardwareSerial` + pins (`Serial1`), `s_com1_tx_mutex`, quiet-first setup, `um982_query_receiver_state()`, powerup selftest.
+   * `um982_nmea_parser.cpp`: Strict 3-way `process_com1_line()` demux (`NMEA`/`UNIHEADINGA`/`BASEINFOA`/CMD ACK), log callback hooks (`nmea_logger_feed`), `um982_forward_rtcm_to_com2()` (`COM1` TX).
+5. **Split `src/waypoint_manager/waypoint_manager.cpp` (`1,017 L` $\rightarrow$ 2 Files):**
+   * `waypoint_csv_store.cpp`: Chunked `512 B` loader, stem cache, file switcher (inject `fs::FS&` + `fs_mux` instead of global externs).
    * `waypoint_survey_log.cpp`: Multi-epoch averaging, centroid calculation, CSV pin writer.
-4. **Split `src/lvgl_port/lvgl_port.c` (`4,206 L` $\rightarrow$ `lvgl_ui_internal.h` + 7 Files):**
-   * `lvgl_port_core.c` (`~460 L`): QSPI `AXS15231B` panel/touch init, `heap_caps_malloc_extmem_enable(64)` wrapper (`AGENTS.md` PSRAM discipline preserved!), `rover_lvgl_lock()/unlock()`, `rover_lvgl_port_task`.
-   * `ui_header_nav.c` (`~550 L`): Persistent 4-row status header bar & bottom nav bar.
-   * `ui_tile0_guidance.c` (`~750 L`): Guidance, Line Stakeout, Mode 2 Map View + pan/zoom HUD.
-   * `ui_tile1_logger_settings.c` (`~700 L`): Survey Logger + 3x4 Quick Settings Deck (`LORA`, `WIFI`, etc.).
-   * `ui_tile2_csv_browser.c` (`~450 L`): Multi-file CSV selector & waypoint table.
-   * `ui_tile3_compass_level.c` (`~430 L`): Compass dial, 2D Pole Bubble Level, `TARE` button *(Phase 4 target for Beam 10DOF `CAL MAG` + Temp/Pressure readout)*.
-   * `ui_tile4_diagnostics.c` (`~520 L`): Dual-power UPS, LoRa RF stats, UM982 State/LOGLIST, Beam 10DOF & fallback sensor diagnostics *(Phase 4 target)*.
-5. **Phase 1 Gate:** Compile via exact `AGENTS.md` `arduino-cli` command after **every** split (`0` compiler warnings, static `DRAM0 <= 25%` / `< 80 KB`), preserve `LV_USE_FLOAT = 0` (`snprintf` + `lv_label_set_text()`), verify `stage2_bench_verify.py --self-test`, `test_rover_telemetry.py`, and `check_secrets.py`.
+6. **Split `src/lvgl_port/lvgl_port.c` (`4,206 L` $\rightarrow$ `lvgl_ui_internal.h` + 7 Files):**
+   * `lvgl_port_core.c` (`~460 L`, reusable `Core` candidate): QSPI `AXS15231B` panel/touch init parameterized by `BoardDisplayCfg_t`, `heap_caps_malloc_extmem_enable(64)` wrapper (`AGENTS.md` PSRAM discipline preserved!), `rover_lvgl_lock()/unlock()`, `rover_lvgl_port_task`.
+   * `ui_header_nav.c` (`~550 L`, `RTK_Rover` app): Persistent 4-row status header bar & bottom nav bar.
+   * `ui_tile0_guidance.c` (`~750 L`, `RTK_Rover` app): Guidance, Line Stakeout, Mode 2 Map View + pan/zoom HUD.
+   * `ui_tile1_logger_settings.c` (`~700 L`, `RTK_Rover` app): Survey Logger + 3x4 Quick Settings Deck (`LORA`, `WIFI`, etc.).
+   * `ui_tile2_csv_browser.c` (`~450 L`, `RTK_Rover` app): Multi-file CSV selector & waypoint table.
+   * `ui_tile3_compass_level.c` (`~430 L`, `RTK_Rover` app): Compass dial, 2D Pole Bubble Level, `TARE` button *(Phase 4 target for Beam 10DOF `CAL MAG` + Temp/Pressure readout)*.
+   * `ui_tile4_diagnostics.c` (`~520 L`, `RTK_Rover` app): Dual-power UPS, LoRa RF stats, UM982 State/LOGLIST, Beam 10DOF & fallback sensor diagnostics *(Phase 4 target)*.
+7. **Phase 1 Gate:** Compile via exact `AGENTS.md` `arduino-cli` command after **every** split (`0` compiler warnings, static `DRAM0 <= 25%` / `< 80 KB`), preserve `LV_USE_FLOAT = 0` (`snprintf` + `lv_label_set_text()`), verify `stage2_bench_verify.py --self-test`, `test_rover_telemetry.py`, and `check_secrets.py`.
 
 ---
 
@@ -162,17 +178,24 @@ flowchart TD
      * `pole_bubble_x_deg` and `pole_bubble_y_deg` come **directly from beam roll/pitch** (never affected by tilting the handheld 3.5B screen!).
      * `QMI8658` (`0x6B`) drives **only** `ui_state.display_pose` (or serves as backup if `SEN0696` is unplugged).
 
-### Step 3.2 — Upgraded 3D Beam AHRS & Dual-GNSS Auto-Calibration (`nav_engine`)
-Split `nav_heading_9dof_update()` internals cleanly inside `nav_engine.cpp` (preserving pure C compatibility) with 5 focused improvements:
+### Step 3.2 — Upgraded 3D Beam AHRS & Dual-GNSS Auto-Calibration (Reusing `MFS` Fusion + `matrix_math`)
+Implement the shared instance-safe `ahrs_9dof` + `matrix_math` fusion core and integrate it cleanly into `nav_heading_9dof_update()` (`nav_engine.cpp`, preserving pure C compatibility):
+
+| Capability | Existing `Magnetic_Field_Scanner` Asset Reused | Upgrade Required for Shared Library & Beam `SEN0696` |
+| :--- | :--- | :--- |
+| **3D Hard & Soft Iron Fit** | `MFS/src/matrix_math/matrix_math.h` (`solve_9x9`, `invert_3x3`, `jacobi_eigen_3x3`, `get_calibration_matrices`, `kabsch_align_3x3`) | Accept `float`/`double` uT arrays directly (remove `MFS` `5000.0` raw scale assumption in `kabsch_align_3x3`); apply $3\times 3$ soft-iron + hard-iron `(B - b_hard) * S_soft` inside `ahrs_9dof`. |
+| **9-DOF Quaternion AHRS** | `MFS/src/imu_bsp/MadgwickAHRS.c` (`MadgwickAHRSupdate` / `MadgwickAHRSupdateIMU`) | Refactor global `q0..q3` into instance struct `Ahrs9DofState_t *`, gate accel corrections ($|\|\vec{a}\| - 1g| > 0.12g$ or $|\vec{\omega}| > 12^\circ/\text{s}$), and switch cleanly to 6-DOF IMU mode during iron spikes. |
+| **Stationary Gyro Bias FOC** | `MFS/src/sensor_fusion/SensorFusion.cpp` (`L126-174` 50-sample accel variance tracker) | Decouple from `CalibrationConfig*` / `SystemSettings*` / `Serial.println`; run continuously on `SEN0696` beam stream whenever stationary variance drops below threshold for `>= 1.5 s`. |
+| **Body $\leftrightarrow$ NED Axis Mapping** | Replaces hardcoded `SensorFusion.cpp:200-202` (`ned_mx = ref.y; ned_my = -ref.x`) | Pass configurable signed `int8_t axis_map[3][3]` / Euler mount struct so `MFS`, `RTK_Rover` (`3.5B`), `RTK_Smart_Pole` (`3.49-V2`), and `SEN0696` share the exact same fusion binary code. |
 
 1. **Dynamic-Motion-Gated 3D Tilt Estimator (`pitch`, `roll`, Gravity Unit Vector $\hat{g}$):**
-   * Replace simple EMA accelerometer-only `atan2` on [`imu_bsp.c`](../../src/imu_bsp/imu_bsp.c#L172-L182) with a gyro-propagated + accel-corrected **3D complementary / Mahony attitude filter** running on every `25–40 Hz` `SEN0696` sample.
+   * Replace simple EMA accelerometer-only `atan2` on [`imu_bsp.c`](../../src/imu_bsp/imu_bsp.c#L172-L182) with the shared instance-safe `ahrs_9dof` (`MadgwickAHRSupdateIMU` / 3D complementary attitude filter) running on every `25–40 Hz` `SEN0696` sample.
    * Reject accel tilt corrections when $|\|\vec{a}\| - 1g| > 0.12g$ or $|\vec{\omega}| > 12^\circ/\text{s}$, eliminating walk-bounce jitter on the Bubble Level AND giving crisp tilt-compensation of `BMM350` `(Bx, By, Bz)` during turns!
-2. **World-Vertical Projected Gyro Rate ($\omega_{\text{world},z}$) + Continuous Stationary Bias Tracking ($\vec{b}_g$):**
+2. **World-Vertical Projected Gyro Rate ($\omega_{\text{world},z}$) + `MFS`-Derived Stationary Bias FOC ($\vec{b}_g$):**
    * Project calibrated 3D gyro onto the estimated gravity vertical vector $\hat{g}$: $\omega_{\text{world},z} = \hat{g} \cdot (\vec{\omega}_{\text{beam}} - \vec{b}_g)$, rather than raw unprojected `gyr_z_dps`.
-   * Detect beam stationarity (sliding window of gyro & accel norm variance `< threshold` for `>= 1.5 s`) to continuously update $\vec{b}_g$ (slow EMA), reducing stationary gyro drift during iron-anomaly coasts by an order of magnitude vs. uncalibrated `±1 deg/s` zero-rate offset.
-3. **3-Axis Geomagnetic Field Calibration (`BMM350`) Trained by `UM982 HDG FIX` + 360° Spin Routine:**
-   * **Offline/Assisted Hard-Iron Fit (Optional Tile 3 `CAL MAG` Button):** User slowly rotates the pole `360°` horizontally (keeping bubble within `±5°`); collects `(Bx, By)` samples across all quadrants to fit hard-iron center `(bx_off, by_off)` and field circle radius `B_horiz_ref`, persisted to `settings.json`. *(Important: beam-bolted aluminum/coax/connectors stay rigid relative to `SEN0696`, so hard-iron offsets remain stable across trips once learned!)*
+   * Run the `MFS`-derived 50-sample sliding accel-variance stationary detector to continuously update $\vec{b}_g$, reducing stationary gyro drift during iron-anomaly coasts by an order of magnitude vs. uncalibrated `±1 deg/s` zero-rate offset.
+3. **3-Axis Geomagnetic Ellipsoid Calibration (`BMM350`) Trained by `matrix_math` + `UM982 HDG FIX`:**
+   * **3D Ellipsoid Fit (`Tile 3 CAL MAG` Button via `matrix_math::get_calibration_matrices()`):** User rotates the pole `360°` (with optional gentle tilt) to collect distributed `(Bx, By, Bz)` samples; `matrix_math` solves the exact **3D hard-iron center `(bx_off, by_off, bz_off)` and `3x3` soft-iron matrix `S[3][3]`**, persisted to `settings.json`. *(Beam-bolted aluminum/coax/connectors stay rigid relative to `SEN0696`, keeping the 3D ellipsoid stable across trips!)*
    * **Continuous Online Teacher (`HDG FIX`):** Whenever `UM982 UNIHEADINGA` has `HDG_SRC_DUAL_FIX` and tilt $< 15^\circ$:
      * Updates circular EMA of `mag_true_north_offset_deg` (`alpha = 0.05`).
      * Updates **both** total field norm $B_{\text{ref}}$ and vertical magnetic component $B_{z,\text{ref}}$.
