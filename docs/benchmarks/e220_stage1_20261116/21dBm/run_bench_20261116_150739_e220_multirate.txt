@@ -1,0 +1,207 @@
+pi@rtkbase:~/rtk-station $ sudo python3 ./bench_e220_multirate.py --stop-service
+=== bench_e220_multirate.py v1.0.2 ===
+[SERVICE] Stopping e220-pacer.service before acquiring /dev/ttyAMA0...
+[SERVICE] e220-pacer.service stopped cleanly.
+[FTDI] Tuned /sys/bus/usb-serial/devices/ttyUSB0/latency_timer: 16ms -> 1ms
+[RADIO TX] /dev/ttyAMA0: ADD=0000 REG=E4/23/4B/00 (Air=9.6k Pkt=200B Pwr=21dBm CH=75(925.125MHz) RSSI_Reg=ON)
+[RADIO RX] /dev/ttyUSB0: ADD=0000 REG=E3/20/4B/00 (Air=4.8k Pkt=200B Pwr=30dBm CH=75(925.125MHz) RSSI_Reg=ON)
+
+======================================================================
+[TEST 1] Empirical ToA & AUX Waveform Sweeper (18 B -> 456 B)
+======================================================================
+
+--- Rate 4.8 kbps ---
+  Len | Subs | AUX_Drop | AUX_Low_ms | TX_Pace_ms | Model_ToA | RX_Wall_ms | Pass
+   18 |   1  |    NO    |       0.0  |      164.9 |     157.2 |      103.0 | 4/4
+   27 |   1  |    NO    |       0.0  |      179.1 |     174.8 |      120.0 | 4/4
+   45 |   1  |    NO    |       0.0  |      215.7 |     210.1 |      153.6 | 4/4
+  144 |   1  |    NO    |       0.0  |      407.2 |     403.8 |      340.6 | 4/4
+  173 |   1  |    NO    |       0.0  |      463.5 |     460.5 |      392.5 | 4/4
+  189 |   1  |    NO    |       0.0  |      495.3 |     491.8 |      425.6 | 4/4
+  200 |   1  |    NO    |       0.0  |      518.7 |     513.4 |      442.6 | 4/4
+  201 |   2  |   YES    |     401.8  |      570.2 |     565.2 |      490.3 | 4/4
+  253 |   2  |   YES    |     399.3  |      666.8 |     663.4 |      582.3 | 4/4
+  316 |   2  |   YES    |     391.9  |      787.9 |     782.2 |      696.2 | 4/4
+  400 |   2  |   YES    |     386.5  |      944.1 |     940.7 |      847.3 | 4/4
+  456 |   3  |    NO    |       0.0  |     1278.2 |    1258.3 |     1212.2 | 4/4
+
+--- Rate 9.6 kbps ---
+  Len | Subs | AUX_Drop | AUX_Low_ms | TX_Pace_ms | Model_ToA | RX_Wall_ms | Pass
+   18 |   1  |    NO    |       0.0  |      124.0 |     120.0 |       66.0 | 4/4
+   27 |   1  |    NO    |       0.0  |      135.6 |     131.5 |       76.5 | 4/4
+   45 |   1  |    NO    |       0.0  |      160.7 |     154.5 |       98.1 | 4/4
+  144 |   1  |    NO    |       0.0  |      284.5 |     280.9 |      216.9 | 4/4
+  173 |   1  |    NO    |       0.0  |      322.2 |     317.9 |      250.2 | 4/4
+  189 |   1  |    NO    |       0.0  |      342.4 |     338.3 |      271.5 | 4/4
+  200 |   1  |    NO    |       0.0  |      356.8 |     352.4 |      283.7 | 4/4
+  201 |   2  |   YES    |     243.4  |      382.6 |     378.6 |      305.5 | 4/4
+  253 |   2  |   YES    |     238.3  |      445.4 |     441.3 |      363.0 | 4/4
+  316 |   2  |   YES    |     232.5  |      522.0 |     517.4 |      433.5 | 4/4
+  400 |   2  |   YES    |     225.3  |      623.2 |     618.7 |      526.8 | 4/4
+  456 |   3  |    NO    |       0.0  |      898.6 |     873.2 |      831.6 | 4/4
+
+--- Rate 19.2 kbps ---
+  Len | Subs | AUX_Drop | AUX_Low_ms | TX_Pace_ms | Model_ToA | RX_Wall_ms | Pass
+   18 |   1  |    NO    |       0.0  |       89.5 |      85.0 |       44.1 | 4/4
+   27 |   1  |    NO    |       0.0  |       97.3 |      92.9 |       49.6 | 4/4
+   45 |   1  |    NO    |       0.0  |      112.7 |     108.9 |       63.7 | 4/4
+  144 |   1  |    NO    |       0.0  |      201.9 |     196.7 |      143.3 | 4/4
+  173 |   1  |    NO    |       0.0  |      226.8 |     222.4 |      166.7 | 4/4
+  189 |   1  |    NO    |       0.0  |      239.9 |     236.6 |      179.7 | 4/4
+  200 |   1  |    NO    |       0.0  |      250.7 |     246.4 |      187.1 | 4/4
+  201 |   2  |   YES    |     146.7  |      274.1 |     269.1 |      196.0 | 4/4
+  253 |   2  |   YES    |     140.8  |      316.6 |     310.1 |      233.0 | 4/4
+  316 |   2  |   YES    |     138.9  |      362.4 |     359.6 |      278.0 | 4/4
+  400 |   2  |   YES    |     130.5  |      429.8 |     425.7 |      336.7 | 4/4
+  456 |   3  |    NO    |       0.0  |      630.8 |     611.4 |      582.1 | 4/4
+
+======================================================================
+[TEST 2] Minimum Inter-Frame Guard & Pacing Method Comparison
+======================================================================
+
+--- Rate 4.8 kbps ---
+  [CTRL] aux_only (35ms guard): failed 0/8 bursts (expected due to missing/early AUX)
+  [TOA-FLOOR] Guard=60ms: 32/32 (100.0%) intact
+  [TOA-FLOOR] Guard=50ms: 32/32 (100.0%) intact
+  [TOA-FLOOR] Guard=40ms: 32/32 (100.0%) intact
+  [TOA-FLOOR] Guard=30ms: 32/32 (100.0%) intact
+  [TOA-FLOOR] Guard=20ms: 32/32 (100.0%) intact
+  [TOA-FLOOR] Guard=10ms: 32/32 (100.0%) intact
+  [separate_3   ]: 8/8 intact | avg_dur= 754.2ms
+  [coalesced_189]: 8/8 intact | avg_dur= 499.3ms
+
+--- Rate 9.6 kbps ---
+  [CTRL] aux_only (35ms guard): failed 0/8 bursts (expected due to missing/early AUX)
+  [TOA-FLOOR] Guard=60ms: 32/32 (100.0%) intact
+  [TOA-FLOOR] Guard=50ms: 32/32 (100.0%) intact
+  [TOA-FLOOR] Guard=40ms: 32/32 (100.0%) intact
+  [TOA-FLOOR] Guard=30ms: 32/32 (100.0%) intact
+  [TOA-FLOOR] Guard=20ms: 32/32 (100.0%) intact
+  [TOA-FLOOR] Guard=10ms: 32/32 (100.0%) intact
+  [separate_3   ]: 8/8 intact | avg_dur= 551.5ms
+  [coalesced_189]: 8/8 intact | avg_dur= 343.8ms
+
+--- Rate 19.2 kbps ---
+  [CTRL] aux_only (35ms guard): failed 0/8 bursts (expected due to missing/early AUX)
+  [TOA-FLOOR] Guard=60ms: 32/32 (100.0%) intact
+  [TOA-FLOOR] Guard=50ms: 32/32 (100.0%) intact
+  [TOA-FLOOR] Guard=40ms: 32/32 (100.0%) intact
+  [TOA-FLOOR] Guard=30ms: 32/32 (100.0%) intact
+  [TOA-FLOOR] Guard=20ms: 32/32 (100.0%) intact
+  [TOA-FLOOR] Guard=10ms: 32/32 (100.0%) intact
+  [separate_3   ]: 8/8 intact | avg_dur= 396.4ms
+  [coalesced_189]: 8/8 intact | avg_dur= 244.2ms
+
+======================================================================
+[TEST 3] Framing PER: 1-pkt vs 2-pkt vs Coalesced <=200B vs 200B Stream
+======================================================================
+
+--- Rate 4.8 kbps (N=60 epochs/mode) ---
+  [1pkt_173B     ] OK= 60/ 60 (100.0%) CRC_err=0 Orph=0B
+  [2pkt_253B     ] OK= 60/ 60 (100.0%) CRC_err=0 Orph=0B
+  [2pkt_316B     ] OK= 60/ 60 (100.0%) CRC_err=0 Orph=0B
+  [coalesced_189B    ] OK=180/180 (100.0%) CRC_err=0 Orph=0B
+  [sliced_200B_stream] OK=180/180 (100.0%) CRC_err=0 Orph=0B
+
+--- Rate 9.6 kbps (N=60 epochs/mode) ---
+  [1pkt_173B     ] OK= 60/ 60 (100.0%) CRC_err=0 Orph=0B
+  [2pkt_253B     ] OK= 60/ 60 (100.0%) CRC_err=0 Orph=0B
+  [2pkt_316B     ] OK= 60/ 60 (100.0%) CRC_err=0 Orph=0B
+  [coalesced_189B    ] OK=180/180 (100.0%) CRC_err=0 Orph=0B
+  [sliced_200B_stream] OK=180/180 (100.0%) CRC_err=0 Orph=0B
+
+--- Rate 19.2 kbps (N=60 epochs/mode) ---
+  [1pkt_173B     ] OK= 60/ 60 (100.0%) CRC_err=0 Orph=0B
+  [2pkt_253B     ] OK= 60/ 60 (100.0%) CRC_err=0 Orph=0B
+  [2pkt_316B     ] OK= 60/ 60 (100.0%) CRC_err=0 Orph=0B
+  [coalesced_189B    ] OK=180/180 (100.0%) CRC_err=0 Orph=0B
+  [sliced_200B_stream] OK=180/180 (100.0%) CRC_err=0 Orph=0B
+
+======================================================================
+[TEST 4] Consolidated Uplink + Mode 0 C0 C1 C2 C3 RSSI Margin Sweep
+======================================================================
+
+--- Rate 4.8 kbps ---
+  Turnaround= 20ms: DL1=6/6 UL=6/6 RSSI=6/6 (avg=  5.9ms) Spills=0
+  Turnaround= 40ms: DL1=6/6 UL=6/6 RSSI=6/6 (avg=  4.9ms) Spills=0
+  Turnaround= 60ms: DL1=6/6 UL=6/6 RSSI=6/6 (avg=  4.9ms) Spills=0
+  Turnaround= 80ms: DL1=6/6 UL=6/6 RSSI=6/6 (avg=  5.0ms) Spills=0
+  Turnaround=100ms: DL1=6/6 UL=6/6 RSSI=6/6 (avg=  5.0ms) Spills=0
+
+--- Rate 9.6 kbps ---
+  Turnaround= 20ms: DL1=6/6 UL=6/6 RSSI=6/6 (avg=  4.8ms) Spills=0
+  Turnaround= 40ms: DL1=6/6 UL=6/6 RSSI=6/6 (avg=  5.1ms) Spills=0
+  Turnaround= 60ms: DL1=6/6 UL=6/6 RSSI=6/6 (avg=  5.8ms) Spills=0
+  Turnaround= 80ms: DL1=6/6 UL=6/6 RSSI=6/6 (avg=  5.1ms) Spills=0
+  Turnaround=100ms: DL1=6/6 UL=6/6 RSSI=6/6 (avg=  5.1ms) Spills=0
+
+--- Rate 19.2 kbps ---
+  Turnaround= 20ms: DL1=6/6 UL=6/6 RSSI=6/6 (avg=  5.0ms) Spills=0
+  Turnaround= 40ms: DL1=6/6 UL=6/6 RSSI=6/6 (avg=  5.2ms) Spills=0
+  Turnaround= 60ms: DL1=6/6 UL=6/6 RSSI=6/6 (avg=  5.1ms) Spills=0
+  Turnaround= 80ms: DL1=6/6 UL=6/6 RSSI=6/6 (avg=  5.4ms) Spills=0
+  Turnaround=100ms: DL1=6/6 UL=6/6 RSSI=6/6 (avg=  6.0ms) Spills=0
+
+======================================================================
+[TEST 5] Automated Mode 3 3-Rate Switch Endurance Loop
+======================================================================
+  Cycle  1/30: cumulative legs passed = 4/4
+  Cycle  2/30: cumulative legs passed = 8/8
+  Cycle  3/30: cumulative legs passed = 12/12
+^[[3~  Cycle  4/30: cumulative legs passed = 16/16
+  Cycle  5/30: cumulative legs passed = 20/20
+  Cycle  6/30: cumulative legs passed = 24/24
+  Cycle  7/30: cumulative legs passed = 28/28
+  Cycle  8/30: cumulative legs passed = 32/32
+  Cycle  9/30: cumulative legs passed = 36/36
+  Cycle 10/30: cumulative legs passed = 40/40
+  Cycle 11/30: cumulative legs passed = 44/44
+  Cycle 12/30: cumulative legs passed = 48/48
+  Cycle 13/30: cumulative legs passed = 51/52
+  Cycle 14/30: cumulative legs passed = 55/56
+  Cycle 15/30: cumulative legs passed = 59/60
+  Cycle 16/30: cumulative legs passed = 63/64
+  Cycle 17/30: cumulative legs passed = 67/68
+  Cycle 18/30: cumulative legs passed = 71/72
+  Cycle 19/30: cumulative legs passed = 75/76
+  Cycle 20/30: cumulative legs passed = 79/80
+  Cycle 21/30: cumulative legs passed = 83/84
+  Cycle 22/30: cumulative legs passed = 87/88
+  Cycle 23/30: cumulative legs passed = 91/92
+  Cycle 24/30: cumulative legs passed = 95/96
+  Cycle 25/30: cumulative legs passed = 99/100
+  Cycle 26/30: cumulative legs passed = 103/104
+  Cycle 27/30: cumulative legs passed = 107/108
+  Cycle 28/30: cumulative legs passed = 111/112
+  Cycle 29/30: cumulative legs passed = 115/116
+  Cycle 30/30: cumulative legs passed = 119/120
+
+======================================================================
+[TEST 6] High-Duty Thermal Drift Soak (5.00 min/rate)
+======================================================================
+
+--- Thermal Soak @ 4.8 kbps (21 dBm, 5.00 min) ---
+  Min  1: OK=106/106 (100.0%) CRC_err=0 Noise=-96dBm Pkt=-39dBm AUX_Rst=0
+  Min  2: OK=106/106 (100.0%) CRC_err=0 Noise=-97dBm Pkt=-40dBm AUX_Rst=0
+  Min  3: OK=106/106 (100.0%) CRC_err=0 Noise=-95dBm Pkt=-41dBm AUX_Rst=0
+  Min  4: OK=106/106 (100.0%) CRC_err=0 Noise=-97dBm Pkt=-41dBm AUX_Rst=0
+  Min  5: OK=102/102 (100.0%) CRC_err=0 Noise=-97dBm Pkt=-39dBm AUX_Rst=0
+
+--- Thermal Soak @ 9.6 kbps (21 dBm, 5.00 min) ---
+  Min  1: OK=0/156 (  0.0%) CRC_err=0 Noise=--dBm Pkt=--dBm AUX_Rst=0
+  Min  2: OK=0/156 (  0.0%) CRC_err=0 Noise=--dBm Pkt=--dBm AUX_Rst=0
+  Min  3: OK=0/156 (  0.0%) CRC_err=0 Noise=--dBm Pkt=--dBm AUX_Rst=0
+  Min  4: OK=0/156 (  0.0%) CRC_err=0 Noise=--dBm Pkt=--dBm AUX_Rst=0
+  Min  5: OK=0/140 (  0.0%) CRC_err=0 Noise=--dBm Pkt=--dBm AUX_Rst=0
+
+======================================================================
+SUMMARY (bench_e220_multirate.py v1.0.2 | run=20261116_150739)
+  [PASS] test1_toa          -> 144 probes saved
+  [PASS] test2_guard        -> 0 AUX resets
+  [PASS] test3_per          -> 15 profiles logged
+  [PASS] test4_uplink_rssi  -> 15 turnaround sweeps
+  [FAIL] test5_switch       -> 119/120 transitions OK
+  [FAIL] test6_thermal      -> 10 soak windows
+======================================================================
+[SERVICE] Restoring e220-pacer.service...
+[SERVICE] e220-pacer.service state: active

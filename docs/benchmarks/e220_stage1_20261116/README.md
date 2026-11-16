@@ -53,6 +53,7 @@ Measured end-to-end (`TX UART write` to `RX CRC24Q complete` at `1 ms` USB polli
 ## 4. Archived Raw Data Files (Scrubbed)
 
 - **`21 dBm` Dataset (`21dBm/`):**
+  - [run_bench_20261116_150739_e220_multirate.txt](21dBm/run_bench_20261116_150739_e220_multirate.txt) *(scrubbed terminal log)*
   - [bench_20261116_150739_test1_toa.csv](21dBm/bench_20261116_150739_test1_toa.csv)
   - [bench_20261116_150739_test2_guard.csv](21dBm/bench_20261116_150739_test2_guard.csv)
   - [bench_20261116_150739_test3_per.csv](21dBm/bench_20261116_150739_test3_per.csv)
