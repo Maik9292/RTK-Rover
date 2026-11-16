@@ -1,7 +1,8 @@
-# Composite Plan: Token-Efficient Modularization & Beam-Mounted DFRobot Gravity 10DOF (`SEN0696`) 9-DOF Heading Fusion
+# Composite Plan: Token-Efficient Modularization & Beam-Mounted DFRobot Gravity 10DOF (`SEN0696` / `Product 3126`) 9-DOF Heading Fusion
 
-**Document Version:** `1.0.0`  
+**Document Version:** `1.0.1`  
 **Date:** November 16, 2026  
+**Product Reference:** DFRobot Gravity: BMI323 + BMM350 + BMP581 10DOF IMU (`SKU: SEN0696` / [`Product 3126`](https://www.dfrobot.com/product-3126.html))  
 **Firmware Baseline:** `v0.8.14` (`e220_pacer.py v3.7.1`, `stage2_bench_verify.py v1.0.3`)  
 **Target Firmware Milestones:** `v0.8.15` (Hygiene & Modularization) $\rightarrow$ `v0.9.0` (`SEN0696` Beam 10DOF Driver, 3D AHRS & Diagnostics)  
 **Supersedes:** Part 2 (outboard compass/IMU roadmap) of [`plan_phase8_single_uart_um982_and_mmc5983ma_compass.md`](plan_phase8_single_uart_um982_and_mmc5983ma_compass.md) *(Note: Part 1 Single-UART `UM982 COM1` shipped in `v0.8.0` and remains active)*  
@@ -105,7 +106,7 @@ Create `.gitignore`'d workspace runbooks matching `.agents/` boundaries:
 ### Step 2.1 — Extract Exact `SEN0696` Register/RTU Protocol & Build `src/beam_imu_bsp/`
 Because `SEN0696` places an onboard aggregator MCU in front of the `BMI323`, `BMM350`, and `BMP581` at I2C address **`0x4A`**, DFRobot's Arduino library (`DFRobot_Multi_DOF_IMU` + `DFRobot_RTU`) talks to that MCU over `TwoWire` (`Wire`). **We must NOT instantiate `TwoWire` alongside `i2c_bsp`'s ESP-IDF `i2c_master_bus_handle_t` (`user_i2c_port0_handle`) on `IO7`/`IO8`.**
 
-1. **Inspect Exact `DFRobot_Multi_DOF_IMU` Wire Framing:** Inspect the official `DFRobot/DFRobot_Multi_DOF_IMU` + `DFRobot_RTU` I2C packet format (`reg` layout, byte order, scaling for `accel`, `gyro`, `mag`, `pressure`, `temperature`, calibration/mode registers, and whether onboard orientation/Euler/quaternion registers exist or if raw scaled 3-axis vectors are read) before writing the C++ driver.
+1. **Verify Hardware I2C Address Scan & Exact `DFRobot_Multi_DOF_IMU` Wire Framing:** Run an initial `I2C0` bus scan on the wired `Product 3126` (`SEN0696`) board in I2C mode (confirming `0x4A..0x4D` Gravity MCU response vs. raw `0x69`/`0x15`/`0x47`), and inspect the official `DFRobot/DFRobot_Multi_DOF_IMU` + `DFRobot_RTU` I2C packet format (`reg` layout, byte order, scaling for `accel`, `gyro`, `mag`, `pressure`, `temperature`, calibration/mode registers, and whether onboard orientation/Euler/quaternion registers exist or if raw scaled 3-axis vectors are read) before writing the C++ driver.
 2. **Add `ROVER_I2C_ADDR_BEAM_IMU = 0x4A` (`user_config.h`) & Device Handle (`i2c_bsp.c/.h`):**
    * Register `beam_imu_dev_handle` on `user_i2c_port0_handle` (`400 kHz`, `.scl_wait_us = 20000`, `i2c_bsp_lock()` protected, covered by `i2c_bsp_reinit_bus()` teardown/re-add so warm resets & bus recovery never leak device handles!).
    * Keep `i2c_bsp_probe_optional_addr(0x4A)` quiet so units without `SEN0696` attached print zero error warnings and seamlessly fall back to `MMC5983MA` (`0x30`) / `QMI8658` (`0x6B`).
