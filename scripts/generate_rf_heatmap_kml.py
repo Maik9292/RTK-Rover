@@ -16,10 +16,11 @@ import tempfile
 import xml.etree.ElementTree as ET
 
 __filename__ = os.path.basename(__file__)
-__version__ = "v1.0.0"
+__version__ = "v1.0.1"
 
 _EARTH_R_M = 6371000.0
 _DEFAULT_HEAT_RADIUS_M = 16.0
+_MIN_TRACK_STEP_M = 1.0
 
 
 def haversine_m(lat1, lon1, lat2, lon2):
@@ -305,16 +306,35 @@ def _add_heat_disc(parent, name, desc_html, lat, lon, radius_m, fill_color, outl
     ET.SubElement(lr, "coordinates").text = circle_polygon_coords(lat, lon, radius_m, steps=18)
 
 
-def _add_track_segment(parent, p1, p2, color_kml, width=4):
+def _add_track_segment(parent, p1, p2, color_kml, width=4, name=None):
+    """Emit a KML LineString track segment only when endpoints are strictly distinct."""
+    c1 = f"{p1['lon']:.7f},{p1['lat']:.7f},0"
+    c2 = f"{p2['lon']:.7f},{p2['lat']:.7f},0"
+    if c1 == c2 or haversine_m(p1["lat"], p1["lon"], p2["lat"], p2["lon"]) < _MIN_TRACK_STEP_M:
+        return False
     pm = ET.SubElement(parent, "Placemark")
-    ET.SubElement(pm, "name").text = ""
+    ET.SubElement(pm, "name").text = name or f"Track {p1['ts']}"
     st = ET.SubElement(pm, "Style")
     ls = ET.SubElement(st, "LineStyle")
     ET.SubElement(ls, "color").text = color_kml
     ET.SubElement(ls, "width").text = str(width)
     ln = ET.SubElement(pm, "LineString")
     ET.SubElement(ln, "tessellate").text = "1"
-    ET.SubElement(ln, "coordinates").text = f"{p1['lon']:.7f},{p1['lat']:.7f},0 {p2['lon']:.7f},{p2['lat']:.7f},0"
+    ET.SubElement(ln, "coordinates").text = f"{c1} {c2}"
+    return True
+
+
+def _advance_track_segment(tracks_folder, prev_pt, pt, line_color, label):
+    """Advance track anchor and emit segment only for motion within the gap threshold."""
+    if prev_pt is None:
+        return pt
+    step_m = haversine_m(prev_pt["lat"], prev_pt["lon"], pt["lat"], pt["lon"])
+    if step_m >= 250.0:
+        return pt
+    if step_m >= _MIN_TRACK_STEP_M:
+        if _add_track_segment(tracks_folder, prev_pt, pt, line_color, width=4, name=f"{label} Track {pt['ts']}"):
+            return pt
+    return prev_pt
 
 
 def _build_base_folder(doc, base_lat, base_lon, ring_radii_m):
@@ -347,7 +367,8 @@ def _build_downlink_folder(doc, label, points, base_lat, base_lon, heat_radius_m
     ET.SubElement(blobs, "name").text = "5s dBm Heatmap Discs (Click for Telemetry)"
     ET.SubElement(blobs, "visibility").text = "1" if visible else "0"
 
-    for i, pt in enumerate(points):
+    prev_track_pt = None
+    for pt in points:
         dist = haversine_m(base_lat, base_lon, pt["lat"], pt["lon"])
         bear = bearing_deg(base_lat, base_lon, pt["lat"], pt["lon"])
         snr = pt["pkt"] - pt["noise"] if (pt["pkt"] < 0 and pt["noise"] < 0) else 0
@@ -371,8 +392,7 @@ def _build_downlink_folder(doc, label, points, base_lat, base_lon, heat_radius_m
             f"<b>GNSS:</b> {fix_code_label(pt['fix'])} | <b>Diff Age:</b> {pt['diff']:.1f} s | <b>Spd:</b> {pt['spd']:.1f} m/s"
         )
         _add_heat_disc(blobs, title, desc, pt["lat"], pt["lon"], heat_radius_m, fill_c, line_c, width=1)
-        if i > 0 and haversine_m(points[i - 1]["lat"], points[i - 1]["lon"], pt["lat"], pt["lon"]) < 250.0:
-            _add_track_segment(tracks, points[i - 1], pt, line_c, width=4)
+        prev_track_pt = _advance_track_segment(tracks, prev_track_pt, pt, line_c, f"{label} DL")
 
 
 def _build_uplink_folder(doc, label, uplinks, base_lat, base_lon, heat_radius_m, visible=False):
@@ -388,7 +408,8 @@ def _build_uplink_folder(doc, label, uplinks, base_lat, base_lon, heat_radius_m,
     ET.SubElement(blobs, "name").text = "5s Base RX dBm Heatmap Discs"
     ET.SubElement(blobs, "visibility").text = "1" if visible else "0"
 
-    for i, pt in enumerate(uplinks):
+    prev_track_pt = None
+    for pt in uplinks:
         dist = haversine_m(base_lat, base_lon, pt["lat"], pt["lon"])
         bear = bearing_deg(base_lat, base_lon, pt["lat"], pt["lon"])
         fill_c = dbm_to_kml_color(pt["rssi"], "88")
@@ -402,8 +423,7 @@ def _build_uplink_folder(doc, label, uplinks, base_lat, base_lon, heat_radius_m,
             f"<b>Hdg:</b> {pt['hdg']} deg [{html.escape(pt['hdg_src'])}]"
         )
         _add_heat_disc(blobs, title, desc, pt["lat"], pt["lon"], heat_radius_m, fill_c, line_c, width=1)
-        if i > 0 and haversine_m(uplinks[i - 1]["lat"], uplinks[i - 1]["lon"], pt["lat"], pt["lon"]) < 250.0:
-            _add_track_segment(tracks, uplinks[i - 1], pt, line_c, width=4)
+        prev_track_pt = _advance_track_segment(tracks, prev_track_pt, pt, line_c, f"{label} UL")
 
 
 def _build_waypoints_folder(doc, csv_path, base_lat, base_lon):
@@ -433,24 +453,33 @@ def _build_waypoints_folder(doc, csv_path, base_lat, base_lon):
 
     if len(pos_pts) >= 3:
         pos_pts.sort(key=lambda x: x["seq"])
-        coords = [f"{r['lon']:.7f},{r['lat']:.7f},0" for r in pos_pts]
-        coords.append(f"{pos_pts[0]['lon']:.7f},{pos_pts[0]['lat']:.7f},0")
-        pm = ET.SubElement(folder, "Placemark")
-        ET.SubElement(pm, "name").text = f"{name} Boundary"
-        ET.SubElement(pm, "styleUrl").text = "#parcelLineStyle"
-        ln = ET.SubElement(pm, "LineString")
-        ET.SubElement(ln, "tessellate").text = "1"
-        ET.SubElement(ln, "coordinates").text = " ".join(coords)
+        coords = []
+        for r in pos_pts:
+            c = f"{r['lon']:.7f},{r['lat']:.7f},0"
+            if not coords or coords[-1] != c:
+                coords.append(c)
+        if coords and coords[-1] != coords[0]:
+            coords.append(coords[0])
+        if len(set(coords)) >= 2 and len(coords) >= 2:
+            pm = ET.SubElement(folder, "Placemark")
+            ET.SubElement(pm, "name").text = f"{name} Boundary"
+            ET.SubElement(pm, "styleUrl").text = "#parcelLineStyle"
+            ln = ET.SubElement(pm, "LineString")
+            ET.SubElement(ln, "tessellate").text = "1"
+            ET.SubElement(ln, "coordinates").text = " ".join(coords)
 
     for r in rows:
         if r["seq"] < 0 and (-r["seq"]) in by_seq:
             tgt = by_seq[-r["seq"]]
-            pm = ET.SubElement(folder, "Placemark")
-            ET.SubElement(pm, "name").text = f"Tie: {r['label']} -> seq {-r['seq']}"
-            ET.SubElement(pm, "styleUrl").text = "#tieLineStyle"
-            ln = ET.SubElement(pm, "LineString")
-            ET.SubElement(ln, "tessellate").text = "1"
-            ET.SubElement(ln, "coordinates").text = f"{r['lon']:.7f},{r['lat']:.7f},0 {tgt['lon']:.7f},{tgt['lat']:.7f},0"
+            c1 = f"{r['lon']:.7f},{r['lat']:.7f},0"
+            c2 = f"{tgt['lon']:.7f},{tgt['lat']:.7f},0"
+            if c1 != c2:
+                pm = ET.SubElement(folder, "Placemark")
+                ET.SubElement(pm, "name").text = f"Tie: {r['label']} -> seq {-r['seq']}"
+                ET.SubElement(pm, "styleUrl").text = "#tieLineStyle"
+                ln = ET.SubElement(pm, "LineString")
+                ET.SubElement(ln, "tessellate").text = "1"
+                ET.SubElement(ln, "coordinates").text = f"{c1} {c2}"
 
 
 def _add_shared_styles(doc):
@@ -543,12 +572,15 @@ def run_self_test():
             f.write("[12:00:00.200] [TELEM] Fix:4 SVs:20/10 Hdg:FIX(0.0) BL:55.0cm Spd:0.0m/s Base:1 Diff:1.0s | USB:5.00V+ | COM1 RX:100B NMEA:10 RTCM_TX:500B | E220 AUX:1 (Edges:5) Noise:-96dBm Pkt:-45dBm RX:500B Fwd:500B OK:10 (1006:1) Err:0 (Trunc:0) Orph:0B\n")
             f.write("[12:00:05.100] [E220 LORA TX #2] Uplink 48B (FW:v0.8.17 Fix:4 SLV:4 Tip:44.0020000,-70.0000000,50.0m BL:55.0cm P:0.0deg USB:5.00V+)\n")
             f.write("[12:00:05.200] [TELEM] Fix:4 SVs:20/10 Hdg:FIX(0.0) BL:55.0cm Spd:1.0m/s Base:1 Diff:1.5s | USB:5.00V+ | COM1 RX:200B NMEA:20 RTCM_TX:1000B | E220 AUX:1 (Edges:10) Noise:-88dBm Pkt:-72dBm RX:1000B Fwd:1000B OK:18 (1006:2) Err:0 (Trunc:0) Orph:0B\n")
-            f.write("[12:00:10.100] [E220 LORA TX #3] Uplink 48B (FW:v0.8.17 Fix:4 SLV:4 Tip:44.0050000,-70.0000000,50.0m BL:55.0cm P:0.0deg USB:5.00V+)\n")
-            f.write("[12:00:10.200] [TELEM] Fix:4 SVs:20/10 Hdg:FIX(0.0) BL:55.0cm Spd:2.0m/s Base:1 Diff:6.5s | USB:5.00V+ | COM1 RX:300B NMEA:30 RTCM_TX:1000B | E220 AUX:1 (Edges:10) Noise:-84dBm Pkt:-72dBm RX:1000B Fwd:1000B OK:18 (1006:2) Err:0 (Trunc:0) Orph:0B\n")
+            f.write("[12:00:10.100] [E220 LORA TX #3] Uplink 48B (FW:v0.8.17 Fix:4 SLV:4 Tip:44.0020000,-70.0000000,50.0m BL:55.0cm P:0.0deg USB:5.00V+)\n")
+            f.write("[12:00:10.200] [TELEM] Fix:4 SVs:20/10 Hdg:FIX(0.0) BL:55.0cm Spd:0.0m/s Base:1 Diff:6.5s | USB:5.00V+ | COM1 RX:300B NMEA:30 RTCM_TX:1000B | E220 AUX:1 (Edges:10) Noise:-84dBm Pkt:-72dBm RX:1000B Fwd:1000B OK:18 (1006:2) Err:0 (Trunc:0) Orph:0B\n")
+            f.write("[12:00:15.100] [E220 LORA TX #4] Uplink 48B (FW:v0.8.17 Fix:4 SLV:4 Tip:44.0021000,-70.0000000,50.0m BL:55.0cm P:0.0deg USB:5.00V+)\n")
+            f.write("[12:00:15.200] [TELEM] Fix:4 SVs:20/10 Hdg:FIX(0.0) BL:55.0cm Spd:2.2m/s Base:1 Diff:11.5s | USB:5.00V+ | COM1 RX:400B NMEA:40 RTCM_TX:1000B | E220 AUX:1 (Edges:10) Noise:-85dBm Pkt:-72dBm RX:1000B Fwd:1000B OK:18 (1006:2) Err:0 (Trunc:0) Orph:0B\n")
 
         with open(pac, "w", encoding="utf-8") as f:
             f.write("Nov 17 07:00:05 host python3[1]: [12:00:05] [PACER HEARTBEAT] In:100B (20.0B/s) | Out:50B (10.0B/s)\n")
             f.write("Nov 17 07:00:05 host python3[1]: [ROVER TEL #002] FW:v0.8.17 | ANT1:RTK_FIX (20M) | ANT2:SLV_FIX (10S, BL:55.0cm, P:0.0deg) | Hdg: 0.0deg [DUAL_FIX] | PWR:USB (5.0V) | RSSI:-68dBm | Pos:44.0020000, -70.0000000, 50.00m\n")
+            f.write("Nov 17 07:00:10 host python3[1]: [ROVER TEL #003] FW:v0.8.17 | ANT1:RTK_FIX (20M) | ANT2:SLV_FIX (10S, BL:55.0cm, P:0.0deg) | Hdg: 0.0deg [DUAL_FIX] | PWR:USB (5.0V) | RSSI:-69dBm | Pos:44.0020000, -70.0000000, 50.00m\n")
 
         with open(csv_p, "w", encoding="utf-8") as f:
             f.write("label,latitude,longitude,poly_order,pos_fix,notes\n")
@@ -558,11 +590,16 @@ def run_self_test():
             f.write("SYNTH_TIE,44.0015,-70.000,-2,RTK_FIX,Tie\n")
 
         counts = generate_kml(["SYNTH::" + ser], pac, [csv_p], out_p)
-        assert counts["SYNTH"] == {"dl_total": 2, "dl_live": 1, "dl_dead": 1, "ul_total": 1}, counts
+        assert counts["SYNTH"] == {"dl_total": 3, "dl_live": 1, "dl_dead": 2, "ul_total": 2}, counts
         tree = ET.parse(out_p)
         ns = {"k": "http://www.opengis.net/kml/2.2"}
         pms = tree.findall(".//k:Placemark", ns)
-        assert len(pms) >= 12, f"Expected >= 12 Placemarks, got {len(pms)}"
+        assert len(pms) >= 14, f"Expected >= 14 Placemarks, got {len(pms)}"
+        for pm in pms:
+            assert (pm.findtext("k:name", "", ns) or "").strip(), "Placemark missing non-empty name"
+        for ln in tree.findall(".//k:LineString/k:coordinates", ns):
+            pts = (ln.text or "").strip().split()
+            assert len(set(pts)) >= 2, f"Degenerate LineString: {pts}"
     print("[SELF-TEST] PASS: Synthetic KML RF heatmap & parcel overlay verified.")
 
 

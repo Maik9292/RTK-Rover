@@ -5,6 +5,10 @@ All notable changes to the **RTK Rover** project will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [generate_rf_heatmap_kml.py v1.0.1] - 2026-11-17
+### Fixed
+- **Google Earth Track Segment Degeneracy (`_MIN_TRACK_STEP_M = 1.0`):** Filtered zero-length and sub-meter stationary RTK-jitter track segments using a shared `_advance_track_segment()` anchor, added non-empty `<name>` tags on track `<Placemark>` elements, guarded parcel boundary/tie polylines against duplicate coordinates, and extended `--self-test` with stationary-point assertions.
+
 ## [generate_rf_heatmap_kml.py v1.0.0] - 2026-11-17
 ### Added
 - **`scripts/generate_rf_heatmap_kml.py` (`v1.0.0`):** Generic, decoupled Google Earth KML LoRa RF signal (`dBm`) heatmap generator CLI tool supporting multi-run downlink/uplink comparisons (`--run LABEL::SERIAL_LOG[::START_UTC::END_UTC]`, `--pacer-log`), automatic Base antenna & UTC heartbeat alignment, live-vs-deadzone RTCM gatekeeping (`delta_OK > 0`), range rings (`150/300/450/750 m`), and `--waypoints` parcel boundary/tie overlays (`--self-test` verified).
