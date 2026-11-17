@@ -101,7 +101,10 @@ void axp2101_bsp_read(Axp2101Status_t *status)
     uint8_t st[2] = {0};
     bool raw_vbus_good = false;
     bool bat_present   = false;
-    if (i2c_read_buff(axp2101_dev_handle, AXP2101_REG_STATUS1, st, 2) == ESP_OK) {
+    const bool st_ok = (i2c_read_buff(axp2101_dev_handle, AXP2101_REG_STATUS1, st, 2) == ESP_OK);
+    // Running system cannot physically have STATUS1==0x00 && STATUS2==0x00 or repeated 0x61/0x71 sentinel bytes
+    const bool st_valid = st_ok && !(st[0] == 0x00U && st[1] == 0x00U) && !i2c_bsp_has_sentinel_run(st, sizeof(st), 2U);
+    if (st_valid) {
         raw_vbus_good = (st[0] & (1 << 5)) != 0;
         bat_present   = (st[0] & (1 << 3)) != 0;
 

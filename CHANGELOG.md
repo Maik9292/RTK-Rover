@@ -5,6 +5,15 @@ All notable changes to the **RTK Rover** project will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.8.18] - 2026-11-17
+
+### Fixed
+- **Two-Tier Runtime `I2C0` Peripheral Reinit & `0x61`/`0x71` Sentinel Filtering ([`src/i2c_bsp/i2c_bsp.h`](src/i2c_bsp/i2c_bsp.h), [`src/i2c_bsp/i2c_bsp.c`](src/i2c_bsp/i2c_bsp.c), [`src/tca9554/esp_io_expander_tca9554.c`](src/tca9554/esp_io_expander_tca9554.c), [`src/esp_codec_dev/platform/audio_codec_ctrl_i2c.c`](src/esp_codec_dev/platform/audio_codec_ctrl_i2c.c), [`src/beam_imu_bsp/sen0696_driver.cpp`](src/beam_imu_bsp/sen0696_driver.cpp), [`src/imu_bsp/imu_bsp.c`](src/imu_bsp/imu_bsp.c), [`src/lvgl_port/lvgl_port.c`](src/lvgl_port/lvgl_port.c), [`src/axp2101_bsp/axp2101_bsp.c`](src/axp2101_bsp/axp2101_bsp.c), [`user_config.h`](user_config.h) `v0.8.18`):**
+  - Root-caused the persistent `test/_052` `SDA=0` touchscreen lockups (where runtime `18-SCL` failed `964/967` times while boot `i2c_bsp_reinit_bus()` recovered on Attempt #1 without cycling battery-backed slaves):
+    1. Updated [`i2c_bsp_gpio_bus_clear()`](src/i2c_bsp/i2c_bsp.c) to pre-drive `SCL`/`SDA` HIGH before `gpio_config()` (eliminating synthetic `START` LOW glitches), skip clocking completely when `SDA=1 && SCL=1` (preventing the `18:57:25` `SDA=1 -> SDA=0` transition), and clock up to `3 x 9` pulses with brief clock-stretch checks and early `STOP` exit once `SDA` releases.
+    2. Added registered external `I2C0` detach/reattach hooks (`i2c_bsp_register_bus_hooks()`) for `TCA9554` (`0x20`, preserving cached direction/output registers) and `ES8311` (`0x18`) so runtime [`i2c_bsp_reinit_bus()`](src/i2c_bsp/i2c_bsp.c) tears down and recreates the `I2C_NUM_0` peripheral (`i2c_del_master_bus()` -> `i2c_bsp_gpio_bus_clear()` -> `i2c_new_master_bus()`) cleanly whenever Tier-1 GPIO clear + `i2c_master_bus_reset()` leaves `SDA=0` or `>= 6` consecutive timeouts occur (`5 s` cooldown).
+  - Extracted shared `i2c_bsp_has_sentinel_run()` / `i2c_bsp_has_sentinel_tail()` helpers and applied `0x61`/`0x71` glitch filtering across `Touch(0x3B)`, `QMI8658(0x6B)`, `SEN0696(0x4A)`, and `AXP2101(0x34)` `STATUS1/STATUS2` (`0x00 0x00` & sentinel rejection) to prevent Roll spikes (`+3.01g/+389 dps`), corrupt `[TOUCH UP]` logs, and false `USB -> BATTERY` transitions.
+
 ## [generate_rf_heatmap_kml.py v1.0.2] - 2026-11-17
 ### Changed
 - **Above-Canopy `relativeToGround` Layering (`--agl-m`, default `35.0`):** Elevated KML layers above 3D photogrammetry tree canopies with stepped vertical offsets (`35.0 m` rings -> `36.0 m` discs -> `37.5 m` tracks -> `39.0 m` parcel boundaries/ties interpolated `<= 40 m` -> `40.0 m` pins), upgraded deadzone slate-gray/silver contrast, added `wpPinStyle` `<StyleMap>` hover-only labels to eliminate center text pileups, and verified both `relativeToGround` and `--agl-m 0` (`clampToGround`) modes in `--self-test`.

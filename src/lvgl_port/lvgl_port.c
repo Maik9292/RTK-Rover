@@ -335,15 +335,16 @@ static void TouchInputReadCallback(lv_indev_t *indev, lv_indev_data_t *indevData
     uint8_t read_touchpad_cmd[11] = {0xb5, 0xab, 0xa5, 0x5a, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00};
     uint8_t buff[14] = {0};
 
+    bool corrupt_sentinel = false;
     esp_err_t err = i2c_master_write_read_dev(disp_touch_dev_handle, read_touchpad_cmd, 11, buff, 14);
     if (err == ESP_OK) {
         err_streak = 0;
-        // Reject corrupt all-0x71 I2C tail glitches in addition to 0xFF invalid frames
-        bool corrupt_71 = (buff[2] == 0x71 && buff[3] == 0x71 && buff[4] == 0x71 && buff[5] == 0x71);
+        // Reject corrupt 0x61 / 0x71 repeated-sentinel I2C glitches in addition to 0xFF invalid frames
+        corrupt_sentinel = i2c_bsp_has_sentinel_run(buff, 6U, 2U);
         // buff[0]: gesture (0xFF = invalid), buff[1]: touch points (1..2)
         // buff[2] bits [7:6]: event flag (0x80 = contact/down, 0x40 = release/up)
         uint8_t event_flag = (buff[2] >> 6) & 0x03;
-        if (!corrupt_71 && buff[0] != 0xFF && buff[1] >= 1 && buff[1] <= 2 && event_flag != 0x01) {
+        if (!corrupt_sentinel && buff[0] != 0xFF && buff[1] >= 1 && buff[1] <= 2 && event_flag != 0x01) {
             uint16_t pointX = (((uint16_t)buff[2] & 0x0F) << 8) | (uint16_t)buff[3];
             uint16_t pointY = (((uint16_t)buff[4] & 0x0F) << 8) | (uint16_t)buff[5];
             if (pointX >= ROVER_LCD_H_RES) pointX = ROVER_LCD_H_RES - 1;
@@ -369,7 +370,7 @@ static void TouchInputReadCallback(lv_indev_t *indev, lv_indev_data_t *indevData
             }
             prev_state = LV_INDEV_STATE_PRESSED;
             return;
-        } else if (!corrupt_71 && buff[1] >= 1 && buff[0] == 0xFF && current_settings.enable_touch_logging) {
+        } else if (!corrupt_sentinel && buff[1] >= 1 && buff[0] == 0xFF && current_settings.enable_touch_logging) {
             rover_printf("[TOUCH REJECTED: buff[0]==0xFF] pts=%u evt=%u\n", buff[1], event_flag);
         }
     } else {
@@ -385,7 +386,7 @@ static void TouchInputReadCallback(lv_indev_t *indev, lv_indev_data_t *indevData
     indevData->point.y = last_y;
     indevData->state   = LV_INDEV_STATE_RELEASED;
 
-    if (current_settings.enable_touch_logging && prev_state == LV_INDEV_STATE_PRESSED) {
+    if (current_settings.enable_touch_logging && prev_state == LV_INDEV_STATE_PRESSED && err == ESP_OK && !corrupt_sentinel) {
         uint8_t event_flag = (buff[2] >> 6) & 0x03;
         rover_printf("[TOUCH UP]   (%d, %d) | buf: %02X %02X %02X %02X %02X %02X | evt:%u pts:%u\n",
                      last_x, last_y, buff[0], buff[1], buff[2], buff[3], buff[4], buff[5],

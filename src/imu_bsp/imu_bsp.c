@@ -74,6 +74,22 @@ void imu_init(void)
     }
 }
 
+static bool imu_raw_is_corrupt(const uint8_t *raw)
+{
+    if (i2c_bsp_has_sentinel_run(raw, 12U, 2U)) {
+        return true;
+    }
+    // Reject mixed-word 0x60/0x61/0x70/0x71 corruption glitches (>=2 axes >=3g or >=384 dps simultaneously)
+    uint8_t sentinel_hi_axes = 0;
+    for (int axis = 0; axis < 6; axis++) {
+        uint8_t hi = raw[axis * 2 + 1];
+        if (hi == 0x60U || hi == 0x61U || hi == 0x70U || hi == 0x71U) {
+            sentinel_hi_axes++;
+        }
+    }
+    return (sentinel_hi_axes >= 2U);
+}
+
 void imu_read(float *acc, float *gyr, int16_t *temp)
 {
     static float last_acc[3] = {0.0f, 0.0f, 1.0f};
@@ -85,7 +101,7 @@ void imu_read(float *acc, float *gyr, int16_t *temp)
     // Address auto-increment reads AX_L, AX_H, AY_L, AY_H, AZ_L, AZ_H, GX_L, GX_H, GY_L, GY_H, GZ_L, GZ_H in one I2C transaction.
     uint8_t raw[12] = {0};
     uint8_t err = i2c_read_buff(imu_dev_handle, 0x35, raw, 12);
-    if (err == 0) {
+    if (err == 0 && !imu_raw_is_corrupt(raw)) {
         int16_t ax = (int16_t)(((uint16_t)raw[1] << 8) | raw[0]);
         int16_t ay = (int16_t)(((uint16_t)raw[3] << 8) | raw[2]);
         int16_t az = (int16_t)(((uint16_t)raw[5] << 8) | raw[4]);

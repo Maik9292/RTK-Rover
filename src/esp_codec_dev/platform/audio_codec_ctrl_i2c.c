@@ -26,6 +26,35 @@ typedef struct {
 #endif
 } i2c_ctrl_t;
 
+#ifdef USE_IDF_I2C_MASTER
+static void _codec_i2c_detach(i2c_master_bus_handle_t bus_handle, void *ctx)
+{
+    (void)bus_handle;
+    i2c_ctrl_t *i2c_ctrl = (i2c_ctrl_t *)ctx;
+    if (i2c_ctrl != NULL && i2c_ctrl->dev_handle != NULL) {
+        i2c_master_bus_rm_device(i2c_ctrl->dev_handle);
+        i2c_ctrl->dev_handle = NULL;
+    }
+}
+
+static void _codec_i2c_reattach(i2c_master_bus_handle_t new_bus, void *ctx)
+{
+    i2c_ctrl_t *i2c_ctrl = (i2c_ctrl_t *)ctx;
+    if (i2c_ctrl == NULL || new_bus == NULL) {
+        return;
+    }
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = (i2c_ctrl->addr >> 1),
+        .scl_speed_hz = DEFAULT_I2C_CLOCK,
+        .scl_wait_us = 20000,
+    };
+    if (i2c_master_bus_add_device(new_bus, &dev_cfg, &i2c_ctrl->dev_handle) != ESP_OK) {
+        i2c_ctrl->dev_handle = NULL;
+    }
+}
+#endif
+
 static int _i2c_ctrl_open(const audio_codec_ctrl_if_t *ctrl, void *cfg, int cfg_size)
 {
     if (ctrl == NULL || cfg == NULL || cfg_size != sizeof(audio_codec_i2c_cfg_t)) {
@@ -46,6 +75,9 @@ static int _i2c_ctrl_open(const audio_codec_ctrl_if_t *ctrl, void *cfg, int cfg_
         .scl_wait_us = 20000,
     };
     int ret = i2c_master_bus_add_device(i2c_cfg->bus_handle, &dev_cfg, &i2c_ctrl->dev_handle);
+    if (ret == ESP_OK) {
+        (void)i2c_bsp_register_bus_hooks(_codec_i2c_detach, _codec_i2c_reattach, i2c_ctrl);
+    }
     return (ret == ESP_OK) ? 0 : ESP_CODEC_DEV_DRV_ERR;
 #else
     return 0;
@@ -74,9 +106,13 @@ static int _i2c_master_read_reg(i2c_ctrl_t *i2c_ctrl, int addr, int addr_len, vo
     if (!i2c_bsp_lock(200)) {
         return ESP_CODEC_DEV_READ_FAIL;
     }
+    if (i2c_ctrl->dev_handle == NULL) {
+        i2c_bsp_unlock();
+        return ESP_CODEC_DEV_READ_FAIL;
+    }
     int ret = i2c_master_transmit_receive(i2c_ctrl->dev_handle, addr_data, addr_len, data, data_len, DEFAULT_I2C_TRANS_TIMEOUT);
+    i2c_bsp_report_status(i2c_ctrl->dev_handle, "CodecRead", ret);
     if (ret != ESP_OK) {
-        i2c_bsp_recover_bus();
         ESP_LOGE(TAG, "Fail to read from dev %x", i2c_ctrl->addr);
     }
     i2c_bsp_unlock();
@@ -104,10 +140,12 @@ static int _i2c_master_write_reg(i2c_ctrl_t *i2c_ctrl, int addr, int addr_len, v
         if (!i2c_bsp_lock(200)) {
             return ESP_CODEC_DEV_WRITE_FAIL;
         }
-        ret = i2c_master_transmit(i2c_ctrl->dev_handle, write_data, len, DEFAULT_I2C_TRANS_TIMEOUT);
-        if (ret != ESP_OK) {
-            i2c_bsp_recover_bus();
+        if (i2c_ctrl->dev_handle == NULL) {
+            i2c_bsp_unlock();
+            return ESP_CODEC_DEV_WRITE_FAIL;
         }
+        ret = i2c_master_transmit(i2c_ctrl->dev_handle, write_data, len, DEFAULT_I2C_TRANS_TIMEOUT);
+        i2c_bsp_report_status(i2c_ctrl->dev_handle, "CodecWrite", ret);
         i2c_bsp_unlock();
     }
     if (ret != 0) {
@@ -195,8 +233,10 @@ static int _i2c_ctrl_close(const audio_codec_ctrl_if_t *ctrl)
     }
     i2c_ctrl_t *i2c_ctrl = (i2c_ctrl_t *) ctrl;
 #ifdef USE_IDF_I2C_MASTER
+    i2c_bsp_unregister_bus_hooks(i2c_ctrl);
     if (i2c_ctrl->dev_handle) {
         i2c_master_bus_rm_device(i2c_ctrl->dev_handle);
+        i2c_ctrl->dev_handle = NULL;
     }
 #endif
     i2c_ctrl->is_open = false;

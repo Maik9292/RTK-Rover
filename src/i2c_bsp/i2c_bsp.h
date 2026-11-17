@@ -2,12 +2,15 @@
 #define I2C_BSP_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "driver/i2c_master.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+typedef void (*i2c_bsp_bus_hook_t)(i2c_master_bus_handle_t bus_handle, void *ctx);
 
 extern i2c_master_bus_handle_t user_i2c_port0_handle;
 extern i2c_master_dev_handle_t disp_touch_dev_handle;
@@ -23,6 +26,10 @@ void i2c_bsp_reinit_bus(void);
 void i2c_bsp_recover_bus(void);
 bool i2c_bsp_attach_beam_imu(uint8_t addr_7bit);
 void i2c_bsp_detach_beam_imu(void);
+bool i2c_bsp_register_bus_hooks(i2c_bsp_bus_hook_t detach_fn, i2c_bsp_bus_hook_t reattach_fn, void *ctx);
+void i2c_bsp_unregister_bus_hooks(void *ctx);
+bool i2c_bsp_has_sentinel_run(const uint8_t *buf, size_t len, size_t min_run);
+bool i2c_bsp_has_sentinel_tail(const uint8_t *buf, size_t len, size_t tail_len);
 void i2c_bsp_report_status(i2c_master_dev_handle_t dev_handle, const char *action, int err_code);
 bool i2c_bsp_lock(uint32_t timeout_ms);
 void i2c_bsp_unlock(void);

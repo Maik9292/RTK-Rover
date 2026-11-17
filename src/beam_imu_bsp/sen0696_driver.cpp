@@ -55,20 +55,6 @@ int32_t parse_s32_le(const uint8_t *buf)
     return (int32_t)raw;
 }
 
-// Reject corrupt reads whose tail was overwritten with repeated 0x71 sentinel bytes
-bool has_corrupt_tail_0x71(const uint8_t *buf, size_t len, size_t min_run)
-{
-    if (len < min_run) {
-        return false;
-    }
-    for (size_t i = len - min_run; i < len; ++i) {
-        if (buf[i] != 0x71U) {
-            return false;
-        }
-    }
-    return true;
-}
-
 bool sen0696_write_reg16(uint16_t reg16, uint16_t val16)
 {
     uint8_t tx[4] = {
@@ -158,7 +144,9 @@ void sen0696_read_acc_gyr_block(sen0696_state_t *st)
 {
     st->accel_gyro_valid = false;
     uint8_t imu_raw[12] = {0};
-    if (!sen0696_read_reg(kRegAccDataX, imu_raw, sizeof(imu_raw)) || has_corrupt_tail_0x71(imu_raw, sizeof(imu_raw), 4U)) {
+    if (!sen0696_read_reg(kRegAccDataX, imu_raw, sizeof(imu_raw)) ||
+        i2c_bsp_has_sentinel_tail(imu_raw, sizeof(imu_raw), 4U) ||
+        i2c_bsp_has_sentinel_run(imu_raw, sizeof(imu_raw), 4U)) {
         return;
     }
 
@@ -183,7 +171,9 @@ void sen0696_read_mag_block(sen0696_state_t *st)
 {
     st->mag_valid = false;
     uint8_t mag_raw[12] = {0};
-    if (!sen0696_read_reg(kRegMagDataXLowWord, mag_raw, sizeof(mag_raw)) || has_corrupt_tail_0x71(mag_raw, sizeof(mag_raw), 4U)) {
+    if (!sen0696_read_reg(kRegMagDataXLowWord, mag_raw, sizeof(mag_raw)) ||
+        i2c_bsp_has_sentinel_tail(mag_raw, sizeof(mag_raw), 4U) ||
+        i2c_bsp_has_sentinel_run(mag_raw, sizeof(mag_raw), 4U)) {
         return;
     }
 
@@ -209,7 +199,8 @@ void sen0696_read_press_block(bool allow_press_retry, sen0696_state_t *st)
 {
     st->press_valid = false;
     uint8_t press_raw[4] = {0};
-    if (!sen0696_read_reg(kRegPressDataLowWord, press_raw, sizeof(press_raw))) {
+    if (!sen0696_read_reg(kRegPressDataLowWord, press_raw, sizeof(press_raw)) ||
+        i2c_bsp_has_sentinel_tail(press_raw, sizeof(press_raw), 3U)) {
         return;
     }
 

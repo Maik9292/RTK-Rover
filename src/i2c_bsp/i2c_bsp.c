@@ -21,6 +21,16 @@ i2c_master_dev_handle_t beam_imu_dev_handle   = NULL;
 static uint8_t s_beam_imu_addr = 0;
 static uint8_t s_consec_bus_timeouts = 0;
 static uint32_t s_last_gpio_clear_ms = 0;
+static uint32_t s_last_reinit_ms = 0;
+
+#define I2C_BSP_MAX_BUS_HOOKS 4
+typedef struct {
+    i2c_bsp_bus_hook_t detach_fn;
+    i2c_bsp_bus_hook_t reattach_fn;
+    void *ctx;
+} i2c_bsp_bus_hook_entry_t;
+
+static i2c_bsp_bus_hook_entry_t s_bus_hooks[I2C_BSP_MAX_BUS_HOOKS] = {0};
 
 static SemaphoreHandle_t i2c_bus_mutex = NULL;
 static uint32_t i2c_data_pdMS_TICKS = 0;
@@ -53,21 +63,118 @@ static const char* i2c_dev_name(i2c_master_dev_handle_t h)
     return "I2C_DEV";
 }
 
-static void i2c_bsp_runtime_gpio_bus_clear_locked(void)
+static bool is_corrupt_sentinel_byte(uint8_t b)
 {
-    // Temporarily detach I2C0 peripheral output matrix so open-drain GPIO clocking controls SCL/SDA directly
+    return (b == 0x61U || b == 0x71U);
+}
+
+bool i2c_bsp_has_sentinel_run(const uint8_t *buf, size_t len, size_t min_run)
+{
+    if (buf == NULL || min_run == 0 || len < min_run) {
+        return false;
+    }
+    if (min_run == 1 && is_corrupt_sentinel_byte(buf[0])) {
+        return true;
+    }
+    size_t run = 1;
+    for (size_t i = 1; i < len; i++) {
+        if (buf[i] == buf[i - 1] && is_corrupt_sentinel_byte(buf[i])) {
+            run++;
+            if (run >= min_run) {
+                return true;
+            }
+        } else {
+            run = 1;
+        }
+    }
+    return false;
+}
+
+bool i2c_bsp_has_sentinel_tail(const uint8_t *buf, size_t len, size_t tail_len)
+{
+    if (buf == NULL || tail_len == 0 || len < tail_len) {
+        return false;
+    }
+    const uint8_t s = buf[len - tail_len];
+    if (!is_corrupt_sentinel_byte(s)) {
+        return false;
+    }
+    for (size_t i = len - tail_len + 1; i < len; i++) {
+        if (buf[i] != s) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool i2c_bsp_register_bus_hooks(i2c_bsp_bus_hook_t detach_fn, i2c_bsp_bus_hook_t reattach_fn, void *ctx)
+{
+    if (detach_fn == NULL && reattach_fn == NULL) {
+        return false;
+    }
+    if (!i2c_bsp_lock(200)) {
+        return false;
+    }
+    int free_idx = -1;
+    for (int i = 0; i < I2C_BSP_MAX_BUS_HOOKS; i++) {
+        if (s_bus_hooks[i].ctx == ctx && s_bus_hooks[i].detach_fn == detach_fn && s_bus_hooks[i].reattach_fn == reattach_fn) {
+            i2c_bsp_unlock();
+            return true;
+        }
+        if (free_idx < 0 && s_bus_hooks[i].detach_fn == NULL && s_bus_hooks[i].reattach_fn == NULL) {
+            free_idx = i;
+        }
+    }
+    if (free_idx < 0) {
+        i2c_bsp_unlock();
+        return false;
+    }
+    s_bus_hooks[free_idx].detach_fn = detach_fn;
+    s_bus_hooks[free_idx].reattach_fn = reattach_fn;
+    s_bus_hooks[free_idx].ctx = ctx;
+    i2c_bsp_unlock();
+    return true;
+}
+
+void i2c_bsp_unregister_bus_hooks(void *ctx)
+{
+    if (!i2c_bsp_lock(200)) {
+        return;
+    }
+    for (int i = 0; i < I2C_BSP_MAX_BUS_HOOKS; i++) {
+        if (s_bus_hooks[i].ctx == ctx) {
+            s_bus_hooks[i].detach_fn = NULL;
+            s_bus_hooks[i].reattach_fn = NULL;
+            s_bus_hooks[i].ctx = NULL;
+        }
+    }
+    i2c_bsp_unlock();
+}
+
+static bool i2c_bsp_runtime_gpio_bus_clear_locked(int *sda_gpio_after_out)
+{
+    // Pre-drive HIGH output latch before detaching I2CEXT0 so switching to open-drain never glitches LOW
+    gpio_set_level(ROVER_PIN_I2C0_SCL, 1);
+    gpio_set_level(ROVER_PIN_I2C0_SDA, 1);
     esp_rom_gpio_connect_out_signal(ROVER_PIN_I2C0_SCL, SIG_GPIO_OUT_IDX, false, false);
     esp_rom_gpio_connect_out_signal(ROVER_PIN_I2C0_SDA, SIG_GPIO_OUT_IDX, false, false);
 
     i2c_bsp_gpio_bus_clear();
 
-    // Restore open-drain levels and reattach GPIO7/8 to I2CEXT0 without deleting live TCA9554/ES8311 handles
+    int sda_gpio_after = gpio_get_level(ROVER_PIN_I2C0_SDA);
+    int scl_gpio_after = gpio_get_level(ROVER_PIN_I2C0_SCL);
+    if (sda_gpio_after_out != NULL) {
+        *sda_gpio_after_out = sda_gpio_after;
+    }
+
+    // Restore open-drain levels and reattach GPIO7/8 to I2CEXT0
     gpio_set_level(ROVER_PIN_I2C0_SCL, 1);
     gpio_set_level(ROVER_PIN_I2C0_SDA, 1);
     esp_rom_gpio_connect_out_signal(ROVER_PIN_I2C0_SCL, I2CEXT0_SCL_OUT_IDX, false, false);
     esp_rom_gpio_connect_in_signal(ROVER_PIN_I2C0_SCL, I2CEXT0_SCL_IN_IDX, false);
     esp_rom_gpio_connect_out_signal(ROVER_PIN_I2C0_SDA, I2CEXT0_SDA_OUT_IDX, false, false);
     esp_rom_gpio_connect_in_signal(ROVER_PIN_I2C0_SDA, I2CEXT0_SDA_IN_IDX, false);
+    return (sda_gpio_after == 1 && scl_gpio_after == 1);
 }
 
 static void i2c_bus_recover_locked(const char *action, i2c_master_dev_handle_t dev_handle, int reg, esp_err_t err)
@@ -90,32 +197,67 @@ static void i2c_bus_recover_locked(const char *action, i2c_master_dev_handle_t d
         s_consec_bus_timeouts++;
     }
 
-    if (user_i2c_port0_handle != NULL) {
-        if (s_consec_bus_timeouts >= 3 && (now - s_last_gpio_clear_ms >= 2000U)) {
-            int sda_before = gpio_get_level(ROVER_PIN_I2C0_SDA);
-            int scl_before = gpio_get_level(ROVER_PIN_I2C0_SCL);
-            s_last_gpio_clear_ms = now;
-            s_consec_bus_timeouts = 0;
-            rover_printf("[I2C RECOVER] %u consecutive bus stalls -> running 18-SCL GPIO bus-clear (SDA=%d SCL=%d)\n",
-                         3U, sda_before, scl_before);
-            i2c_bsp_runtime_gpio_bus_clear_locked();
-            rover_printf("[I2C RECOVER] Runtime 18-SCL bus-clear complete (SDA=%d SCL=%d)\n",
-                         gpio_get_level(ROVER_PIN_I2C0_SDA),
-                         gpio_get_level(ROVER_PIN_I2C0_SCL));
+    if (user_i2c_port0_handle == NULL) {
+        return;
+    }
+
+    bool escalate_reinit = false;
+    int sda_before = gpio_get_level(ROVER_PIN_I2C0_SDA);
+    int scl_before = gpio_get_level(ROVER_PIN_I2C0_SCL);
+
+    // Tier 1: Only run open-drain GPIO clocking if SDA or SCL is actually held LOW; never disturb idle SDA=1/SCL=1
+    if ((s_consec_bus_timeouts >= 3 || sda_before == 0 || scl_before == 0) &&
+        (now - s_last_gpio_clear_ms >= 1500U)) {
+        s_last_gpio_clear_ms = now;
+        int sda_gpio_after = sda_before;
+        if (sda_before == 0 || scl_before == 0) {
+            rover_printf("[I2C RECOVER] %u consecutive bus stalls -> running GPIO bus-clear (SDA=%d SCL=%d)\n",
+                         (unsigned int)s_consec_bus_timeouts, sda_before, scl_before);
+            (void)i2c_bsp_runtime_gpio_bus_clear_locked(&sda_gpio_after);
         }
         i2c_master_bus_reset(user_i2c_port0_handle);
-        // Settle delay while holding mutex so subsequent tasks do not collide with recovering lines
         vTaskDelay(pdMS_TO_TICKS(5));
+        int sda_after = gpio_get_level(ROVER_PIN_I2C0_SDA);
+        int scl_after = gpio_get_level(ROVER_PIN_I2C0_SCL);
+        if (sda_before == 0 || scl_before == 0) {
+            rover_printf("[I2C RECOVER] Runtime bus-clear complete (GPIO SDA=%d | I2C SDA=%d SCL=%d)\n",
+                         sda_gpio_after, sda_after, scl_after);
+        }
+        if (sda_after == 0 || scl_after == 0 || s_consec_bus_timeouts >= 6) {
+            escalate_reinit = true;
+        }
+    } else {
+        i2c_master_bus_reset(user_i2c_port0_handle);
+        vTaskDelay(pdMS_TO_TICKS(5));
+        if (s_consec_bus_timeouts >= 6) {
+            escalate_reinit = true;
+        }
+    }
+
+    // Tier 2: Persistent stall (or peripheral matrix stuck LOW) -> full ESP-IDF I2C0 peripheral teardown & reinit
+    if (escalate_reinit && (now - s_last_reinit_ms >= 5000U)) {
+        s_last_reinit_ms = now;
+        s_consec_bus_timeouts = 0;
+        rover_printf("[I2C RECOVER] Persistent stall (SDA=%d SCL=%d) -> running full I2C0 peripheral reinit\n",
+                     gpio_get_level(ROVER_PIN_I2C0_SDA),
+                     gpio_get_level(ROVER_PIN_I2C0_SCL));
+        i2c_bsp_reinit_bus();
+        rover_printf("[I2C RECOVER] Full I2C0 reinit complete (SDA=%d SCL=%d)\n",
+                     gpio_get_level(ROVER_PIN_I2C0_SDA),
+                     gpio_get_level(ROVER_PIN_I2C0_SCL));
     }
 }
 
 // NXP I2C Spec UM10204 Section 3.1.16 Bus Clear:
-// Because the AXP2101 LiPo UPS keeps all 6 I2C0 slave chips continuously powered across
-// ESP32 warm resets (esptool flash reset, RTC_SW_CPU_RST, or RST button), a reset mid-read
-// leaves a slave holding SDA (GPIO 8) LOW waiting for SCL clocks. Clocking 18 SCL pulses
-// with SDA released HIGH followed by an explicit STOP cleanly releases any wedged slave.
+// Because the AXP2101 LiPo UPS keeps all I2C0 slave chips continuously powered across
+// ESP32 warm resets, an interrupted read can leave a slave holding SDA (GPIO 8) LOW.
+// Pre-drive HIGH before configuring open-drain to avoid synthetic START glitches, and
+// skip clocking completely if SDA and SCL are already idle HIGH.
 void i2c_bsp_gpio_bus_clear(void)
 {
+    gpio_set_level(ROVER_PIN_I2C0_SCL, 1);
+    gpio_set_level(ROVER_PIN_I2C0_SDA, 1);
+
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << ROVER_PIN_I2C0_SCL) | (1ULL << ROVER_PIN_I2C0_SDA),
         .mode = GPIO_MODE_INPUT_OUTPUT_OD,
@@ -126,25 +268,45 @@ void i2c_bsp_gpio_bus_clear(void)
     gpio_config(&io_conf);
     gpio_set_level(ROVER_PIN_I2C0_SCL, 1);
     gpio_set_level(ROVER_PIN_I2C0_SDA, 1);
-    esp_rom_delay_us(200);
+    esp_rom_delay_us(50);
 
-    // Clock up to 18 SCL pulses (~50 kHz) so any interrupted slave shifts out remaining bits + NACK
-    for (int i = 0; i < 18; i++) {
-        gpio_set_level(ROVER_PIN_I2C0_SCL, 0);
-        esp_rom_delay_us(10);
-        gpio_set_level(ROVER_PIN_I2C0_SCL, 1);
-        esp_rom_delay_us(10);
+    // Do not clock an already-idle bus (avoids shifting slaves during benign stalls)
+    if (gpio_get_level(ROVER_PIN_I2C0_SDA) == 1 && gpio_get_level(ROVER_PIN_I2C0_SCL) == 1) {
+        return;
     }
 
-    // Generate explicit I2C STOP condition (SDA LOW -> SCL HIGH -> SDA HIGH)
-    gpio_set_level(ROVER_PIN_I2C0_SCL, 0);
-    esp_rom_delay_us(10);
-    gpio_set_level(ROVER_PIN_I2C0_SDA, 0);
-    esp_rom_delay_us(10);
-    gpio_set_level(ROVER_PIN_I2C0_SCL, 1);
-    esp_rom_delay_us(10);
+    // Clock up to 3 x 9 SCL pulses (~50 kHz), stopping cleanly once SDA releases HIGH and STOP succeeds
+    for (int chunk = 0; chunk < 3; chunk++) {
+        if (gpio_get_level(ROVER_PIN_I2C0_SDA) == 1) {
+            break;
+        }
+        for (int i = 0; i < 9; i++) {
+            gpio_set_level(ROVER_PIN_I2C0_SCL, 0);
+            esp_rom_delay_us(10);
+            gpio_set_level(ROVER_PIN_I2C0_SCL, 1);
+            for (int w = 0; w < 10 && gpio_get_level(ROVER_PIN_I2C0_SCL) == 0; w++) {
+                esp_rom_delay_us(10);
+            }
+            esp_rom_delay_us(10);
+        }
+        if (gpio_get_level(ROVER_PIN_I2C0_SDA) == 1) {
+            gpio_set_level(ROVER_PIN_I2C0_SCL, 0);
+            esp_rom_delay_us(10);
+            gpio_set_level(ROVER_PIN_I2C0_SDA, 0);
+            esp_rom_delay_us(10);
+            gpio_set_level(ROVER_PIN_I2C0_SCL, 1);
+            esp_rom_delay_us(10);
+            gpio_set_level(ROVER_PIN_I2C0_SDA, 1);
+            esp_rom_delay_us(100);
+            if (gpio_get_level(ROVER_PIN_I2C0_SDA) == 1) {
+                break;
+            }
+        }
+    }
+
     gpio_set_level(ROVER_PIN_I2C0_SDA, 1);
-    esp_rom_delay_us(200);
+    gpio_set_level(ROVER_PIN_I2C0_SCL, 1);
+    esp_rom_delay_us(50);
 }
 
 void i2c_bsp_recover_bus(void)
@@ -268,18 +430,43 @@ void i2c_bsp_reinit_bus(void)
     if (!i2c_bsp_lock(500)) {
         return;
     }
+    for (int i = 0; i < I2C_BSP_MAX_BUS_HOOKS; i++) {
+        if (s_bus_hooks[i].detach_fn != NULL && user_i2c_port0_handle != NULL) {
+            s_bus_hooks[i].detach_fn(user_i2c_port0_handle, s_bus_hooks[i].ctx);
+        }
+    }
     if (rtc_dev_handle)        { i2c_master_bus_rm_device(rtc_dev_handle);        rtc_dev_handle = NULL; }
     if (imu_dev_handle)        { i2c_master_bus_rm_device(imu_dev_handle);        imu_dev_handle = NULL; }
     if (disp_touch_dev_handle) { i2c_master_bus_rm_device(disp_touch_dev_handle); disp_touch_dev_handle = NULL; }
     if (axp2101_dev_handle)    { i2c_master_bus_rm_device(axp2101_dev_handle);    axp2101_dev_handle = NULL; }
     if (mag_dev_handle)        { i2c_master_bus_rm_device(mag_dev_handle);        mag_dev_handle = NULL; }
     if (beam_imu_dev_handle)   { i2c_master_bus_rm_device(beam_imu_dev_handle);   beam_imu_dev_handle = NULL; }
-    if (user_i2c_port0_handle) { i2c_del_master_bus(user_i2c_port0_handle);      user_i2c_port0_handle = NULL; }
-    vTaskDelay(pdMS_TO_TICKS(10));
-    i2c_master_Init();
+
+    esp_err_t del_err = ESP_OK;
+    if (user_i2c_port0_handle != NULL) {
+        del_err = i2c_del_master_bus(user_i2c_port0_handle);
+        if (del_err != ESP_OK) {
+            rover_printf("[I2C WARN] i2c_del_master_bus returned err=0x%X; falling back to bus_reset\n",
+                         (unsigned int)del_err);
+            i2c_master_bus_reset(user_i2c_port0_handle);
+        } else {
+            user_i2c_port0_handle = NULL;
+        }
+    }
+
+    if (user_i2c_port0_handle == NULL) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        i2c_master_Init();
+    }
     if (s_beam_imu_addr != 0) {
         (void)i2c_bsp_attach_beam_imu_locked(s_beam_imu_addr);
     }
+    for (int i = 0; i < I2C_BSP_MAX_BUS_HOOKS; i++) {
+        if (s_bus_hooks[i].reattach_fn != NULL && user_i2c_port0_handle != NULL) {
+            s_bus_hooks[i].reattach_fn(user_i2c_port0_handle, s_bus_hooks[i].ctx);
+        }
+    }
+    s_consec_bus_timeouts = 0;
     i2c_bsp_unlock();
 }
 
@@ -322,6 +509,10 @@ uint8_t i2c_write_buff(i2c_master_dev_handle_t dev_handle, int reg, uint8_t *buf
     if (!i2c_bsp_lock(200)) {
         return 1;
     }
+    if (dev_handle == NULL) {
+        i2c_bsp_unlock();
+        return 1;
+    }
     esp_err_t ret;
     if (reg == -1) {
         ret = i2c_master_transmit(dev_handle, buf, len, i2c_data_pdMS_TICKS);
@@ -347,6 +538,10 @@ uint8_t i2c_master_write_read_dev(i2c_master_dev_handle_t dev_handle, uint8_t *w
     if (!i2c_bsp_lock(200)) {
         return 1;
     }
+    if (dev_handle == NULL) {
+        i2c_bsp_unlock();
+        return 1;
+    }
     esp_err_t ret = i2c_master_transmit_receive(dev_handle, writeBuf, writeLen, readBuf, readLen, i2c_data_pdMS_TICKS);
     if (ret == ESP_OK) {
         s_consec_bus_timeouts = 0;
@@ -360,6 +555,10 @@ uint8_t i2c_master_write_read_dev(i2c_master_dev_handle_t dev_handle, uint8_t *w
 uint8_t i2c_read_buff(i2c_master_dev_handle_t dev_handle, int reg, uint8_t *buf, uint8_t len)
 {
     if (!i2c_bsp_lock(200)) {
+        return 1;
+    }
+    if (dev_handle == NULL) {
+        i2c_bsp_unlock();
         return 1;
     }
     esp_err_t ret;

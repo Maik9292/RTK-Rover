@@ -39,11 +39,49 @@ typedef struct {
     esp_io_expander_t base;
     i2c_master_bus_handle_t i2c_bus;
     i2c_master_dev_handle_t i2c_handle;
+    uint32_t dev_addr;
     struct {
         uint8_t direction;
         uint8_t output;
     } regs;
 } esp_io_expander_tca9554_t;
+
+static void tca9554_bus_detach(i2c_master_bus_handle_t bus_handle, void *ctx)
+{
+    (void)bus_handle;
+    esp_io_expander_tca9554_t *tca9554 = (esp_io_expander_tca9554_t *)ctx;
+    if (tca9554 == NULL) {
+        return;
+    }
+    if (tca9554->i2c_handle != NULL) {
+        i2c_master_bus_rm_device(tca9554->i2c_handle);
+        tca9554->i2c_handle = NULL;
+    }
+    tca9554->i2c_bus = NULL;
+}
+
+static void tca9554_bus_reattach(i2c_master_bus_handle_t new_bus, void *ctx)
+{
+    esp_io_expander_tca9554_t *tca9554 = (esp_io_expander_tca9554_t *)ctx;
+    if (tca9554 == NULL || new_bus == NULL) {
+        return;
+    }
+    tca9554->i2c_bus = new_bus;
+    const i2c_device_config_t i2c_dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = tca9554->dev_addr,
+        .scl_speed_hz = I2C_CLK_SPEED,
+        .scl_wait_us = 20000,
+    };
+    if (i2c_master_bus_add_device(new_bus, &i2c_dev_cfg, &tca9554->i2c_handle) == ESP_OK) {
+        uint8_t out_data[] = {OUTPUT_REG_ADDR, tca9554->regs.output};
+        uint8_t dir_data[] = {DIRECTION_REG_ADDR, tca9554->regs.direction};
+        (void)i2c_master_transmit(tca9554->i2c_handle, out_data, sizeof(out_data), I2C_TIMEOUT_MS);
+        (void)i2c_master_transmit(tca9554->i2c_handle, dir_data, sizeof(dir_data), I2C_TIMEOUT_MS);
+    } else {
+        tca9554->i2c_handle = NULL;
+    }
+}
 
 static char *TAG = "tca9554";
 
@@ -64,6 +102,7 @@ esp_err_t esp_io_expander_new_i2c_tca9554(i2c_master_bus_handle_t i2c_bus, uint3
     ESP_RETURN_ON_FALSE(tca9554 != NULL, ESP_ERR_NO_MEM, TAG, "Malloc failed");
 
     tca9554->i2c_bus = i2c_bus;
+    tca9554->dev_addr = dev_addr;
 
     // Add new I2C device (explicitly configure 20ms scl_wait_us to match shared I2C0 bus clock-stretching allowance)
     esp_err_t ret = ESP_OK;
@@ -88,6 +127,7 @@ esp_err_t esp_io_expander_new_i2c_tca9554(i2c_master_bus_handle_t i2c_bus, uint3
     /* Reset configuration and register status */
     ESP_GOTO_ON_ERROR(reset(&tca9554->base), err1, TAG, "Reset failed");
 
+    (void)i2c_bsp_register_bus_hooks(tca9554_bus_detach, tca9554_bus_reattach, tca9554);
     *handle_ret = &tca9554->base;
     return ESP_OK;
 err1:
@@ -102,6 +142,10 @@ static esp_err_t read_input_reg(esp_io_expander_handle_t handle, uint32_t *value
     esp_io_expander_tca9554_t *tca9554 = (esp_io_expander_tca9554_t *)__containerof(handle, esp_io_expander_tca9554_t, base);
     if (!i2c_bsp_lock(250)) {
         return ESP_ERR_TIMEOUT;
+    }
+    if (tca9554->i2c_handle == NULL) {
+        i2c_bsp_unlock();
+        return ESP_ERR_INVALID_STATE;
     }
 
     uint8_t temp = 0;
@@ -124,6 +168,10 @@ static esp_err_t write_output_reg(esp_io_expander_handle_t handle, uint32_t valu
     value &= 0xff;
     if (!i2c_bsp_lock(250)) {
         return ESP_ERR_TIMEOUT;
+    }
+    if (tca9554->i2c_handle == NULL) {
+        i2c_bsp_unlock();
+        return ESP_ERR_INVALID_STATE;
     }
 
     uint8_t data[] = {OUTPUT_REG_ADDR, (uint8_t)value};
@@ -153,6 +201,10 @@ static esp_err_t write_direction_reg(esp_io_expander_handle_t handle, uint32_t v
     value &= 0xff;
     if (!i2c_bsp_lock(250)) {
         return ESP_ERR_TIMEOUT;
+    }
+    if (tca9554->i2c_handle == NULL) {
+        i2c_bsp_unlock();
+        return ESP_ERR_INVALID_STATE;
     }
 
     uint8_t data[] = {DIRECTION_REG_ADDR, (uint8_t)value};
@@ -187,7 +239,10 @@ static esp_err_t del(esp_io_expander_t *handle)
 {
     esp_io_expander_tca9554_t *tca9554 = (esp_io_expander_tca9554_t *)__containerof(handle, esp_io_expander_tca9554_t, base);
 
-    ESP_RETURN_ON_ERROR(i2c_master_bus_rm_device(tca9554->i2c_handle), TAG, "Remove I2C device failed");
+    i2c_bsp_unregister_bus_hooks(tca9554);
+    if (tca9554->i2c_handle != NULL) {
+        ESP_RETURN_ON_ERROR(i2c_master_bus_rm_device(tca9554->i2c_handle), TAG, "Remove I2C device failed");
+    }
     free(tca9554);
     return ESP_OK;
 }
