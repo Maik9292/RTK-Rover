@@ -7,7 +7,7 @@
 // =========================================================================
 // Firmware Identity & Semantic Versioning
 // =========================================================================
-#define ROVER_FIRMWARE_VERSION "v0.8.14"
+#define ROVER_FIRMWARE_VERSION "v0.8.15"
 
 // =========================================================================
 // Display Configuration (Waveshare ESP32-S3-Touch-LCD-3.5B)
@@ -46,6 +46,8 @@
 #define ROVER_I2C_ADDR_MAG        0x30  // SparkFun Qwiic Micro MMC5983MA 3-Axis 18-bit AMR Compass (Auto-Detected)
 #define ROVER_I2C_ADDR_AXP2101    0x34
 #define ROVER_I2C_ADDR_TOUCH      0x3B
+#define ROVER_I2C_ADDR_BEAM_IMU   0x4A  // DFRobot SEN0696 10DOF IMU (BMI323+BMM350+BMP581, 0x4A..0x4D DIP)
+#define ROVER_I2C_ADDR_BEAM_IMU_MAX 0x4D
 #define ROVER_I2C_ADDR_RTC        0x51
 #define ROVER_I2C_ADDR_IMU        0x6B
 #define ROVER_I2C_ADDR_ES8311     0x18

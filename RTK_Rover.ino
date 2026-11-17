@@ -17,6 +17,7 @@
 #include "src/rtc_bsp/rtc_bsp.h"
 #include "src/imu_bsp/imu_bsp.h"
 #include "src/mag_bsp/mmc5983ma_driver.h"
+#include "src/beam_imu_bsp/sen0696_driver.h"
 #include "src/settings_manager/settings_manager.h"
 #include "src/nav_engine/nav_engine.h"
 #include "src/waypoint_manager/waypoint_manager.h"
@@ -599,6 +600,64 @@ void task_display_and_audio(void *pvParameters)
     }
 }
 
+/**
+ * @brief One-shot boot presence verification and initial readout for DFRobot SEN0696 (10DOF IMU).
+ */
+static void run_beam_10dof_boot_check(void)
+{
+    sen0696_boot_report_t report;
+    (void)sen0696_probe_and_read_once(ROVER_I2C_ADDR_BEAM_IMU, ROVER_I2C_ADDR_BEAM_IMU_MAX, &report);
+
+    if (!report.found) {
+        Serial.printf("[10DOF] DFRobot SEN0696 (0x%02X..0x%02X) not detected on I2C0 -- skipping.\n",
+                      (unsigned)ROVER_I2C_ADDR_BEAM_IMU,
+                      (unsigned)ROVER_I2C_ADDR_BEAM_IMU_MAX);
+        return;
+    }
+
+    if (!report.id_valid) {
+        Serial.printf("[10DOF] Device at 0x%02X failed SEN0696 ID check (VID=0x%04X PID=0x%04X FW=0x%04X).\n",
+                      (unsigned)report.i2c_addr,
+                      (unsigned)report.vid,
+                      (unsigned)report.pid,
+                      (unsigned)report.fw_version);
+        return;
+    }
+
+    Serial.printf("[10DOF] DFRobot SEN0696 found @ 0x%02X | VID=0x%04X%s PID=0x%04X FW=0x%04X | Cfg:%s\n",
+                  (unsigned)report.i2c_addr,
+                  (unsigned)report.vid,
+                  (report.vid == SEN0696_EXPECTED_VID) ? "" : "(unexpected)",
+                  (unsigned)report.pid,
+                  (unsigned)report.fw_version,
+                  report.configured ? "OK" : "ERR");
+
+    if (report.accel_gyro_valid) {
+        float acc_norm = sqrtf((report.accel_g[0] * report.accel_g[0]) +
+                               (report.accel_g[1] * report.accel_g[1]) +
+                               (report.accel_g[2] * report.accel_g[2]));
+        Serial.printf("[10DOF] Accel: X=%.3fg Y=%.3fg Z=%.3fg (|a|=%.3fg) | Gyro: X=%.2fdps Y=%.2fdps Z=%.2fdps\n",
+                      report.accel_g[0], report.accel_g[1], report.accel_g[2], acc_norm,
+                      report.gyro_dps[0], report.gyro_dps[1], report.gyro_dps[2]);
+    } else {
+        Serial.println("[10DOF] Accel/Gyro: READ_ERR");
+    }
+
+    if (report.mag_valid) {
+        Serial.printf("[10DOF] Mag:   X=%.2fuT Y=%.2fuT Z=%.2fuT (|B|=%.2fuT)\n",
+                      report.mag_ut[0], report.mag_ut[1], report.mag_ut[2], report.mag_norm_ut);
+    } else {
+        Serial.println("[10DOF] Mag: READ_ERR");
+    }
+
+    if (report.press_valid) {
+        Serial.printf("[10DOF] Press: %.2f hPa (%.0f Pa, BaroAlt=%.1f m) | Temp: N/A (not in SEN0696 I2C bridge reg map)\n",
+                      report.pressure_hpa, report.pressure_pa, report.altitude_m);
+    } else {
+        Serial.println("[10DOF] Press: READ_ERR | Temp: N/A (not in SEN0696 I2C bridge reg map)");
+    }
+}
+
 // =========================================================================
 // Arduino Setup & Loop
 // =========================================================================
@@ -647,19 +706,23 @@ void setup()
     }
 
     // 2. Scan Shared I2C0 Bus (IO7=SCL, IO8=SDA) & Initialize Onboard + Optional Peripherals
-    Serial.printf("[I2C0 SCAN] TCA9554(0x20):%s | AXP2101(0x34):%s | Touch(0x3B):%s | RTC(0x51):%s | IMU(0x6B):%s | ES8311(0x18):%s | MAG(0x30):%s\n",
+    uint8_t beam_imu_addr = sen0696_detect_i2c_addr(ROVER_I2C_ADDR_BEAM_IMU, ROVER_I2C_ADDR_BEAM_IMU_MAX);
+    Serial.printf("[I2C0 SCAN] TCA9554(0x20):%s | AXP2101(0x34):%s | Touch(0x3B):%s | RTC(0x51):%s | IMU(0x6B):%s | ES8311(0x18):%s | MAG(0x30):%s | 10DOF(0x%02X):%s\n",
                   i2c_bsp_probe_addr(ROVER_I2C_ADDR_TCA9554)         ? "OK" : "--",
                   i2c_bsp_probe_addr(ROVER_I2C_ADDR_AXP2101)         ? "OK" : "--",
                   i2c_bsp_probe_addr(ROVER_I2C_ADDR_TOUCH)           ? "OK" : "--",
                   i2c_bsp_probe_addr(ROVER_I2C_ADDR_RTC)             ? "OK" : "--",
                   i2c_bsp_probe_addr(ROVER_I2C_ADDR_IMU)             ? "OK" : "--",
                   i2c_bsp_probe_addr(ROVER_I2C_ADDR_ES8311)          ? "OK" : "--",
-                  i2c_bsp_probe_optional_addr(ROVER_I2C_ADDR_MAG)    ? "OK" : "--");
+                  i2c_bsp_probe_optional_addr(ROVER_I2C_ADDR_MAG)    ? "OK" : "--",
+                  (unsigned)(beam_imu_addr ? beam_imu_addr : ROVER_I2C_ADDR_BEAM_IMU),
+                  beam_imu_addr                                      ? "OK" : "--");
 
     axp2101_bsp_init();
     rtc_bsp_init();
     imu_init();
     mmc5983ma_init();
+    run_beam_10dof_boot_check();
 
     // 3. Mount Internal FFat & MicroSD Card (CLK=11, CMD=10, D0=9)
     if (!FFat.begin(true)) {

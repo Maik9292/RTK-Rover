@@ -5,6 +5,15 @@ All notable changes to the **RTK Rover** project will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.8.15] - 2026-11-16
+
+### Added
+- **DFRobot `SEN0696` (`BMI323 + BMM350 + BMP581`) 10DOF Power-Up Check & One-Shot Readout ([`user_config.h`](user_config.h), [`src/beam_imu_bsp/sen0696_driver.h`](src/beam_imu_bsp/sen0696_driver.h), [`src/beam_imu_bsp/sen0696_driver.cpp`](src/beam_imu_bsp/sen0696_driver.cpp), [`RTK_Rover.ino`](RTK_Rover.ino)):**
+  - Added `ROVER_I2C_ADDR_BEAM_IMU` (`0x4A`..`0x4D` DIP range) and quiet boot auto-detection (`i2c_bsp_probe_optional_addr()`) integrated into `[I2C0 SCAN]` (`10DOF(0x4A):OK` or `--` when unplugged without tripping bus recovery).
+  - Implemented `sen0696_probe_and_read_once()` directly over ESP-IDF `I2C_NUM_0` (`user_i2c_port0_handle`, `400 kHz`, `.scl_wait_us = 20000`, `i2c_bsp_lock()`) using the verified 16-bit LE register address + `10 ms` two-phase read protocol from `DFRobot_Multi_DOF_IMU` (checking `VID` `0x3343`, `PID >= 0x0010`, `FW_VERSION`, setting `Normal` mode / `+/-2g` / `+/-250 dps`, and detaching cleanly after the initial snapshot so zero background `I2C0` load is added).
+  - Logs one-shot power-up readings (`[10DOF]`) to both USB Serial Monitor and SD `/serial/serial-log_*.txt` (`Accel` in `g` + `|a|`, `Gyro` in `dps`, `Mag` in `uT` + `|B|`, and barometric `Press` in `hPa`/`Pa` + standard-atmosphere `BaroAlt` in `m`; notes that the `SEN0696` onboard I2C bridge firmware register map `0x0000..0x0021` does not expose a temperature register).
+  - Compiled cleanly via `arduino-cli` (`esp32:esp32:esp32s3`, `--warnings default`): zero compiler warnings (`1,703,214 B` flash / `54%`, `67,160 B` static `DRAM0` / `20%`).
+
 ## [v0.8.14] - 2026-11-16
 
 ### Fixed
