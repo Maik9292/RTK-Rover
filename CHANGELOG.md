@@ -5,6 +5,15 @@ All notable changes to the **RTK Rover** project will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.8.16] - 2026-11-17
+
+### Added & Improved
+- **Always-On `1 Hz` Lightweight DFRobot `SEN0696` `[10DOF]` Periodic Telemetry & Persistent `I2C0` Handle ([`src/i2c_bsp/i2c_bsp.h`](src/i2c_bsp/i2c_bsp.h), [`src/i2c_bsp/i2c_bsp.c`](src/i2c_bsp/i2c_bsp.c), [`src/beam_imu_bsp/sen0696_driver.h`](src/beam_imu_bsp/sen0696_driver.h), [`src/beam_imu_bsp/sen0696_driver.cpp`](src/beam_imu_bsp/sen0696_driver.cpp), [`RTK_Rover.ino`](RTK_Rover.ino), [`user_config.h`](user_config.h) `v0.8.16`):**
+  - Added `beam_imu_dev_handle`, `i2c_bsp_attach_beam_imu()`, and `i2c_bsp_detach_beam_imu()` in `i2c_bsp` with automatic cleanup and re-attachment inside `i2c_bsp_reinit_bus()` so `SEN0696` requires zero per-poll device handle allocation or heap churn.
+  - Upgraded `sen0696_driver` to persistent `sen0696_init()` / `sen0696_is_present()` / `sen0696_poll()` APIs that release `i2c_bsp_unlock()` across each `10 ms` two-phase bridge MCU preparation delay (`< 0.5 ms` `I2C0` bus mutex hold per transaction, keeping `AXS15231B` Touch and `QMI8658` polling completely unblocked) and gently re-apply Normal/`+/-2g`/`+/-250dps` configuration every `10` consecutive read errors without triggering `i2c_bsp_reinit_bus()`.
+  - Added always-on `1 Hz` (`1000 ms`) `[10DOF]` field-capture log line inside `task_display_and_audio()` whenever `SEN0696` was verified at boot (`[10DOF] Acc(g):... | Gyr(dps):... | Mag(uT):... (|B|=...) | P:...hPa`), independent of the Tile 1 `IMU` debug log button.
+  - Compiled cleanly via `arduino-cli` (`esp32:esp32:esp32s3`, `--warnings default`): zero compiler warnings (`1,704,174 B` flash / `54%`, `67,248 B` static `DRAM0` / `20%`).
+
 ## [v0.8.15] - 2026-11-16
 
 ### Added

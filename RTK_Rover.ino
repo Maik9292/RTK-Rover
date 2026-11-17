@@ -322,10 +322,11 @@ void task_display_and_audio(void *pvParameters)
     (void)pvParameters;
     RoverUIData_t    ui_state          = {};
     Axp2101Status_t  pwr               = {};
-    Mmc5983maState_t cached_mag        = {};
-    uint32_t         last_imu_poll_ms  = 0;
-    uint32_t         last_imu_log_ms   = 0;
-    uint32_t         last_pwr_poll_ms  = 0;
+    Mmc5983maState_t cached_mag         = {};
+    uint32_t         last_imu_poll_ms   = 0;
+    uint32_t         last_imu_log_ms    = 0;
+    uint32_t         last_pwr_poll_ms   = 0;
+    uint32_t         last_10dof_poll_ms = millis();
     float            cached_imu_pitch  = 0.0f;
     float            cached_imu_roll   = 0.0f;
     float            cached_bubble_x   = 0.0f;
@@ -399,6 +400,26 @@ void task_display_and_audio(void *pvParameters)
             }
             s_last_vbus_good = pwr.vbus_good;
             s_pwr_init       = true;
+        }
+
+        // Always-on 1 Hz lightweight readout from external DFRobot SEN0696 (10DOF IMU) when detected
+        if (sen0696_is_present() && (now - last_10dof_poll_ms >= 1000)) {
+            last_10dof_poll_ms = now;
+            sen0696_state_t beam_state;
+            if (sen0696_poll(&beam_state)) {
+                Serial.printf("[10DOF] Acc(g):%+.3f,%+.3f,%+.3f | Gyr(dps):%+.2f,%+.2f,%+.2f | Mag(uT):%+.2f,%+.2f,%+.2f (|B|=%.1f) | P:%.2fhPa\n",
+                              beam_state.accel_g[0], beam_state.accel_g[1], beam_state.accel_g[2],
+                              beam_state.gyro_dps[0], beam_state.gyro_dps[1], beam_state.gyro_dps[2],
+                              beam_state.mag_ut[0], beam_state.mag_ut[1], beam_state.mag_ut[2],
+                              beam_state.mag_norm_ut,
+                              beam_state.pressure_hpa);
+            } else {
+                Serial.printf("[10DOF] READ ERR (acc:%s mag:%s press:%s fails:%u)\n",
+                              beam_state.accel_gyro_valid ? "OK" : "ERR",
+                              beam_state.mag_valid        ? "OK" : "ERR",
+                              beam_state.press_valid      ? "OK" : "ERR",
+                              (unsigned)beam_state.consec_fails);
+            }
         }
 
         // Auto-shutdown on battery inactivity timeout
@@ -601,14 +622,14 @@ void task_display_and_audio(void *pvParameters)
 }
 
 /**
- * @brief One-shot boot presence verification and initial readout for DFRobot SEN0696 (10DOF IMU).
+ * @brief Initializes DFRobot SEN0696 (10DOF IMU) on I2C0 and logs boot presence + initial readout.
  */
 static void run_beam_10dof_boot_check(void)
 {
-    sen0696_boot_report_t report;
-    (void)sen0696_probe_and_read_once(ROVER_I2C_ADDR_BEAM_IMU, ROVER_I2C_ADDR_BEAM_IMU_MAX, &report);
+    sen0696_state_t report;
+    (void)sen0696_init(ROVER_I2C_ADDR_BEAM_IMU, ROVER_I2C_ADDR_BEAM_IMU_MAX, &report);
 
-    if (!report.found) {
+    if (report.i2c_addr == 0U) {
         Serial.printf("[10DOF] DFRobot SEN0696 (0x%02X..0x%02X) not detected on I2C0 -- skipping.\n",
                       (unsigned)ROVER_I2C_ADDR_BEAM_IMU,
                       (unsigned)ROVER_I2C_ADDR_BEAM_IMU_MAX);
@@ -624,7 +645,7 @@ static void run_beam_10dof_boot_check(void)
         return;
     }
 
-    Serial.printf("[10DOF] DFRobot SEN0696 found @ 0x%02X | VID=0x%04X%s PID=0x%04X FW=0x%04X | Cfg:%s\n",
+    Serial.printf("[10DOF] DFRobot SEN0696 found @ 0x%02X | VID=0x%04X%s PID=0x%04X FW=0x%04X | Cfg:%s (1 Hz log enabled)\n",
                   (unsigned)report.i2c_addr,
                   (unsigned)report.vid,
                   (report.vid == SEN0696_EXPECTED_VID) ? "" : "(unexpected)",

@@ -14,6 +14,9 @@ i2c_master_dev_handle_t rtc_dev_handle        = NULL;
 i2c_master_dev_handle_t imu_dev_handle        = NULL;
 i2c_master_dev_handle_t axp2101_dev_handle    = NULL;
 i2c_master_dev_handle_t mag_dev_handle        = NULL;
+i2c_master_dev_handle_t beam_imu_dev_handle   = NULL;
+
+static uint8_t s_beam_imu_addr = 0;
 
 static SemaphoreHandle_t i2c_bus_mutex = NULL;
 static uint32_t i2c_data_pdMS_TICKS = 0;
@@ -170,6 +173,56 @@ void i2c_master_Init(void)
     ESP_ERROR_CHECK(i2c_master_bus_add_device(user_i2c_port0_handle, &dev_cfg, &mag_dev_handle));
 }
 
+static bool i2c_bsp_attach_beam_imu_locked(uint8_t addr_7bit)
+{
+    if (user_i2c_port0_handle == NULL || addr_7bit < 0x08U || addr_7bit > 0x77U) {
+        return false;
+    }
+    if (beam_imu_dev_handle != NULL && s_beam_imu_addr == addr_7bit) {
+        return true;
+    }
+    if (beam_imu_dev_handle != NULL) {
+        i2c_master_bus_rm_device(beam_imu_dev_handle);
+        beam_imu_dev_handle = NULL;
+    }
+
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = addr_7bit,
+        .scl_speed_hz    = 400000,
+        .scl_wait_us     = 20000,
+    };
+    if (i2c_master_bus_add_device(user_i2c_port0_handle, &dev_cfg, &beam_imu_dev_handle) != ESP_OK) {
+        beam_imu_dev_handle = NULL;
+        return false;
+    }
+    s_beam_imu_addr = addr_7bit;
+    return true;
+}
+
+bool i2c_bsp_attach_beam_imu(uint8_t addr_7bit)
+{
+    if (!i2c_bsp_lock(200)) {
+        return false;
+    }
+    bool ok = i2c_bsp_attach_beam_imu_locked(addr_7bit);
+    i2c_bsp_unlock();
+    return ok;
+}
+
+void i2c_bsp_detach_beam_imu(void)
+{
+    if (!i2c_bsp_lock(200)) {
+        return;
+    }
+    if (beam_imu_dev_handle != NULL) {
+        i2c_master_bus_rm_device(beam_imu_dev_handle);
+        beam_imu_dev_handle = NULL;
+    }
+    s_beam_imu_addr = 0;
+    i2c_bsp_unlock();
+}
+
 void i2c_bsp_reinit_bus(void)
 {
     if (!i2c_bsp_lock(500)) {
@@ -180,9 +233,13 @@ void i2c_bsp_reinit_bus(void)
     if (disp_touch_dev_handle) { i2c_master_bus_rm_device(disp_touch_dev_handle); disp_touch_dev_handle = NULL; }
     if (axp2101_dev_handle)    { i2c_master_bus_rm_device(axp2101_dev_handle);    axp2101_dev_handle = NULL; }
     if (mag_dev_handle)        { i2c_master_bus_rm_device(mag_dev_handle);        mag_dev_handle = NULL; }
+    if (beam_imu_dev_handle)   { i2c_master_bus_rm_device(beam_imu_dev_handle);   beam_imu_dev_handle = NULL; }
     if (user_i2c_port0_handle) { i2c_del_master_bus(user_i2c_port0_handle);      user_i2c_port0_handle = NULL; }
     vTaskDelay(pdMS_TO_TICKS(10));
     i2c_master_Init();
+    if (s_beam_imu_addr != 0) {
+        (void)i2c_bsp_attach_beam_imu_locked(s_beam_imu_addr);
+    }
     i2c_bsp_unlock();
 }
 

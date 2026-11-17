@@ -13,15 +13,16 @@
 #define SEN0696_MIN_10DOF_PID        0x0010U
 
 /**
- * @brief One-shot power-up verification and sensor snapshot for DFRobot SEN0696 (10DOF).
+ * @brief Persistent state and latest physical readings for DFRobot SEN0696 (10DOF IMU).
  */
 typedef struct {
-    bool     found;            // True if any address in [addr_min..addr_max] ACKed on I2C0
-    bool     id_valid;         // True if PID >= 0x0010 (10DOF compatible)
+    bool     present;          // True if detected on I2C0 and verified PID >= 0x0010 at boot
+    bool     id_valid;         // True if REG_I2C_PID >= 0x0010
     bool     configured;       // True if Normal mode + +/-2g + +/-250dps writes succeeded
-    bool     accel_gyro_valid; // True if 12-byte IMU block read succeeded
-    bool     mag_valid;        // True if 12-byte magnetometer block read succeeded
-    bool     press_valid;      // True if 4-byte barometer block read succeeded
+    bool     valid;            // True if the latest sample read all 3 blocks cleanly
+    bool     accel_gyro_valid; // True if latest 12-byte IMU block read succeeded
+    bool     mag_valid;        // True if latest 12-byte magnetometer block read succeeded
+    bool     press_valid;      // True if latest 4-byte barometer block read succeeded
     uint8_t  i2c_addr;         // Detected 7-bit I2C address (0 if not found)
     uint16_t vid;              // REG_I2C_VID (0x0000), expected 0x3343 (DFRobot)
     uint16_t pid;              // REG_I2C_PID (0x0001), expected >= 0x0010 (10DOF)
@@ -33,7 +34,9 @@ typedef struct {
     float    pressure_pa;      // Barometric pressure in Pa (1 Pa/LSB)
     float    pressure_hpa;     // Barometric pressure in hPa
     float    altitude_m;       // Standard-atmosphere altitude estimate (P0 = 101325 Pa)
-} sen0696_boot_report_t;
+    uint8_t  consec_fails;     // Consecutive poll errors since last valid sample
+    uint32_t last_sample_ms;   // FreeRTOS tick timestamp (ms) of last valid sample
+} sen0696_state_t;
 
 /**
  * @brief Quietly probes [addr_min..addr_max] on shared I2C0 without tripping bus recovery.
@@ -42,19 +45,35 @@ typedef struct {
 uint8_t sen0696_detect_i2c_addr(uint8_t addr_min, uint8_t addr_max);
 
 /**
- * @brief Performs a one-shot boot verification and initial 10DOF read on I2C0.
+ * @brief Initializes DFRobot SEN0696 on I2C0, attaches persistent device handle, and reads initial sample.
  *
- * Uses a temporary ESP-IDF i2c_master_dev_handle_t attached to user_i2c_port0_handle
- * under i2c_bsp_lock(), configures normal mode (+/-2g, +/-250dps), waits for first
- * conversion settling, reads Accel/Gyro/Mag/Pressure, and detaches cleanly.
- * Note: DFRobot's SEN0696 onboard I2C bridge firmware (regs 0x0000..0x0021) does not
- * expose an external temperature register over I2C.
+ * Configures Normal operating mode (+/-2g accel, +/-250dps gyro) and waits for first sensor
+ * conversion settling. Note: DFRobot's SEN0696 onboard I2C bridge firmware (regs 0x0000..0x0021)
+ * does not expose an external temperature register over I2C.
  *
- * @param addr_min Minimum 7-bit I2C address to probe (e.g., 0x4A).
- * @param addr_max Maximum 7-bit I2C address to probe (e.g., 0x4D).
- * @param report   Output report struct (must be non-NULL).
- * @return true if device was found, verified 10DOF PID, and all active sensors read cleanly.
+ * @param addr_min  Minimum 7-bit I2C address to probe (e.g., 0x4A).
+ * @param addr_max  Maximum 7-bit I2C address to probe (e.g., 0x4D).
+ * @param out_state Optional output copy of populated boot state (may be NULL).
+ * @return true if device was found, verified 10DOF PID, and initial sample read cleanly.
  */
-bool sen0696_probe_and_read_once(uint8_t addr_min, uint8_t addr_max, sen0696_boot_report_t *report);
+bool sen0696_init(uint8_t addr_min, uint8_t addr_max, sen0696_state_t *out_state);
+
+/**
+ * @brief Returns true if SEN0696 was detected and verified at boot.
+ */
+bool sen0696_is_present(void);
+
+/**
+ * @brief Polls Accel/Gyro, Mag, and Barometer blocks once and updates cached state.
+ *
+ * Releases i2c_bsp_lock() across the 10 ms two-phase bridge MCU delays so concurrent
+ * LVGL Touch (0x3B) and QMI8658 (0x6B) transactions are never blocked. Automatically
+ * retries Normal mode configuration every 10 consecutive read failures without triggering
+ * I2C0 bus-wide reinitialization.
+ *
+ * @param out_state Optional output snapshot (may be NULL).
+ * @return true if all 3 sensor blocks succeeded on this poll.
+ */
+bool sen0696_poll(sen0696_state_t *out_state);
 
 #endif // SEN0696_DRIVER_H

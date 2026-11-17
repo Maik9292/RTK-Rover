@@ -15,11 +15,14 @@ extern i2c_master_dev_handle_t rtc_dev_handle;
 extern i2c_master_dev_handle_t imu_dev_handle;
 extern i2c_master_dev_handle_t axp2101_dev_handle;
 extern i2c_master_dev_handle_t mag_dev_handle;
+extern i2c_master_dev_handle_t beam_imu_dev_handle;
 
 void i2c_bsp_gpio_bus_clear(void);
 void i2c_master_Init(void);
 void i2c_bsp_reinit_bus(void);
 void i2c_bsp_recover_bus(void);
+bool i2c_bsp_attach_beam_imu(uint8_t addr_7bit);
+void i2c_bsp_detach_beam_imu(void);
 bool i2c_bsp_lock(uint32_t timeout_ms);
 void i2c_bsp_unlock(void);
 bool i2c_bsp_probe_addr(uint8_t addr_7bit);
