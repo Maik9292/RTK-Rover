@@ -5,6 +5,19 @@ All notable changes to the **RTK Rover** project will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.8.17] - 2026-11-17
+
+### Fixed
+- **Runtime `I2C0` Bus-Clear Recovery, Atomic Staggered `SEN0696` Reads (`400 kHz` Uniform) & Idle Shutdown Beeper Loop ([`src/i2c_bsp/i2c_bsp.h`](src/i2c_bsp/i2c_bsp.h), [`src/i2c_bsp/i2c_bsp.c`](src/i2c_bsp/i2c_bsp.c), [`src/beam_imu_bsp/sen0696_driver.h`](src/beam_imu_bsp/sen0696_driver.h), [`src/beam_imu_bsp/sen0696_driver.cpp`](src/beam_imu_bsp/sen0696_driver.cpp), [`src/imu_bsp/imu_bsp.c`](src/imu_bsp/imu_bsp.c), [`src/lvgl_port/lvgl_port.c`](src/lvgl_port/lvgl_port.c), [`RTK_Rover.ino`](RTK_Rover.ino), [`user_config.h`](user_config.h) `v0.8.17`):**
+  - Root-caused the `test/_051` `I2C0` touchscreen lockups, `0x71` tail corruptions, `2045` RTC rollovers, and desk idle freeze+beeper loop:
+    1. Releasing `i2c_bsp_unlock()` across `sen0696_read_reg()`'s `10 ms` prep gap allowed `Touch(0x3B)` and `IMU(0x6B)` transactions (and `i2c_master_bus_reset()`) to interleave mid-transaction, corrupting reads (`0x71` tail sentinel) and wedging the external slave holding `SDA`/`SCL` LOW.
+    2. Runtime `i2c_bus_recover_locked()` only called ESP-IDF's hardware-FSM `i2c_master_bus_reset()` without issuing `18 SCL` clock pulses (`i2c_bsp_gpio_bus_clear()`), leaving wedged slaves permanently stuck until reboot.
+    3. When `I2C0` wedged while battery inactivity timeout (`auto_shutdown_battery_min`) expired, `axp2101_bsp_power_off()` failed silently without resetting `s_battery_since_ms`, looping `rover_lvgl_lock()` + `save_settings()` + `play_rover_beep(800, 300)` every `~350 ms`.
+  - **Atomic Staggered `SEN0696` Polling (Uniform `400 kHz`):** Kept all `I2C0` devices uniformly at `400 kHz` (avoiding ESP-IDF clock divider switching). Updated `sen0696_read_reg()` to hold `i2c_bsp_lock()` atomically across `[write reg -> 10 ms -> read]`, staggered the 3 blocks (`Acc/Gyr`, `Mag`, `Press`) via `sen0696_poll_step()` across 3 `RoverUI` ticks (`~10.3 ms` lock per tick), added trailing-`0x71` and physical-bounds rejection (`|acc| <= 16g`, `|gyr| <= 2000 dps`, `|mag| <= 2000 uT`, `300..1200 hPa`), and backed off to `5 s` NACK fast-probing when `consec_fails >= 15`.
+  - **Runtime `18-SCL` GPIO Bus-Clear & Timeout Margin:** Raised `i2c_data_pdMS_TICKS` from `25` to `40` ms (above `.scl_wait_us = 20000`) and added `i2c_bsp_runtime_gpio_bus_clear_locked()` (`SIG_GPIO_OUT_IDX -> i2c_bsp_gpio_bus_clear() -> I2CEXT0_*` restore + `i2c_master_bus_reset()`, preserving live `TCA9554` and `ES8311` device handles) triggered automatically after `3` consecutive `0x103`/`0x107` stalls (`2 s` cooldown).
+  - **UI/IMU Fault Throttling & Clean Auto-Shutdown:** Added `250 ms` backoff in `TouchInputReadCallback()` after `5` consecutive errors + `0x71` corruption guard, early abort in `imu_init()` when both `WHO_AM_I` and soft-reset fail on a dead bus, and removed `rover_lvgl_lock()` / added a `30 s` cooldown + `s_battery_since_ms` reset around `axp2101_bsp_power_off()` in `RTK_Rover.ino`.
+  - Compiled cleanly via `arduino-cli` (`esp32:esp32:esp32s3`, `--warnings default`): zero compiler warnings (`1,705,510 B` flash / `54%`, `67,264 B` static `DRAM0` / `20%`).
+
 ## [v0.8.16] - 2026-11-17
 
 ### Added & Improved

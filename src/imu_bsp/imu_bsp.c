@@ -16,10 +16,13 @@ void imu_init(void)
     uint8_t who_am_i = 0;
     esp_err_t err = i2c_read_buff(imu_dev_handle, 0x00, &who_am_i, 1);
 
-    uint8_t ctrl_buf;
-    // 1. Soft Reset QMI8658 (REG 0x60 = 0xB0)
-    ctrl_buf = 0xB0;
-    i2c_write_buff(imu_dev_handle, 0x60, &ctrl_buf, 1);
+    // Abort early during runtime recovery if both WHO_AM_I and soft-reset fail so we do not flood a recovering I2C0 bus
+    uint8_t ctrl_buf = 0xB0;
+    uint8_t rst_err  = i2c_write_buff(imu_dev_handle, 0x60, &ctrl_buf, 1);
+    if (err != 0 && rst_err != 0) {
+        rover_printf("[IMU] QMI8658 (0x6B) unreachable during init/recovery (err=%d) -- aborting config burst\n", (int)err);
+        return;
+    }
     vTaskDelay(pdMS_TO_TICKS(5));
 
     // 2. Poll RST_RESULT (0x4D) until reset completion bit (0x80) is asserted

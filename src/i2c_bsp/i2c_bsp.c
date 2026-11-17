@@ -6,7 +6,9 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
+#include "esp_rom_gpio.h"
 #include "esp_rom_sys.h"
+#include "soc/gpio_sig_map.h"
 
 i2c_master_bus_handle_t user_i2c_port0_handle = NULL;
 i2c_master_dev_handle_t disp_touch_dev_handle = NULL;
@@ -17,6 +19,8 @@ i2c_master_dev_handle_t mag_dev_handle        = NULL;
 i2c_master_dev_handle_t beam_imu_dev_handle   = NULL;
 
 static uint8_t s_beam_imu_addr = 0;
+static uint8_t s_consec_bus_timeouts = 0;
+static uint32_t s_last_gpio_clear_ms = 0;
 
 static SemaphoreHandle_t i2c_bus_mutex = NULL;
 static uint32_t i2c_data_pdMS_TICKS = 0;
@@ -45,7 +49,25 @@ static const char* i2c_dev_name(i2c_master_dev_handle_t h)
     if (h == rtc_dev_handle)        return "RTC(0x51)";
     if (h == axp2101_dev_handle)    return "AXP2101(0x34)";
     if (h == mag_dev_handle)        return "MAG(0x30)";
+    if (h == beam_imu_dev_handle)   return "10DOF(0x4A)";
     return "I2C_DEV";
+}
+
+static void i2c_bsp_runtime_gpio_bus_clear_locked(void)
+{
+    // Temporarily detach I2C0 peripheral output matrix so open-drain GPIO clocking controls SCL/SDA directly
+    esp_rom_gpio_connect_out_signal(ROVER_PIN_I2C0_SCL, SIG_GPIO_OUT_IDX, false, false);
+    esp_rom_gpio_connect_out_signal(ROVER_PIN_I2C0_SDA, SIG_GPIO_OUT_IDX, false, false);
+
+    i2c_bsp_gpio_bus_clear();
+
+    // Restore open-drain levels and reattach GPIO7/8 to I2CEXT0 without deleting live TCA9554/ES8311 handles
+    gpio_set_level(ROVER_PIN_I2C0_SCL, 1);
+    gpio_set_level(ROVER_PIN_I2C0_SDA, 1);
+    esp_rom_gpio_connect_out_signal(ROVER_PIN_I2C0_SCL, I2CEXT0_SCL_OUT_IDX, false, false);
+    esp_rom_gpio_connect_in_signal(ROVER_PIN_I2C0_SCL, I2CEXT0_SCL_IN_IDX, false);
+    esp_rom_gpio_connect_out_signal(ROVER_PIN_I2C0_SDA, I2CEXT0_SDA_OUT_IDX, false, false);
+    esp_rom_gpio_connect_in_signal(ROVER_PIN_I2C0_SDA, I2CEXT0_SDA_IN_IDX, false);
 }
 
 static void i2c_bus_recover_locked(const char *action, i2c_master_dev_handle_t dev_handle, int reg, esp_err_t err)
@@ -62,7 +84,25 @@ static void i2c_bus_recover_locked(const char *action, i2c_master_dev_handle_t d
                          action, i2c_dev_name(dev_handle), (unsigned int)err);
         }
     }
+
+    const bool is_bus_stall = (err == ESP_ERR_TIMEOUT || err == ESP_ERR_INVALID_STATE);
+    if (is_bus_stall && s_consec_bus_timeouts < 255) {
+        s_consec_bus_timeouts++;
+    }
+
     if (user_i2c_port0_handle != NULL) {
+        if (s_consec_bus_timeouts >= 3 && (now - s_last_gpio_clear_ms >= 2000U)) {
+            int sda_before = gpio_get_level(ROVER_PIN_I2C0_SDA);
+            int scl_before = gpio_get_level(ROVER_PIN_I2C0_SCL);
+            s_last_gpio_clear_ms = now;
+            s_consec_bus_timeouts = 0;
+            rover_printf("[I2C RECOVER] %u consecutive bus stalls -> running 18-SCL GPIO bus-clear (SDA=%d SCL=%d)\n",
+                         3U, sda_before, scl_before);
+            i2c_bsp_runtime_gpio_bus_clear_locked();
+            rover_printf("[I2C RECOVER] Runtime 18-SCL bus-clear complete (SDA=%d SCL=%d)\n",
+                         gpio_get_level(ROVER_PIN_I2C0_SDA),
+                         gpio_get_level(ROVER_PIN_I2C0_SCL));
+        }
         i2c_master_bus_reset(user_i2c_port0_handle);
         // Settle delay while holding mutex so subsequent tasks do not collide with recovering lines
         vTaskDelay(pdMS_TO_TICKS(5));
@@ -127,9 +167,9 @@ void i2c_master_Init(void)
     if (i2c_bus_mutex == NULL) {
         i2c_bus_mutex = xSemaphoreCreateRecursiveMutex();
     }
-    // Fast 25ms timeout prevents noticeable UI stutter if a transient bus stretch occurs
-    i2c_data_pdMS_TICKS = 25;
-    i2c_done_pdMS_TICKS = 25;
+    // 40 ms software timeout clears 20 ms .scl_wait_us slave stretching margin plus RTOS jitter
+    i2c_data_pdMS_TICKS = 40;
+    i2c_done_pdMS_TICKS = 40;
 
     // Clear any slave holding SDA low across warm/UPS reset before attaching hardware I2C master
     i2c_bsp_gpio_bus_clear();
@@ -264,6 +304,19 @@ bool i2c_bsp_probe_optional_addr(uint8_t addr_7bit)
     return (err == ESP_OK);
 }
 
+void i2c_bsp_report_status(i2c_master_dev_handle_t dev_handle, const char *action, int err_code)
+{
+    if (!i2c_bsp_lock(200)) {
+        return;
+    }
+    if (err_code == ESP_OK) {
+        s_consec_bus_timeouts = 0;
+    } else {
+        i2c_bus_recover_locked(action ? action : "Op", dev_handle, -1, (esp_err_t)err_code);
+    }
+    i2c_bsp_unlock();
+}
+
 uint8_t i2c_write_buff(i2c_master_dev_handle_t dev_handle, int reg, uint8_t *buf, uint8_t len)
 {
     if (!i2c_bsp_lock(200)) {
@@ -280,7 +333,9 @@ uint8_t i2c_write_buff(i2c_master_dev_handle_t dev_handle, int reg, uint8_t *buf
         }
         ret = i2c_master_transmit(dev_handle, pbuf, len + 1, i2c_data_pdMS_TICKS);
     }
-    if (ret != ESP_OK) {
+    if (ret == ESP_OK) {
+        s_consec_bus_timeouts = 0;
+    } else {
         i2c_bus_recover_locked("Write", dev_handle, reg, ret);
     }
     i2c_bsp_unlock();
@@ -293,7 +348,9 @@ uint8_t i2c_master_write_read_dev(i2c_master_dev_handle_t dev_handle, uint8_t *w
         return 1;
     }
     esp_err_t ret = i2c_master_transmit_receive(dev_handle, writeBuf, writeLen, readBuf, readLen, i2c_data_pdMS_TICKS);
-    if (ret != ESP_OK) {
+    if (ret == ESP_OK) {
+        s_consec_bus_timeouts = 0;
+    } else {
         i2c_bus_recover_locked("WriteRead", dev_handle, -1, ret);
     }
     i2c_bsp_unlock();
@@ -312,7 +369,9 @@ uint8_t i2c_read_buff(i2c_master_dev_handle_t dev_handle, int reg, uint8_t *buf,
         uint8_t addr = (uint8_t)reg;
         ret = i2c_master_transmit_receive(dev_handle, &addr, 1, buf, len, i2c_data_pdMS_TICKS);
     }
-    if (ret != ESP_OK) {
+    if (ret == ESP_OK) {
+        s_consec_bus_timeouts = 0;
+    } else {
         i2c_bus_recover_locked("Read", dev_handle, reg, ret);
     }
     i2c_bsp_unlock();

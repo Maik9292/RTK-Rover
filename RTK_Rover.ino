@@ -402,29 +402,45 @@ void task_display_and_audio(void *pvParameters)
             s_pwr_init       = true;
         }
 
-        // Always-on 1 Hz lightweight readout from external DFRobot SEN0696 (10DOF IMU) when detected
-        if (sen0696_is_present() && (now - last_10dof_poll_ms >= 1000)) {
-            last_10dof_poll_ms = now;
-            sen0696_state_t beam_state;
-            if (sen0696_poll(&beam_state)) {
-                Serial.printf("[10DOF] Acc(g):%+.3f,%+.3f,%+.3f | Gyr(dps):%+.2f,%+.2f,%+.2f | Mag(uT):%+.2f,%+.2f,%+.2f (|B|=%.1f) | P:%.2fhPa\n",
-                              beam_state.accel_g[0], beam_state.accel_g[1], beam_state.accel_g[2],
-                              beam_state.gyro_dps[0], beam_state.gyro_dps[1], beam_state.gyro_dps[2],
-                              beam_state.mag_ut[0], beam_state.mag_ut[1], beam_state.mag_ut[2],
-                              beam_state.mag_norm_ut,
-                              beam_state.pressure_hpa);
-            } else {
-                Serial.printf("[10DOF] READ ERR (acc:%s mag:%s press:%s fails:%u)\n",
-                              beam_state.accel_gyro_valid ? "OK" : "ERR",
-                              beam_state.mag_valid        ? "OK" : "ERR",
-                              beam_state.press_valid      ? "OK" : "ERR",
-                              (unsigned)beam_state.consec_fails);
+        // Staggered 1 Hz always-on DFRobot SEN0696 (10DOF IMU) polling across 3 RoverUI ticks (~10.3 ms/tick, 400 kHz)
+        static uint8_t s_10dof_step     = 0;
+        static bool    s_10dof_in_cycle = false;
+        if (sen0696_is_present()) {
+            const uint32_t period_ms = (sen0696_get_consec_fails() >= 15U) ? 5000U : 1000U;
+            if (!s_10dof_in_cycle && (now - last_10dof_poll_ms >= period_ms)) {
+                last_10dof_poll_ms = now;
+                s_10dof_in_cycle   = true;
+                s_10dof_step       = 0;
+            }
+            if (s_10dof_in_cycle) {
+                sen0696_state_t beam_state;
+                bool ok = sen0696_poll_step(s_10dof_step, &beam_state);
+                s_10dof_step++;
+                if (s_10dof_step >= 3U) {
+                    s_10dof_in_cycle = false;
+                    s_10dof_step     = 0;
+                    if (ok) {
+                        Serial.printf("[10DOF] Acc(g):%+.3f,%+.3f,%+.3f | Gyr(dps):%+.2f,%+.2f,%+.2f | Mag(uT):%+.2f,%+.2f,%+.2f (|B|=%.1f) | P:%.2fhPa\n",
+                                      beam_state.accel_g[0], beam_state.accel_g[1], beam_state.accel_g[2],
+                                      beam_state.gyro_dps[0], beam_state.gyro_dps[1], beam_state.gyro_dps[2],
+                                      beam_state.mag_ut[0], beam_state.mag_ut[1], beam_state.mag_ut[2],
+                                      beam_state.mag_norm_ut,
+                                      beam_state.pressure_hpa);
+                    } else {
+                        Serial.printf("[10DOF] READ ERR (acc:%s mag:%s press:%s fails:%u)\n",
+                                      beam_state.accel_gyro_valid ? "OK" : "ERR",
+                                      beam_state.mag_valid        ? "OK" : "ERR",
+                                      beam_state.press_valid      ? "OK" : "ERR",
+                                      (unsigned)beam_state.consec_fails);
+                    }
+                }
             }
         }
 
         // Auto-shutdown on battery inactivity timeout
         static uint32_t s_battery_since_ms = 0;
         static uint32_t s_last_touch_seen_ms = 0;
+        static uint32_t s_last_poweroff_attempt_ms = 0;
         uint32_t touch_act_ms = rover_get_last_user_activity_ms();
         if (touch_act_ms != s_last_touch_seen_ms) {
             s_last_touch_seen_ms = touch_act_ms;
@@ -437,15 +453,19 @@ void task_display_and_audio(void *pvParameters)
             if (s_battery_since_ms == 0) s_battery_since_ms = now;
             if (current_settings.auto_shutdown_battery_min > 0) {
                 uint32_t timeout_ms = (uint32_t)current_settings.auto_shutdown_battery_min * 60000ULL;
-                if (now - s_battery_since_ms >= timeout_ms) {
+                if ((now - s_battery_since_ms >= timeout_ms) &&
+                    (s_last_poweroff_attempt_ms == 0 || (now - s_last_poweroff_attempt_ms >= 30000U))) {
+                    s_last_poweroff_attempt_ms = (now == 0) ? 1 : now;
                     Serial.printf("[POWER] Battery inactivity timeout (%u min) expired -> Initiating clean shutdown.\n",
                                   current_settings.auto_shutdown_battery_min);
-                    rover_lvgl_lock(200);
-                    save_settings();
+                    if (settings_dirty) {
+                        settings_dirty = false;
+                        save_settings();
+                    }
                     play_rover_beep(800, 300);
                     vTaskDelay(pdMS_TO_TICKS(350));
                     axp2101_bsp_power_off();
-                    rover_lvgl_unlock();
+                    s_battery_since_ms = millis(); // Prevent repeated beep/flash loop if PMIC I2C power-off fails
                 }
             }
         }

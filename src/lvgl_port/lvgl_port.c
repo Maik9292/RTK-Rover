@@ -320,6 +320,16 @@ static void TouchInputReadCallback(lv_indev_t *indev, lv_indev_data_t *indevData
     static int16_t last_y = 0;
     static lv_indev_state_t prev_state = LV_INDEV_STATE_RELEASED;
     static uint32_t last_log_ms = 0;
+    static uint8_t  err_streak = 0;
+    static uint32_t backoff_until_ms = 0;
+
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+    if (err_streak >= 5 && (int32_t)(now_ms - backoff_until_ms) < 0) {
+        indevData->point.x = last_x;
+        indevData->point.y = last_y;
+        indevData->state   = LV_INDEV_STATE_RELEASED;
+        return;
+    }
 
     // Command byte 7 = 0x0E (14 bytes): matches Waveshare ESP32-S3-Touch-LCD-3.5B bsp_touch.c
     uint8_t read_touchpad_cmd[11] = {0xb5, 0xab, 0xa5, 0x5a, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00};
@@ -327,10 +337,13 @@ static void TouchInputReadCallback(lv_indev_t *indev, lv_indev_data_t *indevData
 
     esp_err_t err = i2c_master_write_read_dev(disp_touch_dev_handle, read_touchpad_cmd, 11, buff, 14);
     if (err == ESP_OK) {
+        err_streak = 0;
+        // Reject corrupt all-0x71 I2C tail glitches in addition to 0xFF invalid frames
+        bool corrupt_71 = (buff[2] == 0x71 && buff[3] == 0x71 && buff[4] == 0x71 && buff[5] == 0x71);
         // buff[0]: gesture (0xFF = invalid), buff[1]: touch points (1..2)
         // buff[2] bits [7:6]: event flag (0x80 = contact/down, 0x40 = release/up)
         uint8_t event_flag = (buff[2] >> 6) & 0x03;
-        if (buff[0] != 0xFF && buff[1] >= 1 && buff[1] <= 2 && event_flag != 0x01) {
+        if (!corrupt_71 && buff[0] != 0xFF && buff[1] >= 1 && buff[1] <= 2 && event_flag != 0x01) {
             uint16_t pointX = (((uint16_t)buff[2] & 0x0F) << 8) | (uint16_t)buff[3];
             uint16_t pointY = (((uint16_t)buff[4] & 0x0F) << 8) | (uint16_t)buff[5];
             if (pointX >= ROVER_LCD_H_RES) pointX = ROVER_LCD_H_RES - 1;
@@ -340,25 +353,30 @@ static void TouchInputReadCallback(lv_indev_t *indev, lv_indev_data_t *indevData
             indevData->point.x = last_x;
             indevData->point.y = last_y;
             indevData->state   = LV_INDEV_STATE_PRESSED;
-            s_last_user_activity_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+            s_last_user_activity_ms = now_ms;
 
             if (current_settings.enable_touch_logging) {
-                uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
                 if (prev_state != LV_INDEV_STATE_PRESSED) {
                     rover_printf("[TOUCH DOWN] (%d, %d) | buf: %02X %02X %02X %02X %02X %02X | evt:%u pts:%u\n",
                                  last_x, last_y, buff[0], buff[1], buff[2], buff[3], buff[4], buff[5],
                                  event_flag, buff[1]);
-                    last_log_ms = now;
-                } else if (now - last_log_ms >= 250) {
+                    last_log_ms = now_ms;
+                } else if (now_ms - last_log_ms >= 250) {
                     rover_printf("[TOUCH HELD] (%d, %d) | buf: %02X %02X %02X %02X | pts:%u\n",
                                  last_x, last_y, buff[0], buff[1], buff[2], buff[3], buff[1]);
-                    last_log_ms = now;
+                    last_log_ms = now_ms;
                 }
             }
             prev_state = LV_INDEV_STATE_PRESSED;
             return;
-        } else if (buff[1] >= 1 && buff[0] == 0xFF && current_settings.enable_touch_logging) {
+        } else if (!corrupt_71 && buff[1] >= 1 && buff[0] == 0xFF && current_settings.enable_touch_logging) {
             rover_printf("[TOUCH REJECTED: buff[0]==0xFF] pts=%u evt=%u\n", buff[1], event_flag);
+        }
+    } else {
+        if (err_streak < 255) err_streak++;
+        if (err_streak >= 5) {
+            // Back off 250 ms during I2C0 fault recovery so lvgl_port_task does not thrash lvgl_mux/i2c_bus_mutex
+            backoff_until_ms = (uint32_t)(esp_timer_get_time() / 1000ULL) + 250U;
         }
     }
 

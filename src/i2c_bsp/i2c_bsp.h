@@ -23,6 +23,7 @@ void i2c_bsp_reinit_bus(void);
 void i2c_bsp_recover_bus(void);
 bool i2c_bsp_attach_beam_imu(uint8_t addr_7bit);
 void i2c_bsp_detach_beam_imu(void);
+void i2c_bsp_report_status(i2c_master_dev_handle_t dev_handle, const char *action, int err_code);
 bool i2c_bsp_lock(uint32_t timeout_ms);
 void i2c_bsp_unlock(void);
 bool i2c_bsp_probe_addr(uint8_t addr_7bit);

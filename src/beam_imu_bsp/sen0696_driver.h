@@ -20,9 +20,9 @@ typedef struct {
     bool     id_valid;         // True if REG_I2C_PID >= 0x0010
     bool     configured;       // True if Normal mode + +/-2g + +/-250dps writes succeeded
     bool     valid;            // True if the latest sample read all 3 blocks cleanly
-    bool     accel_gyro_valid; // True if latest 12-byte IMU block read succeeded
-    bool     mag_valid;        // True if latest 12-byte magnetometer block read succeeded
-    bool     press_valid;      // True if latest 4-byte barometer block read succeeded
+    bool     accel_gyro_valid; // True if latest 12-byte IMU block read passed sanity checks
+    bool     mag_valid;        // True if latest 12-byte magnetometer block passed sanity checks
+    bool     press_valid;      // True if latest 4-byte barometer block passed sanity checks
     uint8_t  i2c_addr;         // Detected 7-bit I2C address (0 if not found)
     uint16_t vid;              // REG_I2C_VID (0x0000), expected 0x3343 (DFRobot)
     uint16_t pid;              // REG_I2C_PID (0x0001), expected >= 0x0010 (10DOF)
@@ -45,16 +45,11 @@ typedef struct {
 uint8_t sen0696_detect_i2c_addr(uint8_t addr_min, uint8_t addr_max);
 
 /**
- * @brief Initializes DFRobot SEN0696 on I2C0, attaches persistent device handle, and reads initial sample.
+ * @brief Initializes DFRobot SEN0696 on I2C0 (uniform 400 kHz), attaches persistent handle, and reads initial sample.
  *
  * Configures Normal operating mode (+/-2g accel, +/-250dps gyro) and waits for first sensor
  * conversion settling. Note: DFRobot's SEN0696 onboard I2C bridge firmware (regs 0x0000..0x0021)
  * does not expose an external temperature register over I2C.
- *
- * @param addr_min  Minimum 7-bit I2C address to probe (e.g., 0x4A).
- * @param addr_max  Maximum 7-bit I2C address to probe (e.g., 0x4D).
- * @param out_state Optional output copy of populated boot state (may be NULL).
- * @return true if device was found, verified 10DOF PID, and initial sample read cleanly.
  */
 bool sen0696_init(uint8_t addr_min, uint8_t addr_max, sen0696_state_t *out_state);
 
@@ -64,15 +59,25 @@ bool sen0696_init(uint8_t addr_min, uint8_t addr_max, sen0696_state_t *out_state
 bool sen0696_is_present(void);
 
 /**
- * @brief Polls Accel/Gyro, Mag, and Barometer blocks once and updates cached state.
+ * @brief Returns consecutive error count (useful for backing off poll cadence when disconnected).
+ */
+uint8_t sen0696_get_consec_fails(void);
+
+/**
+ * @brief Executes one staggered acquisition step (step 0=IMU, 1=Mag, 2=Baro/Finalize).
  *
- * Releases i2c_bsp_lock() across the 10 ms two-phase bridge MCU delays so concurrent
- * LVGL Touch (0x3B) and QMI8658 (0x6B) transactions are never blocked. Automatically
- * retries Normal mode configuration every 10 consecutive read failures without triggering
- * I2C0 bus-wide reinitialization.
+ * Holds i2c_bsp_lock() atomically across each single block's [write -> 10 ms -> read]
+ * sequence so Touch (0x3B) and QMI8658 (0x6B) never split an active SEN0696 transaction,
+ * while capping max single-tick bus lock hold time to ~10.3 ms across 3 RoverUI ticks.
  *
- * @param out_state Optional output snapshot (may be NULL).
- * @return true if all 3 sensor blocks succeeded on this poll.
+ * @param step      0, 1, or 2.
+ * @param out_state Optional snapshot updated cleanly after step 2 completes (may be NULL).
+ * @return true after step 2 if all 3 sensor blocks succeeded on this cycle.
+ */
+bool sen0696_poll_step(uint8_t step, sen0696_state_t *out_state);
+
+/**
+ * @brief Convenience blocking call that executes steps 0, 1, and 2 sequentially.
  */
 bool sen0696_poll(sen0696_state_t *out_state);
 
