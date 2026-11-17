@@ -16,10 +16,11 @@ import tempfile
 import xml.etree.ElementTree as ET
 
 __filename__ = os.path.basename(__file__)
-__version__ = "v1.0.1"
+__version__ = "v1.0.2"
 
 _EARTH_R_M = 6371000.0
 _DEFAULT_HEAT_RADIUS_M = 16.0
+_DEFAULT_AGL_M = 35.0
 _MIN_TRACK_STEP_M = 1.0
 
 
@@ -268,26 +269,52 @@ def parse_waypoints_csv(csv_path):
     return rows
 
 
-def circle_polygon_coords(lat, lon, radius_m, steps=20):
-    """Build closed KML lon,lat,0 coordinate string for a circle around (lat, lon)."""
+def circle_polygon_coords(lat, lon, radius_m, steps=20, alt_m=0.0):
+    """Build closed KML lon,lat,alt coordinate string for a circle around (lat, lon)."""
     coords = []
     for step in range(steps + 1):
         ang = (360.0 * step) / steps
         plat, plon = destination_point(lat, lon, ang, radius_m)
-        coords.append(f"{plon:.7f},{plat:.7f},0")
+        coords.append(f"{plon:.7f},{plat:.7f},{alt_m:.1f}")
     return " ".join(coords)
 
 
-def _add_placemark_point(parent, name, desc_html, lat, lon, style_id):
+def _apply_altitude_mode(geom_el, alt_m):
+    """Set OGC KML 2.2 tessellate/altitudeMode elements in schema order before coordinates."""
+    if alt_m > 0.0:
+        ET.SubElement(geom_el, "altitudeMode").text = "relativeToGround"
+    else:
+        if geom_el.tag in ("LineString", "Polygon"):
+            ET.SubElement(geom_el, "tessellate").text = "1"
+        ET.SubElement(geom_el, "altitudeMode").text = "clampToGround"
+
+
+def _interp_segment_coords(lat1, lon1, lat2, lon2, alt_m, max_step_m=40.0):
+    """Sample intermediate vertices along long lines so AGL lines follow undulating terrain."""
+    dist = haversine_m(lat1, lon1, lat2, lon2)
+    steps = max(1, int(math.ceil(dist / max_step_m))) if (alt_m > 0.0 and dist > max_step_m) else 1
+    out = []
+    for k in range(steps + 1):
+        f = k / steps
+        lat = lat1 + f * (lat2 - lat1)
+        lon = lon1 + f * (lon2 - lon1)
+        c = f"{lon:.7f},{lat:.7f},{alt_m:.1f}"
+        if not out or out[-1] != c:
+            out.append(c)
+    return out
+
+
+def _add_placemark_point(parent, name, desc_html, lat, lon, style_id, alt_m=0.0):
     pm = ET.SubElement(parent, "Placemark")
     ET.SubElement(pm, "name").text = name
     ET.SubElement(pm, "description").text = desc_html
     ET.SubElement(pm, "styleUrl").text = f"#{style_id}"
     pt = ET.SubElement(pm, "Point")
-    ET.SubElement(pt, "coordinates").text = f"{lon:.7f},{lat:.7f},0"
+    _apply_altitude_mode(pt, alt_m)
+    ET.SubElement(pt, "coordinates").text = f"{lon:.7f},{lat:.7f},{alt_m:.1f}"
 
 
-def _add_heat_disc(parent, name, desc_html, lat, lon, radius_m, fill_color, outline_color, width=1):
+def _add_heat_disc(parent, name, desc_html, lat, lon, radius_m, fill_color, outline_color, width=1, alt_m=0.0):
     pm = ET.SubElement(parent, "Placemark")
     ET.SubElement(pm, "name").text = name
     ET.SubElement(pm, "description").text = desc_html
@@ -300,16 +327,16 @@ def _add_heat_disc(parent, name, desc_html, lat, lon, radius_m, fill_color, outl
     ET.SubElement(ps, "fill").text = "1"
     ET.SubElement(ps, "outline").text = "1"
     poly = ET.SubElement(pm, "Polygon")
-    ET.SubElement(poly, "tessellate").text = "1"
+    _apply_altitude_mode(poly, alt_m)
     ob = ET.SubElement(poly, "outerBoundaryIs")
     lr = ET.SubElement(ob, "LinearRing")
-    ET.SubElement(lr, "coordinates").text = circle_polygon_coords(lat, lon, radius_m, steps=18)
+    ET.SubElement(lr, "coordinates").text = circle_polygon_coords(lat, lon, radius_m, steps=18, alt_m=alt_m)
 
 
-def _add_track_segment(parent, p1, p2, color_kml, width=4, name=None):
+def _add_track_segment(parent, p1, p2, color_kml, width=4, name=None, alt_m=0.0):
     """Emit a KML LineString track segment only when endpoints are strictly distinct."""
-    c1 = f"{p1['lon']:.7f},{p1['lat']:.7f},0"
-    c2 = f"{p2['lon']:.7f},{p2['lat']:.7f},0"
+    c1 = f"{p1['lon']:.7f},{p1['lat']:.7f},{alt_m:.1f}"
+    c2 = f"{p2['lon']:.7f},{p2['lat']:.7f},{alt_m:.1f}"
     if c1 == c2 or haversine_m(p1["lat"], p1["lon"], p2["lat"], p2["lon"]) < _MIN_TRACK_STEP_M:
         return False
     pm = ET.SubElement(parent, "Placemark")
@@ -319,12 +346,12 @@ def _add_track_segment(parent, p1, p2, color_kml, width=4, name=None):
     ET.SubElement(ls, "color").text = color_kml
     ET.SubElement(ls, "width").text = str(width)
     ln = ET.SubElement(pm, "LineString")
-    ET.SubElement(ln, "tessellate").text = "1"
+    _apply_altitude_mode(ln, alt_m)
     ET.SubElement(ln, "coordinates").text = f"{c1} {c2}"
     return True
 
 
-def _advance_track_segment(tracks_folder, prev_pt, pt, line_color, label):
+def _advance_track_segment(tracks_folder, prev_pt, pt, line_color, label, alt_m=0.0):
     """Advance track anchor and emit segment only for motion within the gap threshold."""
     if prev_pt is None:
         return pt
@@ -332,29 +359,31 @@ def _advance_track_segment(tracks_folder, prev_pt, pt, line_color, label):
     if step_m >= 250.0:
         return pt
     if step_m >= _MIN_TRACK_STEP_M:
-        if _add_track_segment(tracks_folder, prev_pt, pt, line_color, width=4, name=f"{label} Track {pt['ts']}"):
+        if _add_track_segment(tracks_folder, prev_pt, pt, line_color, width=4, name=f"{label} Track {pt['ts']}", alt_m=alt_m):
             return pt
     return prev_pt
 
 
-def _build_base_folder(doc, base_lat, base_lon, ring_radii_m):
+def _build_base_folder(doc, base_lat, base_lon, ring_radii_m, agl_m=0.0):
     base_folder = ET.SubElement(doc, "Folder")
     ET.SubElement(base_folder, "name").text = "Base Station & Range Rings"
     ET.SubElement(base_folder, "open").text = "0"
 
+    pin_alt = (agl_m + 5.0) if agl_m > 0.0 else 0.0
+    ring_alt = agl_m
     base_desc = f"<b>RTK Base Antenna</b><br/>Lat: {base_lat:.7f}<br/>Lon: {base_lon:.7f}"
-    _add_placemark_point(base_folder, "RTK Base Station", base_desc, base_lat, base_lon, "basePinStyle")
+    _add_placemark_point(base_folder, "RTK Base Station", base_desc, base_lat, base_lon, "basePinStyle", alt_m=pin_alt)
 
     for r_m in ring_radii_m:
         pm = ET.SubElement(base_folder, "Placemark")
         ET.SubElement(pm, "name").text = f"Range {r_m} m ({int(round(r_m * 3.28084))} ft)"
         ET.SubElement(pm, "styleUrl").text = "#ringStyle"
         ln = ET.SubElement(pm, "LineString")
-        ET.SubElement(ln, "tessellate").text = "1"
-        ET.SubElement(ln, "coordinates").text = circle_polygon_coords(base_lat, base_lon, r_m, steps=64)
+        _apply_altitude_mode(ln, ring_alt)
+        ET.SubElement(ln, "coordinates").text = circle_polygon_coords(base_lat, base_lon, r_m, steps=64, alt_m=ring_alt)
 
 
-def _build_downlink_folder(doc, label, points, base_lat, base_lon, heat_radius_m, visible=True):
+def _build_downlink_folder(doc, label, points, base_lat, base_lon, heat_radius_m, visible=True, agl_m=0.0):
     folder = ET.SubElement(doc, "Folder")
     ET.SubElement(folder, "name").text = f"{label} - Downlink (Base -> Rover dBm + Blackouts)"
     ET.SubElement(folder, "visibility").text = "1" if visible else "0"
@@ -367,19 +396,21 @@ def _build_downlink_folder(doc, label, points, base_lat, base_lon, heat_radius_m
     ET.SubElement(blobs, "name").text = "5s dBm Heatmap Discs (Click for Telemetry)"
     ET.SubElement(blobs, "visibility").text = "1" if visible else "0"
 
+    disc_alt = (agl_m + 1.0) if agl_m > 0.0 else 0.0
+    track_alt = (agl_m + 2.5) if agl_m > 0.0 else 0.0
     prev_track_pt = None
     for pt in points:
         dist = haversine_m(base_lat, base_lon, pt["lat"], pt["lon"])
         bear = bearing_deg(base_lat, base_lon, pt["lat"], pt["lon"])
         snr = pt["pkt"] - pt["noise"] if (pt["pkt"] < 0 and pt["noise"] < 0) else 0
         if pt["live"]:
-            fill_c = dbm_to_kml_color(pt["pkt"], "88")
-            line_c = dbm_to_kml_color(pt["pkt"], "EE")
+            fill_c = dbm_to_kml_color(pt["pkt"], "A8")
+            line_c = dbm_to_kml_color(pt["pkt"], "FF")
             title = f"{label} DL: {pt['pkt']} dBm @ {dist:.0f}m"
             state_txt = "LIVE RTCM RX"
         else:
-            fill_c = "60303030"
-            line_c = "CC555555"
+            fill_c = "90505460"
+            line_c = "FFE0E0E0"
             title = f"{label} DL: NO RTCM @ {dist:.0f}m"
             state_txt = "DEADZONE (0 new RTCM frames; Pkt RSSI stale)"
 
@@ -391,11 +422,11 @@ def _build_downlink_folder(doc, label, points, base_lat, base_lon, heat_radius_m
             f"<b>+OK (5s):</b> {pt['dok']} frames (Err+: {pt['derr']}, Total OK: {pt['ok_total']})<br/>"
             f"<b>GNSS:</b> {fix_code_label(pt['fix'])} | <b>Diff Age:</b> {pt['diff']:.1f} s | <b>Spd:</b> {pt['spd']:.1f} m/s"
         )
-        _add_heat_disc(blobs, title, desc, pt["lat"], pt["lon"], heat_radius_m, fill_c, line_c, width=1)
-        prev_track_pt = _advance_track_segment(tracks, prev_track_pt, pt, line_c, f"{label} DL")
+        _add_heat_disc(blobs, title, desc, pt["lat"], pt["lon"], heat_radius_m, fill_c, line_c, width=1, alt_m=disc_alt)
+        prev_track_pt = _advance_track_segment(tracks, prev_track_pt, pt, line_c, f"{label} DL", alt_m=track_alt)
 
 
-def _build_uplink_folder(doc, label, uplinks, base_lat, base_lon, heat_radius_m, visible=False):
+def _build_uplink_folder(doc, label, uplinks, base_lat, base_lon, heat_radius_m, visible=False, agl_m=0.0):
     folder = ET.SubElement(doc, "Folder")
     ET.SubElement(folder, "name").text = f"{label} - Uplink (Rover -> Base dBm)"
     ET.SubElement(folder, "visibility").text = "1" if visible else "0"
@@ -408,12 +439,14 @@ def _build_uplink_folder(doc, label, uplinks, base_lat, base_lon, heat_radius_m,
     ET.SubElement(blobs, "name").text = "5s Base RX dBm Heatmap Discs"
     ET.SubElement(blobs, "visibility").text = "1" if visible else "0"
 
+    disc_alt = (agl_m + 1.0) if agl_m > 0.0 else 0.0
+    track_alt = (agl_m + 2.5) if agl_m > 0.0 else 0.0
     prev_track_pt = None
     for pt in uplinks:
         dist = haversine_m(base_lat, base_lon, pt["lat"], pt["lon"])
         bear = bearing_deg(base_lat, base_lon, pt["lat"], pt["lon"])
-        fill_c = dbm_to_kml_color(pt["rssi"], "88")
-        line_c = dbm_to_kml_color(pt["rssi"], "EE")
+        fill_c = dbm_to_kml_color(pt["rssi"], "A8")
+        line_c = dbm_to_kml_color(pt["rssi"], "FF")
         title = f"{label} UL #{pt['seq']}: {pt['rssi']} dBm @ {dist:.0f}m"
         desc = (
             f"<b>{html.escape(title)}</b><br/>"
@@ -422,11 +455,11 @@ def _build_uplink_folder(doc, label, uplinks, base_lat, base_lon, heat_radius_m,
             f"<b>ANT1:</b> {html.escape(pt['ant1'])} | <b>ANT2:</b> {html.escape(pt['ant2'])} | "
             f"<b>Hdg:</b> {pt['hdg']} deg [{html.escape(pt['hdg_src'])}]"
         )
-        _add_heat_disc(blobs, title, desc, pt["lat"], pt["lon"], heat_radius_m, fill_c, line_c, width=1)
-        prev_track_pt = _advance_track_segment(tracks, prev_track_pt, pt, line_c, f"{label} UL")
+        _add_heat_disc(blobs, title, desc, pt["lat"], pt["lon"], heat_radius_m, fill_c, line_c, width=1, alt_m=disc_alt)
+        prev_track_pt = _advance_track_segment(tracks, prev_track_pt, pt, line_c, f"{label} UL", alt_m=track_alt)
 
 
-def _build_waypoints_folder(doc, csv_path, base_lat, base_lon):
+def _build_waypoints_folder(doc, csv_path, base_lat, base_lon, agl_m=0.0):
     rows = parse_waypoints_csv(csv_path)
     if not rows:
         return
@@ -435,6 +468,8 @@ def _build_waypoints_folder(doc, csv_path, base_lat, base_lon):
     ET.SubElement(folder, "name").text = f"Parcel: {name}"
     ET.SubElement(folder, "open").text = "0"
 
+    line_alt = (agl_m + 4.0) if agl_m > 0.0 else 0.0
+    pin_alt = (agl_m + 5.0) if agl_m > 0.0 else 0.0
     by_seq = {}
     pos_pts = []
     for r in rows:
@@ -446,7 +481,7 @@ def _build_waypoints_folder(doc, csv_path, base_lat, base_lon):
             f"<b>Recorded Fix:</b> {html.escape(r['pos_fix'])}<br/>"
             f"<b>Notes:</b> {html.escape(r['notes'])}"
         )
-        _add_placemark_point(folder, f"{r['label']} ({dist:.0f}m)", desc, r["lat"], r["lon"], "wpPinStyle")
+        _add_placemark_point(folder, f"{r['label']} ({dist:.0f}m)", desc, r["lat"], r["lon"], "wpPinStyle", alt_m=pin_alt)
         if r["seq"] > 0:
             pos_pts.append(r)
             by_seq[r["seq"]] = r
@@ -454,44 +489,42 @@ def _build_waypoints_folder(doc, csv_path, base_lat, base_lon):
     if len(pos_pts) >= 3:
         pos_pts.sort(key=lambda x: x["seq"])
         coords = []
-        for r in pos_pts:
-            c = f"{r['lon']:.7f},{r['lat']:.7f},0"
-            if not coords or coords[-1] != c:
-                coords.append(c)
-        if coords and coords[-1] != coords[0]:
-            coords.append(coords[0])
+        closed = pos_pts + [pos_pts[0]]
+        for a, b in zip(closed, closed[1:]):
+            for c in _interp_segment_coords(a["lat"], a["lon"], b["lat"], b["lon"], line_alt):
+                if not coords or coords[-1] != c:
+                    coords.append(c)
         if len(set(coords)) >= 2 and len(coords) >= 2:
             pm = ET.SubElement(folder, "Placemark")
             ET.SubElement(pm, "name").text = f"{name} Boundary"
             ET.SubElement(pm, "styleUrl").text = "#parcelLineStyle"
             ln = ET.SubElement(pm, "LineString")
-            ET.SubElement(ln, "tessellate").text = "1"
+            _apply_altitude_mode(ln, line_alt)
             ET.SubElement(ln, "coordinates").text = " ".join(coords)
 
     for r in rows:
         if r["seq"] < 0 and (-r["seq"]) in by_seq:
             tgt = by_seq[-r["seq"]]
-            c1 = f"{r['lon']:.7f},{r['lat']:.7f},0"
-            c2 = f"{tgt['lon']:.7f},{tgt['lat']:.7f},0"
-            if c1 != c2:
+            coords = _interp_segment_coords(r["lat"], r["lon"], tgt["lat"], tgt["lon"], line_alt)
+            if len(set(coords)) >= 2:
                 pm = ET.SubElement(folder, "Placemark")
                 ET.SubElement(pm, "name").text = f"Tie: {r['label']} -> seq {-r['seq']}"
                 ET.SubElement(pm, "styleUrl").text = "#tieLineStyle"
                 ln = ET.SubElement(pm, "LineString")
-                ET.SubElement(ln, "tessellate").text = "1"
-                ET.SubElement(ln, "coordinates").text = f"{c1} {c2}"
+                _apply_altitude_mode(ln, line_alt)
+                ET.SubElement(ln, "coordinates").text = " ".join(coords)
 
 
 def _add_shared_styles(doc):
-    def icon_style(sid, color, scale, icon_href):
+    def icon_style(sid, color, icon_scale, icon_href, label_scale):
         st = ET.SubElement(doc, "Style", id=sid)
         ics = ET.SubElement(st, "IconStyle")
         ET.SubElement(ics, "color").text = color
-        ET.SubElement(ics, "scale").text = str(scale)
+        ET.SubElement(ics, "scale").text = str(icon_scale)
         ic = ET.SubElement(ics, "Icon")
         ET.SubElement(ic, "href").text = icon_href
         lbs = ET.SubElement(st, "LabelStyle")
-        ET.SubElement(lbs, "scale").text = "0.75"
+        ET.SubElement(lbs, "scale").text = str(label_scale)
 
     def line_style(sid, color, width):
         st = ET.SubElement(doc, "Style", id=sid)
@@ -499,14 +532,21 @@ def _add_shared_styles(doc):
         ET.SubElement(ls, "color").text = color
         ET.SubElement(ls, "width").text = str(width)
 
-    icon_style("basePinStyle", "FF00FFFF", "1.2", "http://maps.google.com/mapfiles/kml/shapes/ranger_station.png")
-    icon_style("wpPinStyle", "FFFFAA00", "0.85", "http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png")
-    line_style("ringStyle", "80FFFFFF", "1.5")
-    line_style("parcelLineStyle", "FFE2A822", "2.5")
-    line_style("tieLineStyle", "FF0088FF", "2.0")
+    icon_style("basePinStyle", "FF00FFFF", "1.2", "http://maps.google.com/mapfiles/kml/shapes/ranger_station.png", "0.85")
+    icon_style("wpPinNormal", "FFFFAA00", "0.7", "http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png", "0")
+    icon_style("wpPinHighlight", "FF00FFFF", "1.0", "http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png", "0.85")
+    sm = ET.SubElement(doc, "StyleMap", id="wpPinStyle")
+    for key, target in (("normal", "#wpPinNormal"), ("highlight", "#wpPinHighlight")):
+        pair = ET.SubElement(sm, "Pair")
+        ET.SubElement(pair, "key").text = key
+        ET.SubElement(pair, "styleUrl").text = target
+
+    line_style("ringStyle", "B0FFFFFF", "1.8")
+    line_style("parcelLineStyle", "FFE2A822", "2.8")
+    line_style("tieLineStyle", "FF00AAFF", "2.2")
 
 
-def generate_kml(runs, pacer_log, waypoint_csvs, out_path, base_override=None, heat_radius_m=_DEFAULT_HEAT_RADIUS_M):
+def generate_kml(runs, pacer_log, waypoint_csvs, out_path, base_override=None, heat_radius_m=_DEFAULT_HEAT_RADIUS_M, agl_m=_DEFAULT_AGL_M):
     """Build and write the complete KML RF signal heatmap document."""
     parsed_runs = []
     detected_base = base_override
@@ -533,23 +573,26 @@ def generate_kml(runs, pacer_log, waypoint_csvs, out_path, base_override=None, h
     ET.SubElement(doc, "name").text = "RTK Rover LoRa RF Heatmap (dBm)"
     ET.SubElement(doc, "description").text = (
         "Color scale: Green (-40 dBm) -> Yellow (-68 dBm) -> Red (-86 dBm); "
-        "Dark Gray = 0 new RTCM frames received in 5s window (downlink blackout)."
+        "Slate Gray = 0 new RTCM frames received in 5s window (downlink blackout). "
+        f"Elevation: {agl_m:.0f}m AGL (above 3D tree canopy)." if agl_m > 0.0 else
+        "Color scale: Green (-40 dBm) -> Yellow (-68 dBm) -> Red (-86 dBm); "
+        "Slate Gray = 0 new RTCM frames received in 5s window (downlink blackout)."
     )
     _add_shared_styles(doc)
-    _build_base_folder(doc, base_lat, base_lon, [150, 300, 450, 750])
+    _build_base_folder(doc, base_lat, base_lon, [150, 300, 450, 750], agl_m=agl_m)
 
     counts = {}
     for idx, (label, dl_pts, (t_lo, t_hi)) in enumerate(parsed_runs):
-        _build_downlink_folder(doc, label, dl_pts, base_lat, base_lon, heat_radius_m, visible=(idx == 0))
+        _build_downlink_folder(doc, label, dl_pts, base_lat, base_lon, heat_radius_m, visible=(idx == 0), agl_m=agl_m)
         run_ul = [u for u in uplinks if t_lo <= u["t"] <= t_hi]
         if run_ul:
-            _build_uplink_folder(doc, label, run_ul, base_lat, base_lon, heat_radius_m, visible=False)
+            _build_uplink_folder(doc, label, run_ul, base_lat, base_lon, heat_radius_m, visible=False, agl_m=agl_m)
         live_cnt = sum(1 for p in dl_pts if p["live"])
         dead_cnt = len(dl_pts) - live_cnt
         counts[label] = {"dl_total": len(dl_pts), "dl_live": live_cnt, "dl_dead": dead_cnt, "ul_total": len(run_ul)}
 
     for csv_p in waypoint_csvs:
-        _build_waypoints_folder(doc, csv_p, base_lat, base_lon)
+        _build_waypoints_folder(doc, csv_p, base_lat, base_lon, agl_m=agl_m)
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     tree = ET.ElementTree(kml)
@@ -600,6 +643,15 @@ def run_self_test():
         for ln in tree.findall(".//k:LineString/k:coordinates", ns):
             pts = (ln.text or "").strip().split()
             assert len(set(pts)) >= 2, f"Degenerate LineString: {pts}"
+        modes = [el.text for el in tree.findall(".//k:altitudeMode", ns)]
+        assert modes and all(m == "relativeToGround" for m in modes), f"Unexpected altitudeMode: {modes}"
+        assert not tree.findall(".//k:tessellate", ns), "Unexpected tessellate with relativeToGround"
+
+        out_gnd = os.path.join(tmp, "out_synth_gnd.kml")
+        generate_kml(["SYNTH::" + ser], pac, [csv_p], out_gnd, agl_m=0.0)
+        tree_gnd = ET.parse(out_gnd)
+        modes_gnd = [el.text for el in tree_gnd.findall(".//k:altitudeMode", ns)]
+        assert modes_gnd and all(m == "clampToGround" for m in modes_gnd), f"Unexpected ground altitudeMode: {modes_gnd}"
     print("[SELF-TEST] PASS: Synthetic KML RF heatmap & parcel overlay verified.")
 
 
@@ -611,6 +663,7 @@ def main():
     parser.add_argument("--base-lat", type=float, default=None, help="Optional Base latitude override")
     parser.add_argument("--base-lon", type=float, default=None, help="Optional Base longitude override")
     parser.add_argument("--radius-m", type=float, default=_DEFAULT_HEAT_RADIUS_M, help="Heatmap disc radius in meters")
+    parser.add_argument("--agl-m", type=float, default=_DEFAULT_AGL_M, help="Height above ground (m) to float layers above 3D trees (0 = ground-clamped)")
     parser.add_argument("--out", default=None, help="Output KML file path")
     parser.add_argument("--self-test", action="store_true", help="Run synthetic unit verification and exit")
     args = parser.parse_args()
@@ -625,7 +678,7 @@ def main():
         parser.error("--run and --out are required unless running --self-test")
 
     base_ov = (args.base_lat, args.base_lon) if (args.base_lat is not None and args.base_lon is not None) else None
-    counts = generate_kml(args.runs if hasattr(args, "runs") else args.run, args.pacer_log, args.waypoints, args.out, base_ov, args.radius_m)
+    counts = generate_kml(args.run, args.pacer_log, args.waypoints, args.out, base_ov, args.radius_m, args.agl_m)
     print(f"[OK] Wrote KML: {args.out}")
     for lbl, st in counts.items():
         print(f"  {lbl}: DL={st['dl_total']} (live={st['dl_live']}, deadzone={st['dl_dead']}) | UL={st['ul_total']}")

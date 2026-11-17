@@ -5,6 +5,10 @@ All notable changes to the **RTK Rover** project will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [generate_rf_heatmap_kml.py v1.0.2] - 2026-11-17
+### Changed
+- **Above-Canopy `relativeToGround` Layering (`--agl-m`, default `35.0`):** Elevated KML layers above 3D photogrammetry tree canopies with stepped vertical offsets (`35.0 m` rings -> `36.0 m` discs -> `37.5 m` tracks -> `39.0 m` parcel boundaries/ties interpolated `<= 40 m` -> `40.0 m` pins), upgraded deadzone slate-gray/silver contrast, added `wpPinStyle` `<StyleMap>` hover-only labels to eliminate center text pileups, and verified both `relativeToGround` and `--agl-m 0` (`clampToGround`) modes in `--self-test`.
+
 ## [generate_rf_heatmap_kml.py v1.0.1] - 2026-11-17
 ### Fixed
 - **Google Earth Track Segment Degeneracy (`_MIN_TRACK_STEP_M = 1.0`):** Filtered zero-length and sub-meter stationary RTK-jitter track segments using a shared `_advance_track_segment()` anchor, added non-empty `<name>` tags on track `<Placemark>` elements, guarded parcel boundary/tie polylines against duplicate coordinates, and extended `--self-test` with stationary-point assertions.
